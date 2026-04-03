@@ -1,5 +1,6 @@
 # ThymerHabitTracker
 Habit Tracker Plugin for Thymer
+_(COLLECTION Plugin; not global plugin)_
 
 ### FEATURES
 - Header Panel on Journal Page with Checkable Habits and Streak Displays
