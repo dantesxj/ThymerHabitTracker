@@ -2,6 +2,8 @@
 Habit Tracker Plugin for Thymer
 _(COLLECTION Plugin; not global plugin)_
 
+‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
+
 ### FEATURES
 - Header Panel on Journal Page with Checkable Habits and Streak Displays
 - Settings Screen to Configure Categories and Habits
