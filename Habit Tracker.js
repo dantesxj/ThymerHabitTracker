@@ -1,6 +1,8 @@
 /**
  * HabitTracker — Standalone CollectionPlugin
- * @version 1.0.2
+ * @version 1.0.4
+ *
+ * UI icons: Tabler Icons (https://tabler.io/icons) via webfont classes `ti ti-{name}`.
  *
  * Data model (all stored as records in own collection):
  *   - One "config" record (title: "__config__") — stores categories/habits as JSON in `data`
@@ -8,9 +10,11 @@
  *
  * Config JSON shape:
  *   { categories: [ { id, name, emoji, order }, ... ], habits: [ { id, name, categoryId, order }, ... ] }
+ *   `emoji` holds a Tabler icon slug (e.g. folder, flame) or legacy Unicode emoji for display.
  *
  * Log JSON shape:
- *   { date: "YYYY-MM-DD", completions: { habitId: true, ... }, categoryDone: { categoryId: true, ... } }
+ *   { date: "YYYY-MM-DD", completions: { habitId: true, ... }, categoryDone: { categoryId: true, ... }, notes?: string }
+ *   Per-day text also stored on the record field `notes` (collection schema) when supported.
  *
  * Streaks are calculated on-the-fly by scanning log records.
  */
@@ -84,7 +88,33 @@ const HT_CSS = `
     color: #e8e0d0;
     white-space: nowrap;
     flex: 1;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
   }
+  .ht-sidebar .ti,
+  .ht-stats-view .ti,
+  .ht-modal .ti,
+  .ht-importer-overlay .ti {
+    font-size: 1.1em;
+    vertical-align: -0.12em;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .ht-empty-icon .ti { font-size: 28px; opacity: 0.85; vertical-align: middle; }
+  .ht-stats-btn .ti,
+  .ht-nav-btn .ti { font-size: 17px; }
+  .ht-toggle-btn .ti { font-size: 15px; }
+  .ht-category-caret .ti { font-size: 9px; color: #8a7e6a; }
+  .ht-category-status .ti { font-size: 13px; }
+  .ht-streak-badge .ti { font-size: 11px; opacity: 0.9; }
+  .ht-habit-check .ti { font-size: 14px; color: #4caf50; }
+  .ht-habit-ring-label .ti { font-size: 11px; display: block; margin-top: 1px; }
+  .ht-modal-close .ti { font-size: 16px; }
+  .ht-modal-title .ti { font-size: 17px; vertical-align: -0.18em; margin-right: 2px; }
+  .ht-btn .ti { font-size: 14px; margin-right: 0.25em; vertical-align: -0.18em; }
+  .ht-item-sub .ti { font-size: 10px; vertical-align: -0.12em; opacity: 0.95; }
+  .ht-modal-body .ti { vertical-align: middle; }
   .ht-date-label {
     font-size: 12px;
     color: #8a7e6a;
@@ -123,6 +153,47 @@ const HT_CSS = `
     background: #4caf50;
     border-radius: 2px;
     transition: width 0.35s ease;
+  }
+
+  /* ── Day notes (under habit list) ── */
+  .ht-notes-wrap {
+    margin: 10px 14px 4px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+  }
+  .ht-notes-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #8a7e6a;
+    margin-bottom: 6px;
+  }
+  .ht-notes-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 2.8em;
+    max-height: 120px;
+    overflow-y: auto;
+    resize: vertical;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.35;
+    color: #e8e0d0;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 6px 8px;
+    margin: 0;
+  }
+  .ht-notes-input::placeholder {
+    color: rgba(138, 126, 106, 0.75);
+  }
+  .ht-notes-input:focus {
+    outline: none;
+    border-color: rgba(124, 106, 247, 0.45);
+    background: rgba(0, 0, 0, 0.32);
   }
 
   /* ── Category block ── */
@@ -334,12 +405,42 @@ const HT_CSS = `
     background: rgba(255,255,255,0.04);
     border: 1px solid rgba(255,255,255,0.06);
   }
-  .ht-item-emoji { font-size: 15px; width: 22px; text-align: center; flex-shrink: 0; }
+  .ht-item-emoji {
+    font-size: 15px;
+    width: 24px;
+    min-width: 24px;
+    text-align: center;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .ht-item-emoji .ti { font-size: 16px; }
   .ht-item-left { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
   .ht-item-name { font-size: 13px; color: #e8e0d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ht-item-sub { font-size: 11px; color: #8a7e6a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ht-item-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-  .ht-add-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+  .ht-add-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  .ht-icon-select {
+    flex: 0 0 auto;
+    min-width: 148px;
+    max-width: 200px;
+    padding: 5px 8px;
+    font-size: 12px;
+  }
+  .ht-cat-glyph-inline { display: inline-flex; align-items: center; vertical-align: middle; margin-right: 4px; }
+  .ht-cat-glyph-inline .ti { font-size: 1em; }
+  .ht-category-emoji .ti { font-size: 14px; }
+  .ht-emoji-inline { font-size: 1.1em; line-height: 1; }
+  .ht-icon-preview {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    flex-shrink: 0;
+    color: #c4a882;
+  }
+  .ht-icon-preview .ti { font-size: 18px; }
   .ht-input {
     flex: 1;
     min-width: 0;
@@ -723,6 +824,110 @@ function htEsc(str) {
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+/** Tabler Icons (tabler.io) — webfont uses `ti ti-{name}` per https://docs.tabler.io/icons/webfont */
+function htIcon(name, extraClass = '') {
+  const n = String(name || '').trim();
+  if (!n || !/^[a-z][a-z0-9-]*$/.test(n)) return '';
+  const ex = extraClass ? ' ' + extraClass : '';
+  return `<i class="ti ti-${n}${ex}" aria-hidden="true"></i>`;
+}
+
+/** Curated icons for category picker (slug → menu label). */
+const HT_CATEGORY_ICONS = [
+  { slug: 'folder', label: 'Folder' },
+  { slug: 'flame', label: 'Flame' },
+  { slug: 'heart', label: 'Heart' },
+  { slug: 'star', label: 'Star' },
+  { slug: 'bolt', label: 'Bolt' },
+  { slug: 'moon', label: 'Moon' },
+  { slug: 'sun', label: 'Sun' },
+  { slug: 'droplet', label: 'Droplet' },
+  { slug: 'coffee', label: 'Coffee' },
+  { slug: 'book', label: 'Book' },
+  { slug: 'barbell', label: 'Barbell' },
+  { slug: 'music', label: 'Music' },
+  { slug: 'bike', label: 'Bike' },
+  { slug: 'run', label: 'Run' },
+  { slug: 'pill', label: 'Pill' },
+  { slug: 'brush', label: 'Brush' },
+  { slug: 'home', label: 'Home' },
+  { slug: 'briefcase', label: 'Briefcase' },
+  { slug: 'plane', label: 'Plane' },
+  { slug: 'tree', label: 'Tree' },
+  { slug: 'leaf', label: 'Leaf' },
+  { slug: 'apple', label: 'Apple' },
+  { slug: 'carrot', label: 'Carrot' },
+  { slug: 'trophy', label: 'Trophy' },
+  { slug: 'puzzle', label: 'Puzzle' },
+  { slug: 'gift', label: 'Gift' },
+  { slug: 'flag', label: 'Flag' },
+  { slug: 'bookmark', label: 'Bookmark' },
+  { slug: 'compass', label: 'Compass' },
+  { slug: 'brain', label: 'Brain' },
+  { slug: 'plant', label: 'Plant' },
+  { slug: 'dog', label: 'Dog' },
+  { slug: 'cat', label: 'Cat' },
+  { slug: 'tools', label: 'Tools' },
+  { slug: 'palette', label: 'Palette' },
+  { slug: 'users', label: 'People' },
+  { slug: 'chart-line', label: 'Chart' },
+  { slug: 'device-mobile', label: 'Phone' },
+  { slug: 'zzz', label: 'Sleep' },
+  { slug: 'sparkles', label: 'Sparkles' },
+  { slug: 'infinity', label: 'Infinity' },
+  { slug: 'pray', label: 'Pray' },
+  { slug: 'mountain', label: 'Mountain' },
+  { slug: 'beach', label: 'Beach' },
+  { slug: 'snowflake', label: 'Snowflake' },
+];
+
+function htCategoryGlyphHtml(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return htIcon('folder');
+  if (/^[a-z][a-z0-9-]*$/.test(s) && s.length < 48) return htIcon(s);
+  return `<span class="ht-emoji-inline">${htEsc(s)}</span>`;
+}
+
+/** Plain-text label for native <select> / optgroup (no HTML). */
+function htCategoryGlyphText(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (/^[a-z][a-z0-9-]*$/.test(s) && s.length < 48) {
+    const hit = HT_CATEGORY_ICONS.find(x => x.slug === s);
+    return hit ? hit.label : s;
+  }
+  return s;
+}
+
+function htFillIconSelect(selectEl, currentValue) {
+  const cur = String(currentValue ?? '').trim();
+  const slugSet = new Set(HT_CATEGORY_ICONS.map(x => x.slug));
+  selectEl.innerHTML = '';
+  for (const { slug, label } of HT_CATEGORY_ICONS) {
+    const o = document.createElement('option');
+    o.value = slug;
+    o.textContent = label;
+    selectEl.appendChild(o);
+  }
+  if (cur && !slugSet.has(cur)) {
+    const o = document.createElement('option');
+    o.value = cur;
+    o.textContent = `Other: ${cur}`;
+    selectEl.insertBefore(o, selectEl.firstChild);
+  }
+  if (cur) {
+    selectEl.value = cur;
+  } else {
+    selectEl.value = 'folder';
+  }
+}
+
+function htBindIconPreview(selectEl, previewEl) {
+  const sync = () => { previewEl.innerHTML = htCategoryGlyphHtml(selectEl.value); };
+  selectEl.addEventListener('change', sync);
+  sync();
+}
+
 function htGenId() {
   return Math.random().toString(36).slice(2, 10);
 }
@@ -870,13 +1075,30 @@ class Plugin extends CollectionPlugin {
            '';
   }
 
+  _readNotesProp(r) {
+    if (!r) return '';
+    const t = r.text?.('notes') ||
+      r.prop?.('notes')?.text?.() ||
+      r.prop?.('notes')?.get?.();
+    return t == null ? '' : String(t);
+  }
+
+  _writeNotesProp(rec, text) {
+    if (!rec) return;
+    const s = text == null ? '' : String(text);
+    try {
+      rec.prop?.('notes')?.set?.(s);
+    } catch(e) {}
+  }
+
   async _loadLog(dateStr) {
-    if (!this._collection) return { date: dateStr, completions: {}, categoryDone: {} };
+    const empty = () => ({ date: dateStr, completions: {}, categoryDone: {}, notes: '' });
+    if (!this._collection) return empty();
     try {
       const records = await this._collection.getAllRecords();
       const logRecords = records.filter(r => r.getName() === `log-${dateStr}`);
-      if (logRecords.length === 0) return { date: dateStr, completions: {}, categoryDone: {} };
-      const merged = { date: dateStr, completions: {}, categoryDone: {} };
+      if (logRecords.length === 0) return empty();
+      const merged = empty();
       for (const r of logRecords) {
         const raw = this._readDataProp(r);
         if (raw) {
@@ -884,19 +1106,104 @@ class Plugin extends CollectionPlugin {
             const d = JSON.parse(raw);
             Object.assign(merged.completions, d.completions || {});
             Object.assign(merged.categoryDone, d.categoryDone || {});
+            if (d.notes != null && String(d.notes) !== '') merged.notes = String(d.notes);
           } catch(e) {}
         }
+        const propNotes = this._readNotesProp(r);
+        if (propNotes) merged.notes = propNotes;
       }
       return merged;
     } catch(e) {}
-    return { date: dateStr, completions: {}, categoryDone: {} };
+    return empty();
+  }
+
+  /**
+   * One pass over all records: merged log data per calendar day (for streaks + sidebar).
+   * Matches merge rules used by _loadLog / streak calculators.
+   */
+  _buildLogsByDateMap(records) {
+    const logsByDate = new Map();
+    for (const r of records) {
+      const name = r.getName() || '';
+      if (!name.startsWith('log-')) continue;
+      const raw = this._readDataProp(r);
+      if (!raw) continue;
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch(e) {
+        continue;
+      }
+      if (!data.date) continue;
+      const key = data.date;
+      if (!logsByDate.has(key)) {
+        logsByDate.set(key, { completions: {}, categoryDone: {}, notes: '' });
+      }
+      const ex = logsByDate.get(key);
+      Object.assign(ex.completions, data.completions || {});
+      Object.assign(ex.categoryDone, data.categoryDone || {});
+      if (data.notes != null && String(data.notes) !== '') ex.notes = String(data.notes);
+      const propNotes = this._readNotesProp(r);
+      if (propNotes) ex.notes = propNotes;
+    }
+    return logsByDate;
+  }
+
+  _getLogForDateFromMap(logsByDate, dateStr) {
+    const empty = () => ({ date: dateStr, completions: {}, categoryDone: {}, notes: '' });
+    const e = logsByDate.get(dateStr);
+    if (!e) return empty();
+    return {
+      date: dateStr,
+      completions: { ...e.completions },
+      categoryDone: { ...e.categoryDone },
+      notes: e.notes || '',
+    };
+  }
+
+  _categoryStreakFromMap(catId, refDate, logsByDate, cat) {
+    let streak = 0;
+    let d = htDaysBefore(refDate || htToday(), 1);
+    for (let i = 0; i < 3650; i++) {
+      const log = logsByDate.get(d);
+      if (log && log.categoryDone && log.categoryDone[catId]) {
+        streak++;
+        d = htDaysBefore(d, 1);
+      } else if (cat?.seedDate && d >= cat.seedDate && !log) {
+        streak++;
+        d = htDaysBefore(d, 1);
+      } else {
+        break;
+      }
+    }
+    return streak;
+  }
+
+  _habitStreakFromMap(habitId, refDate, logsByDate, habit) {
+    let streak = 0;
+    let d = htDaysBefore(refDate || htToday(), 1);
+    for (let i = 0; i < 3650; i++) {
+      const log = logsByDate.get(d);
+      if (log && log.completions && log.completions[habitId]) {
+        streak++;
+        d = htDaysBefore(d, 1);
+      } else if (habit?.seedDate && d >= habit.seedDate && !log) {
+        streak++;
+        d = htDaysBefore(d, 1);
+      } else {
+        break;
+      }
+    }
+    return streak;
   }
 
   async _saveLog(dateStr, logData) {
     if (!this._collection) return;
     try {
       const records = await this._collection.getAllRecords();
+      if (logData.notes == null) logData.notes = '';
       const json = JSON.stringify(logData);
+      const notesStr = String(logData.notes);
 
       // Find an existing record for this date that ALREADY HAS DATA (skip empty shells)
       const allForDate = records.filter(r => r.getName() === `log-${dateStr}`);
@@ -904,6 +1211,7 @@ class Plugin extends CollectionPlugin {
         const raw = this._readDataProp(r);
         if (raw) {
           r.prop('data')?.set(json);
+          this._writeNotesProp(r, notesStr);
           return;
         }
       }
@@ -916,6 +1224,7 @@ class Plugin extends CollectionPlugin {
       if (!newRec) { console.warn('[HT] saveLog: record not found', dateStr); return; }
       try { newRec.prop('record_type')?.setChoice('Log'); } catch(e) {}
       newRec.prop('data')?.set(json);
+      this._writeNotesProp(newRec, notesStr);
     } catch(e) {
       console.error('[HabitTracker] Error saving log:', e);
     }
@@ -928,43 +1237,8 @@ class Plugin extends CollectionPlugin {
     const cat = this._config?.categories?.find(c => c.id === catId);
     try {
       const records = await this._collection.getAllRecords();
-      const logsByDate = new Map();
-      for (const r of records) {
-        const name = r.getName() || '';
-        if (name.startsWith('log-')) {
-          const raw = this._readDataProp(r);
-          if (raw) {
-            try {
-              const data = JSON.parse(raw);
-              if (!data.date) continue;
-              if (logsByDate.has(data.date)) {
-                const ex = logsByDate.get(data.date);
-                Object.assign(ex.completions, data.completions || {});
-                Object.assign(ex.categoryDone, data.categoryDone || {});
-              } else {
-                logsByDate.set(data.date, { completions: data.completions || {}, categoryDone: data.categoryDone || {} });
-              }
-            } catch(e) {}
-          }
-        }
-      }
-      let streak = 0;
-      // Start from yesterday relative to refDate (don't count refDate itself unless it's complete)
-      let d = htDaysBefore(refDate || htToday(), 1);
-      for (let i = 0; i < 3650; i++) {
-        const log = logsByDate.get(d);
-        if (log && log.categoryDone && log.categoryDone[catId]) {
-          streak++;
-          d = htDaysBefore(d, 1);
-        } else if (cat?.seedDate && d >= cat.seedDate && !log) {
-          // No log for this day but it's within the seeded range — count it
-          streak++;
-          d = htDaysBefore(d, 1);
-        } else {
-          break;
-        }
-      }
-      return streak;
+      const logsByDate = this._buildLogsByDateMap(records);
+      return this._categoryStreakFromMap(catId, refDate, logsByDate, cat);
     } catch(e) { return 0; }
   }
 
@@ -975,42 +1249,8 @@ class Plugin extends CollectionPlugin {
     const habit = this._config?.habits?.find(h => h.id === habitId);
     try {
       const records = await this._collection.getAllRecords();
-      const logsByDate = new Map();
-      for (const r of records) {
-        const name = r.getName() || '';
-        if (name.startsWith('log-')) {
-          const raw = this._readDataProp(r);
-          if (raw) {
-            try {
-              const data = JSON.parse(raw);
-              if (!data.date) continue;
-              if (logsByDate.has(data.date)) {
-                const ex = logsByDate.get(data.date);
-                Object.assign(ex.completions, data.completions || {});
-                Object.assign(ex.categoryDone, data.categoryDone || {});
-              } else {
-                logsByDate.set(data.date, { completions: data.completions || {}, categoryDone: data.categoryDone || {} });
-              }
-            } catch(e) {}
-          }
-        }
-      }
-      let streak = 0;
-      let d = htDaysBefore(refDate || htToday(), 1);
-      for (let i = 0; i < 3650; i++) {
-        const log = logsByDate.get(d);
-        if (log && log.completions && log.completions[habitId]) {
-          streak++;
-          d = htDaysBefore(d, 1);
-        } else if (habit?.seedDate && d >= habit.seedDate && !log) {
-          // No log exists for this day but it's within the seeded range — count it
-          streak++;
-          d = htDaysBefore(d, 1);
-        } else {
-          break;
-        }
-      }
-      return streak;
+      const logsByDate = this._buildLogsByDateMap(records);
+      return this._habitStreakFromMap(habitId, refDate, logsByDate, habit);
     } catch(e) { return 0; }
   }
 
@@ -1161,17 +1401,17 @@ class Plugin extends CollectionPlugin {
     const toggleBtn = document.createElement('button');
     toggleBtn.className = 'ht-toggle-btn';
     toggleBtn.title = this._collapsed ? 'Expand habits' : 'Collapse habits';
-    toggleBtn.textContent = this._collapsed ? '+' : '−';
+    toggleBtn.innerHTML = this._collapsed ? htIcon('plus') : htIcon('minus');
     toggleBtn.addEventListener('click', () => this._toggleCollapse());
 
     const titleEl = document.createElement('span');
     titleEl.className = 'ht-sidebar-title';
-    titleEl.textContent = '🔥 Habits';
+    titleEl.innerHTML = `${htIcon('flame')} Habits`;
 
     // Date nav: prev arrow — date label — next arrow
     const prevBtn = document.createElement('button');
     prevBtn.className = 'ht-nav-btn';
-    prevBtn.innerHTML = '‹';
+    prevBtn.innerHTML = htIcon('chevron-left');
     prevBtn.title = 'Previous day';
 
     const dateEl = document.createElement('span');
@@ -1179,7 +1419,7 @@ class Plugin extends CollectionPlugin {
 
     const nextBtn = document.createElement('button');
     nextBtn.className = 'ht-nav-btn';
-    nextBtn.innerHTML = '›';
+    nextBtn.innerHTML = htIcon('chevron-right');
     nextBtn.title = 'Next day';
 
     const updateDateDisplay = () => {
@@ -1219,12 +1459,12 @@ class Plugin extends CollectionPlugin {
 
     const statsBtn = document.createElement('button');
     statsBtn.className = 'ht-stats-btn';
-    statsBtn.textContent = '📊';
+    statsBtn.innerHTML = htIcon('chart-bar');
     statsBtn.title = 'View stats';
 
     const enterStats = () => {
       body.dataset.mode = 'stats';
-      statsBtn.textContent = '←';
+      statsBtn.innerHTML = htIcon('arrow-left');
       statsBtn.title = 'Back to habits';
       statsBtn.classList.add('active');
       prevBtn.style.display = 'none';
@@ -1234,7 +1474,7 @@ class Plugin extends CollectionPlugin {
     };
     const exitStats = () => {
       body.dataset.mode = 'habits';
-      statsBtn.textContent = '📊';
+      statsBtn.innerHTML = htIcon('chart-bar');
       statsBtn.title = 'View stats';
       statsBtn.classList.remove('active');
       prevBtn.style.display = '';
@@ -1251,7 +1491,7 @@ class Plugin extends CollectionPlugin {
     // Search button + input
     const searchBtn = document.createElement('button');
     searchBtn.className = 'ht-nav-btn';
-    searchBtn.textContent = '🔍';
+    searchBtn.innerHTML = htIcon('search');
     searchBtn.title = 'Search habits';
     searchBtn.style.fontSize = '12px';
 
@@ -1263,7 +1503,7 @@ class Plugin extends CollectionPlugin {
     searchInput.style.cssText = 'flex:1;height:22px;font-size:11px;padding:2px 6px;';
     const searchClose = document.createElement('button');
     searchClose.className = 'ht-nav-btn';
-    searchClose.textContent = '✕';
+    searchClose.innerHTML = htIcon('x');
     searchClose.style.fontSize = '10px';
     searchWrap.appendChild(searchInput);
     searchWrap.appendChild(searchClose);
@@ -1344,8 +1584,7 @@ class Plugin extends CollectionPlugin {
       state.sidebarEl.classList.toggle('ht-collapsed', this._collapsed);
       const btn = state.sidebarEl.querySelector('.ht-toggle-btn');
       if (btn) {
-        // ◀ = collapse (panel is open), ▶ = expand (panel is collapsed)
-        btn.textContent = this._collapsed ? '+' : '−';
+        btn.innerHTML = this._collapsed ? htIcon('plus') : htIcon('minus');
         btn.title = this._collapsed ? 'Expand habits' : 'Collapse habits';
       }
     }
@@ -1372,6 +1611,44 @@ class Plugin extends CollectionPlugin {
     localStorage.setItem('ht_stats_range', String(days));
   }
 
+  /** Day notes textarea under the habit list; persists to log record `notes` field + JSON. */
+  _renderNotesSection(body, log, dateStr, state, token) {
+    const stale = () => state._renderToken !== token || this._inStatsMode(state);
+    body.querySelector('.ht-notes-wrap')?.remove();
+
+    const wrap = document.createElement('div');
+    wrap.className = 'ht-notes-wrap';
+    const label = document.createElement('div');
+    label.className = 'ht-notes-label';
+    label.textContent = 'Notes';
+    const ta = document.createElement('textarea');
+    ta.className = 'ht-notes-input';
+    ta.rows = 2;
+    ta.placeholder = 'Notes for this day…';
+    ta.value = log.notes || '';
+    ta.setAttribute('spellcheck', 'true');
+
+    const flush = async () => {
+      if (stale()) return;
+      clearTimeout(state._notesSaveTimer);
+      const text = ta.value;
+      const fresh = await this._loadLog(dateStr);
+      if (stale()) return;
+      fresh.notes = text;
+      await this._saveLog(dateStr, fresh);
+    };
+
+    ta.addEventListener('input', () => {
+      clearTimeout(state._notesSaveTimer);
+      state._notesSaveTimer = setTimeout(() => { void flush(); }, 450);
+    });
+    ta.addEventListener('blur', () => { void flush(); });
+
+    wrap.appendChild(label);
+    wrap.appendChild(ta);
+    body.appendChild(wrap);
+  }
+
   async _renderSidebar(state) {
     const body = state.bodyEl;
     if (!body || this._inStatsMode(state)) return;
@@ -1385,24 +1662,31 @@ class Plugin extends CollectionPlugin {
 
     if (!config || config.categories.length === 0) {
       if (stale()) return;
+      const dateStrEmpty = state.dateStr || htToday();
+      const recordsEmpty = this._collection ? await this._collection.getAllRecords() : [];
+      if (stale()) return;
+      const logEmpty = this._getLogForDateFromMap(this._buildLogsByDateMap(recordsEmpty), dateStrEmpty);
       body.innerHTML = '';
       const emptyDiv = document.createElement('div');
       emptyDiv.className = 'ht-empty';
       emptyDiv.innerHTML = `
-        <div class="ht-empty-icon">🌱</div>
+        <div class="ht-empty-icon">${htIcon('plant')}</div>
         <div>No habits yet.</div>
         <div style="margin-top:4px;font-size:11px;">Open settings to add categories and habits.</div>
         <button class="ht-setup-btn" data-action="open-settings">Set up habits</button>
       `;
       emptyDiv.querySelector('[data-action="open-settings"]')?.addEventListener('click', () => this.openSettings());
       body.appendChild(emptyDiv);
+      this._renderNotesSection(body, logEmpty, dateStrEmpty, state, token);
       return;
     }
 
-    // Load log for the currently viewed date
+    // One collection load: current-day log + shared map for all streak badges (avoids N× getAllRecords)
     const dateStr = state.dateStr || htToday();
-    const log = await this._loadLog(dateStr);
-    if (stale()) return; // abort if stats opened while we were loading
+    const records = this._collection ? await this._collection.getAllRecords() : [];
+    if (stale()) return;
+    const logsByDate = this._buildLogsByDateMap(records);
+    const log = this._getLogForDateFromMap(logsByDate, dateStr);
 
     // Progress bar — keep stable (update in-place if it exists)
     const allHabits = config.habits.filter(h => !h.archived);
@@ -1453,8 +1737,7 @@ class Plugin extends CollectionPlugin {
       });
       const catIsDone = anyDone;
 
-      const streak = await this._getCategoryStreak(cat.id);
-      if (stale()) return;
+      const streak = this._categoryStreakFromMap(cat.id, undefined, logsByDate, cat);
       const isOpen = !this._catCollapsed[cat.id];
 
       const catEl = document.createElement('div');
@@ -1463,13 +1746,13 @@ class Plugin extends CollectionPlugin {
       const catHeader = document.createElement('div');
       catHeader.className = 'ht-category-header';
       catHeader.innerHTML = `
-        <span class="ht-category-caret ${isOpen ? 'open' : ''}">▶</span>
-        <span class="ht-category-emoji">${htEsc(cat.emoji || '📋')}</span>
+        <span class="ht-category-caret ${isOpen ? 'open' : ''}">${htIcon('chevron-right')}</span>
+        <span class="ht-category-emoji">${htCategoryGlyphHtml(cat.emoji)}</span>
         <span class="ht-category-name">${htEsc(cat.name)}</span>
         <span class="ht-category-status ${catIsDone ? 'ht-cat-done' : 'ht-cat-pending'}">
-          ${catIsDone ? '✅' : '○'}
+          ${catIsDone ? htIcon('circle-check') : htIcon('circle')}
         </span>
-        ${streak > 0 ? `<span class="ht-streak-badge">🔥${streak}d</span>` : ''}
+        ${streak > 0 ? `<span class="ht-streak-badge">${htIcon('flame')}${streak}d</span>` : ''}
       `;
       catHeader.addEventListener('click', () => this._toggleCategory(cat.id, state));
 
@@ -1483,8 +1766,7 @@ class Plugin extends CollectionPlugin {
         const isNumeric = hasTarget;
         const currentVal = typeof rawVal === 'number' ? rawVal : (rawVal ? 1 : 0);
         const isDone = hasTarget ? currentVal >= habit.target : !!rawVal;
-        const hStreak = await this._getHabitStreak(habit.id);
-        if (stale()) return;
+        const hStreak = this._habitStreakFromMap(habit.id, undefined, logsByDate, habit);
 
         const habitEl = document.createElement('div');
         habitEl.className = 'ht-habit' + (isDone ? ' ht-done' : '');
@@ -1496,7 +1778,7 @@ class Plugin extends CollectionPlugin {
           const r = 8; const circ = 2 * Math.PI * r;
           const pct = Math.min(1, currentVal / habit.target);
           const dash = circ * pct;
-          const label = currentVal >= habit.target ? '✓' : `${currentVal}`;
+          const label = currentVal >= habit.target ? htIcon('check') : `${currentVal}`;
           indicatorHTML = `
             <div class="ht-habit-ring">
               <svg width="22" height="22" viewBox="0 0 22 22">
@@ -1508,12 +1790,12 @@ class Plugin extends CollectionPlugin {
               <div class="ht-habit-ring-label">${label}</div>
             </div>`;
         } else {
-          indicatorHTML = `<div class="ht-habit-check">${isDone ? '✓' : ''}</div>`;
+          indicatorHTML = `<div class="ht-habit-check">${isDone ? htIcon('check') : ''}</div>`;
         }
 
         const unitLabel = habit.unit ? htEsc(habit.unit) : '';
         const targetLabel = hasTarget ? `<span style="font-size:10px;color:#8a7e6a;margin-left:2px;">${currentVal}/${habit.target}${unitLabel ? ' ' + unitLabel : ''}</span>` : '';
-        const streakHTML = hStreak > 0 ? `<span class="ht-habit-streak ${hStreak >= 7 ? 'hot' : ''}">🔥${hStreak}d</span>` : '';
+        const streakHTML = hStreak > 0 ? `<span class="ht-habit-streak ${hStreak >= 7 ? 'hot' : ''}">${htIcon('flame')}${hStreak}d</span>` : '';
 
         habitEl.innerHTML = `
           ${indicatorHTML}
@@ -1597,6 +1879,7 @@ class Plugin extends CollectionPlugin {
     }
     // Single DOM swap — no intermediate empty state, no collapse
     catsWrap.replaceChildren(fragment);
+    this._renderNotesSection(body, log, dateStr, state, token);
   }
 
   _toggleCategory(catId, state) {
@@ -1689,7 +1972,7 @@ class Plugin extends CollectionPlugin {
       const fill = habitEl.querySelector('.ht-habit-ring-fill');
       const label = habitEl.querySelector('.ht-habit-ring-label');
       if (fill) fill.style.strokeDashoffset = circ - circ * pct;
-      if (label) label.textContent = isDone ? '✓' : String(currentVal);
+      if (label) label.innerHTML = isDone ? htIcon('check') : String(currentVal);
       // Update inline count label
       const nameEl = habitEl.querySelector('.ht-habit-name');
       if (nameEl) {
@@ -1700,7 +1983,7 @@ class Plugin extends CollectionPlugin {
       }
     } else {
       const check = habitEl.querySelector('.ht-habit-check');
-      if (check) check.textContent = isDone ? '✓' : '';
+      if (check) check.innerHTML = isDone ? htIcon('check') : '';
     }
 
     // Update category header status badge and streak badge
@@ -1711,7 +1994,7 @@ class Plugin extends CollectionPlugin {
       const catDone = !!(log.categoryDone[catId]);
       if (statusEl) {
         statusEl.className = `ht-category-status ${catDone ? 'ht-cat-done' : 'ht-cat-pending'}`;
-        statusEl.textContent = catDone ? '✅' : '○';
+        statusEl.innerHTML = catDone ? htIcon('circle-check') : htIcon('circle');
       }
     }
 
@@ -1757,7 +2040,7 @@ class Plugin extends CollectionPlugin {
 
     const okBtn = document.createElement('button');
     okBtn.className = 'ht-num-btn';
-    okBtn.textContent = '✓';
+    okBtn.innerHTML = htIcon('check');
     okBtn.style.background = 'rgba(76,175,80,0.2)';
     okBtn.style.borderColor = '#4caf50';
     okBtn.style.color = '#4caf50';
@@ -1851,12 +2134,12 @@ class Plugin extends CollectionPlugin {
       const sel = document.createElement('select');
       sel.className = 'ht-stats-select';
       const opt0 = document.createElement('option');
-      opt0.value = '__overall__'; opt0.textContent = '🌐 Overall';
+      opt0.value = '__overall__'; opt0.textContent = 'Overall';
       sel.appendChild(opt0);
       for (const cat of config.categories) {
         const o = document.createElement('option');
         o.value = 'cat:' + cat.id;
-        o.textContent = `${cat.emoji || '📋'} ${cat.name} (category)`;
+        o.textContent = `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')} (category)`;
         sel.appendChild(o);
         for (const h of config.habits.filter(h2 => h2.categoryId === cat.id && !h2.archived)) {
           const oh = document.createElement('option');
@@ -1997,7 +2280,7 @@ class Plugin extends CollectionPlugin {
       input.min = 0; input.max = 9999;
 
       const okBtn = document.createElement('button');
-      okBtn.className = 'ht-num-btn'; okBtn.textContent = '✓';
+      okBtn.className = 'ht-num-btn'; okBtn.innerHTML = htIcon('check');
       okBtn.style.cssText = 'background:rgba(76,175,80,0.2);border-color:#4caf50;color:#4caf50;';
 
       const commit = async () => {
@@ -2289,12 +2572,12 @@ class Plugin extends CollectionPlugin {
           const nav = document.createElement('div');
           nav.className = 'ht-cal-month-nav';
           const prevMo = document.createElement('button');
-          prevMo.className = 'ht-cal-nav-btn'; prevMo.textContent = '‹';
+          prevMo.className = 'ht-cal-nav-btn'; prevMo.innerHTML = htIcon('chevron-left');
           const monthTitle = document.createElement('span');
           monthTitle.className = 'ht-cal-month-title';
           monthTitle.textContent = new Date(year, month, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
           const nextMo = document.createElement('button');
-          nextMo.className = 'ht-cal-nav-btn'; nextMo.textContent = '›';
+          nextMo.className = 'ht-cal-nav-btn'; nextMo.innerHTML = htIcon('chevron-right');
           prevMo.addEventListener('click', () => {
             calMonth--; if (calMonth < 0) { calMonth = 11; calYear--; }
             renderMonth(calYear, calMonth);
@@ -2481,7 +2764,7 @@ class Plugin extends CollectionPlugin {
           const row = document.createElement('div');
           row.className = 'ht-cat-rate-row';
           row.innerHTML = `
-            <span class="ht-cat-rate-name">${htEsc(c.emoji||'')} ${htEsc(c.name)}</span>
+            <span class="ht-cat-rate-name"><span class="ht-cat-glyph-inline">${htCategoryGlyphHtml(c.emoji)}</span>${htEsc(c.name)}</span>
             <div class="ht-cat-rate-bar-wrap"><div class="ht-cat-rate-bar" style="width:${rate}%"></div></div>
             <span class="ht-cat-rate-pct">${rate}%</span>
           `;
@@ -2495,10 +2778,19 @@ class Plugin extends CollectionPlugin {
     await renderContent();
   }
 
-  refreshAllPanels() {
+  /** Re-render every mounted panel (habits or stats) after config/logs change. */
+  async refreshAllPanels() {
     for (const [, state] of (this._panelStates || [])) {
-      if (state.bodyEl?.dataset?.mode === 'stats') continue;
-      this._renderSidebar(state);
+      if (!state.bodyEl) continue;
+      try {
+        if (state.bodyEl.dataset?.mode === 'stats') {
+          await this._renderStats(state, state.bodyEl);
+        } else {
+          await this._renderSidebar(state);
+        }
+      } catch (e) {
+        console.error('[HabitTracker] refreshAllPanels:', e);
+      }
     }
   }
 
@@ -2522,8 +2814,8 @@ class Plugin extends CollectionPlugin {
 
     modal.innerHTML = `
       <div class="ht-modal-header">
-        <span class="ht-modal-title">🔥 HabitTracker — Manage Habits</span>
-        <button class="ht-modal-close" title="Close">✕</button>
+        <span class="ht-modal-title">${htIcon('flame')} HabitTracker — Manage Habits</span>
+        <button class="ht-modal-close" title="Close">${htIcon('x')}</button>
       </div>
       <div class="ht-modal-body" id="ht-settings-body"></div>
       <div class="ht-modal-footer">
@@ -2538,7 +2830,7 @@ class Plugin extends CollectionPlugin {
       this._config = draft;
       await this._saveConfig();
       overlay.remove();
-      this.refreshAllPanels();
+      await this.refreshAllPanels();
       this.ui.addToaster({ title: 'HabitTracker', message: 'Habits saved!', dismissible: true, autoDestroyTime: 2000 });
     });
 
@@ -2576,12 +2868,12 @@ class Plugin extends CollectionPlugin {
         item.draggable = false;  // enabled only via handle mousedown
         item.dataset.catId = cat.id;
         item.innerHTML = `
-          <span class="ht-drag-handle" title="Drag to reorder">⠿</span>
-          <span class="ht-item-emoji">${htEsc(cat.emoji || '📋')}</span>
+          <span class="ht-drag-handle" title="Drag to reorder">${htIcon('grip-vertical')}</span>
+          <span class="ht-item-emoji">${htCategoryGlyphHtml(cat.emoji)}</span>
           <span class="ht-item-left"><span class="ht-item-name">${htEsc(cat.name)}</span></span>
           <div class="ht-item-actions">
-            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="edit-cat" data-id="${cat.id}" title="Edit">✏️</button>
-            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-cat" data-id="${cat.id}" title="Delete">🗑</button>
+            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="edit-cat" data-id="${cat.id}" title="Edit">${htIcon('pencil')}</button>
+            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-cat" data-id="${cat.id}" title="Delete">${htIcon('trash')}</button>
           </div>
         `;
 
@@ -2646,11 +2938,13 @@ class Plugin extends CollectionPlugin {
           const editForm = document.createElement('div');
           editForm.style.cssText = 'display:flex;flex:1;gap:6px;align-items:center;flex-wrap:wrap;';
 
-          const emojiInput = document.createElement('input');
-          emojiInput.className = 'ht-input';
-          emojiInput.value = cat.emoji || '📋';
-          emojiInput.style.cssText = 'width:52px;flex-shrink:0;text-align:center;';
-          emojiInput.placeholder = '📋';
+          const iconSelect = document.createElement('select');
+          iconSelect.className = 'ht-input ht-icon-select';
+          iconSelect.style.cssText = 'flex-shrink:0;';
+          htFillIconSelect(iconSelect, cat.emoji);
+          const iconPreview = document.createElement('span');
+          iconPreview.className = 'ht-icon-preview';
+          htBindIconPreview(iconSelect, iconPreview);
 
           const nameInput = document.createElement('input');
           nameInput.className = 'ht-input';
@@ -2675,7 +2969,7 @@ class Plugin extends CollectionPlugin {
           saveBtn.addEventListener('click', () => {
             const newName = nameInput.value.trim();
             if (!newName) return;
-            cat.emoji = emojiInput.value.trim() || '📋';
+            cat.emoji = iconSelect.value || 'folder';
             cat.name = newName;
             finish();
             renderCats();
@@ -2687,7 +2981,8 @@ class Plugin extends CollectionPlugin {
             if (e.key === 'Escape') cancelBtn.click();
           });
 
-          editForm.appendChild(emojiInput);
+          editForm.appendChild(iconSelect);
+          editForm.appendChild(iconPreview);
           editForm.appendChild(nameInput);
           editForm.appendChild(saveBtn);
           editForm.appendChild(cancelBtn);
@@ -2712,24 +3007,38 @@ class Plugin extends CollectionPlugin {
     // Add category row
     const addCatRow = document.createElement('div');
     addCatRow.className = 'ht-add-row';
-    addCatRow.innerHTML = `
-      <input class="ht-input" id="ht-new-cat-emoji" placeholder="Emoji" style="max-width:60px;">
-      <input class="ht-input" id="ht-new-cat-name" placeholder="Category name (e.g. expansion)">
-      <button class="ht-btn ht-btn-primary ht-btn-sm" id="ht-add-cat-btn">Add</button>
-    `;
-    addCatRow.querySelector('#ht-add-cat-btn').addEventListener('click', () => {
-      const emoji = addCatRow.querySelector('#ht-new-cat-emoji').value.trim() || '📋';
-      const name = addCatRow.querySelector('#ht-new-cat-name').value.trim();
+    const newCatIconSel = document.createElement('select');
+    newCatIconSel.className = 'ht-input ht-icon-select';
+    newCatIconSel.id = 'ht-new-cat-icon';
+    htFillIconSelect(newCatIconSel, 'folder');
+    const newCatIconPrev = document.createElement('span');
+    newCatIconPrev.className = 'ht-icon-preview';
+    htBindIconPreview(newCatIconSel, newCatIconPrev);
+    const newCatName = document.createElement('input');
+    newCatName.className = 'ht-input';
+    newCatName.id = 'ht-new-cat-name';
+    newCatName.placeholder = 'Category name (e.g. expansion)';
+    const newCatBtn = document.createElement('button');
+    newCatBtn.className = 'ht-btn ht-btn-primary ht-btn-sm';
+    newCatBtn.id = 'ht-add-cat-btn';
+    newCatBtn.textContent = 'Add';
+    addCatRow.appendChild(newCatIconSel);
+    addCatRow.appendChild(newCatIconPrev);
+    addCatRow.appendChild(newCatName);
+    addCatRow.appendChild(newCatBtn);
+    newCatBtn.addEventListener('click', () => {
+      const emoji = newCatIconSel.value || 'folder';
+      const name = newCatName.value.trim();
       if (!name) return;
       draft.categories.push({ id: htGenId(), name, emoji, order: draft.categories.length });
-      addCatRow.querySelector('#ht-new-cat-emoji').value = '';
-      addCatRow.querySelector('#ht-new-cat-name').value = '';
+      htFillIconSelect(newCatIconSel, 'folder');
+      newCatIconSel.dispatchEvent(new Event('change'));
+      newCatName.value = '';
       renderCats();
       renderHabits(); // refresh category select
     });
-    // Allow Enter key in name field
-    addCatRow.querySelector('#ht-new-cat-name').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') addCatRow.querySelector('#ht-add-cat-btn').click();
+    newCatName.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') newCatBtn.click();
     });
     container.appendChild(addCatRow);
 
@@ -2753,9 +3062,9 @@ class Plugin extends CollectionPlugin {
     bulkBar.style.display = 'none';
     bulkBar.innerHTML = `
       <span id="ht-bulk-count" style="flex:1;font-weight:600;"></span>
-      <button class="ht-btn ht-btn-danger ht-btn-sm" id="ht-bulk-delete">🗑 Delete selected</button>
-      <button class="ht-btn ht-btn-secondary ht-btn-sm" id="ht-bulk-archive">📦 Archive selected</button>
-      <button class="ht-btn ht-btn-secondary ht-btn-sm" id="ht-bulk-clear">✕ Deselect all</button>
+      <button class="ht-btn ht-btn-danger ht-btn-sm" id="ht-bulk-delete">${htIcon('trash')} Delete selected</button>
+      <button class="ht-btn ht-btn-secondary ht-btn-sm" id="ht-bulk-archive">${htIcon('package')} Archive selected</button>
+      <button class="ht-btn ht-btn-secondary ht-btn-sm" id="ht-bulk-clear">${htIcon('x')} Deselect all</button>
     `;
     container.appendChild(bulkBar);
 
@@ -2798,7 +3107,7 @@ This cannot be undone.`)) return;
 
     const renderArchive = () => {
       const archived = draft.habits.filter(h => h.archived);
-      archiveTitle.innerHTML = `<span style="flex:1">📦 Archived (${archived.length})</span><span style="font-size:10px;opacity:0.6">${archiveOpen ? '▲ hide' : '▼ show'}</span>`;
+      archiveTitle.innerHTML = `<span style="flex:1;display:inline-flex;align-items:center;gap:6px;">${htIcon('package')} Archived (${archived.length})</span><span style="font-size:10px;opacity:0.6">${archiveOpen ? `${htIcon('chevron-up')} hide` : `${htIcon('chevron-down')} show`}</span>`;
       archiveList.style.display = archiveOpen ? '' : 'none';
       archiveList.innerHTML = '';
       if (archived.length === 0) {
@@ -2815,11 +3124,11 @@ This cannot be undone.`)) return;
           <input type="checkbox" class="ht-habit-cb" ${selected.has(habit.id) ? 'checked' : ''} title="Select">
           <div class="ht-item-left">
             <span class="ht-item-name" style="color:#8a7e6a;text-decoration:line-through">${htEsc(habit.name)}</span>
-            <span class="ht-item-sub">${htEsc(cat?.emoji || '')} ${htEsc(cat?.name || 'Unknown')}</span>
+            <span class="ht-item-sub"><span class="ht-cat-glyph-inline">${htCategoryGlyphHtml(cat?.emoji)}</span> ${htEsc(cat?.name || 'Unknown')}</span>
           </div>
           <div class="ht-item-actions">
-            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="unarchive-habit" data-id="${habit.id}" title="Restore">↩ Restore</button>
-            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-habit" data-id="${habit.id}" title="Delete permanently">🗑</button>
+            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="unarchive-habit" data-id="${habit.id}" title="Restore">${htIcon('arrow-back-up')} Restore</button>
+            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-habit" data-id="${habit.id}" title="Delete permanently">${htIcon('trash')}</button>
           </div>
         `;
         item.querySelector('.ht-habit-cb').addEventListener('change', (e) => {
@@ -2866,20 +3175,20 @@ This cannot be undone.`)) return;
         item.className = 'ht-habit-item';
         item.draggable = false;  // enabled only via handle mousedown
         item.dataset.habitId = habit.id;
-        const seedHint = habit.seedDate ? `<span style="font-size:10px;color:#c4a882;margin-left:4px;" title="Streak seeded from ${habit.seedDate}">🔥 since ${habit.seedDate}</span>` : '';
-        const targetHint = habit.target > 0 ? ` · 🎯${habit.target}${habit.unit ? ' ' + habit.unit : ''}` : '';
+        const seedHint = habit.seedDate ? `<span style="font-size:10px;color:#c4a882;margin-left:4px;" title="Streak seeded from ${habit.seedDate}">${htIcon('flame')} since ${habit.seedDate}</span>` : '';
+        const targetHint = habit.target > 0 ? ` · ${htIcon('target')} ${habit.target}${habit.unit ? ' ' + habit.unit : ''}` : '';
         if (selected.has(habit.id)) item.classList.add('ht-selected');
         item.innerHTML = `
           <input type="checkbox" class="ht-habit-cb" ${selected.has(habit.id) ? 'checked' : ''} title="Select">
-          <span class="ht-drag-handle" title="Drag to reorder">⠿</span>
+          <span class="ht-drag-handle" title="Drag to reorder">${htIcon('grip-vertical')}</span>
           <div class="ht-item-left">
             <span class="ht-item-name">${htEsc(habit.name)}${seedHint}</span>
-            <span class="ht-item-sub">${htEsc(cat?.emoji || '')} ${htEsc(cat?.name || 'Unknown')}${targetHint}</span>
+            <span class="ht-item-sub"><span class="ht-cat-glyph-inline">${htCategoryGlyphHtml(cat?.emoji)}</span> ${htEsc(cat?.name || 'Unknown')}${targetHint}</span>
           </div>
           <div class="ht-item-actions">
-            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="edit-habit" data-id="${habit.id}" title="Edit">✏️</button>
-            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="archive-habit" data-id="${habit.id}" title="Archive">📦</button>
-            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-habit" data-id="${habit.id}" title="Delete">🗑</button>
+            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="edit-habit" data-id="${habit.id}" title="Edit">${htIcon('pencil')}</button>
+            <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="archive-habit" data-id="${habit.id}" title="Archive">${htIcon('package')}</button>
+            <button class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-habit" data-id="${habit.id}" title="Delete">${htIcon('trash')}</button>
           </div>
         `;
         item.querySelector('.ht-habit-cb').addEventListener('change', (e) => {
@@ -2977,7 +3286,7 @@ This cannot be undone.`)) return;
           for (const c of draft.categories) {
             const o = document.createElement('option');
             o.value = c.id;
-            o.textContent = `${c.emoji || ''} ${c.name}`;
+            o.textContent = `${[htCategoryGlyphText(c.emoji), c.name].filter(Boolean).join(' ')}`;
             if (c.id === habit.categoryId) o.selected = true;
             catSel.appendChild(o);
           }
@@ -2987,7 +3296,7 @@ This cannot be undone.`)) return;
           seedRow.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:4px;flex-wrap:wrap;';
           const seedLabel = document.createElement('span');
           seedLabel.style.cssText = 'font-size:11px;color:#8a7e6a;white-space:nowrap;';
-          seedLabel.textContent = '🔥 Streak since:';
+          seedLabel.innerHTML = `${htIcon('flame')} Streak since:`;
           const seedInput = document.createElement('input');
           seedInput.type = 'date';
           seedInput.className = 'ht-input';
@@ -2996,7 +3305,7 @@ This cannot be undone.`)) return;
           seedInput.title = 'Set this to bring over an existing streak from another app';
           const clearSeedBtn = document.createElement('button');
           clearSeedBtn.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-          clearSeedBtn.textContent = '✕ Clear';
+          clearSeedBtn.innerHTML = `${htIcon('x')} Clear`;
           clearSeedBtn.addEventListener('click', () => { seedInput.value = ''; });
           seedRow.appendChild(seedLabel);
           seedRow.appendChild(seedInput);
@@ -3021,7 +3330,7 @@ This cannot be undone.`)) return;
           targetRow.style.cssText = 'display:flex;align-items:center;gap:6px;width:100%;margin-top:4px;flex-wrap:wrap;';
           const targetLabel = document.createElement('span');
           targetLabel.style.cssText = 'font-size:11px;color:#8a7e6a;white-space:nowrap;';
-          targetLabel.textContent = '🎯 Daily target:';
+          targetLabel.innerHTML = `${htIcon('target')} Daily target:`;
           const targetInput = document.createElement('input');
           targetInput.type = 'number';
           targetInput.className = 'ht-input';
@@ -3037,7 +3346,7 @@ This cannot be undone.`)) return;
           unitInput.value = habit.unit || '';
           const clearTargetBtn = document.createElement('button');
           clearTargetBtn.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-          clearTargetBtn.textContent = '✕';
+          clearTargetBtn.innerHTML = htIcon('x');
           clearTargetBtn.title = 'Clear target (back to checkbox)';
           clearTargetBtn.addEventListener('click', () => { targetInput.value = ''; unitInput.value = ''; });
           targetRow.appendChild(targetLabel);
@@ -3091,7 +3400,7 @@ This cannot be undone.`)) return;
           renderArchive();
         });
         item.querySelector('[data-action="del-habit"]').addEventListener('click', () => {
-          if (!confirm(`Permanently delete "${habit.name}"? This cannot be undone.\n\nTip: use 📦 Archive instead to keep your history.`)) return;
+          if (!confirm(`Permanently delete "${habit.name}"? This cannot be undone.\n\nTip: use Archive instead to keep your history.`)) return;
           const idx = draft.habits.findIndex(h => h.id === habit.id);
           if (idx >= 0) draft.habits.splice(idx, 1);
           renderHabits();
@@ -3125,7 +3434,7 @@ This cannot be undone.`)) return;
         for (const cat of draft.categories) {
           const opt = document.createElement('option');
           opt.value = cat.id;
-          opt.textContent = `${cat.emoji || ''} ${cat.name}`;
+          opt.textContent = `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')}`;
           catSelect.appendChild(opt);
         }
       }
@@ -3207,16 +3516,16 @@ This cannot be undone.`)) return;
       await htSleep(400);
       const verify = await this._loadLog(testDate);
       const writeOk = verify.completions?.test === true;
-      writeTest = (priorPersisted ? '✅ persisted · ' : '❌ NOT persisted across reload · ') +
-                  (writeOk ? '✅ write works' : '❌ write failed');
-    } catch(e) { writeTest = '❌ ERROR: ' + e.message; }
+      writeTest = (priorPersisted ? 'OK persisted · ' : 'NOT persisted across reload · ') +
+                  (writeOk ? 'OK write works' : 'write failed');
+    } catch(e) { writeTest = 'ERROR: ' + e.message; }
 
     // Test createRecord directly
     let createTest = 'not tested';
     try {
       const testName = 'log-1970-01-02-test';
       const guid = this._collection.createRecord(testName);
-      createTest = guid ? `✅ got guid: ${guid.slice(0,8)}…` : '❌ createRecord returned null/undefined';
+      createTest = guid ? `OK got guid: ${guid.slice(0,8)}…` : 'createRecord returned null/undefined';
       if (guid) {
         await htSleep(300);
         const all2 = await this._collection.getAllRecords();
@@ -3225,12 +3534,12 @@ This cannot be undone.`)) return;
           found.prop('data')?.set(JSON.stringify({ date: testName, completions: { create_test: true }, categoryDone: {} }));
           await htSleep(200);
           const readback = found.prop('data')?.get?.() || found.text?.('data') || '';
-          createTest += readback ? ` · ✅ data set+read ok` : ` · ❌ data set but read empty`;
+          createTest += readback ? ` · data set+read ok` : ` · data set but read empty`;
         } else {
-          createTest += ' · ❌ record not found after creation';
+          createTest += ' · record not found after creation';
         }
       }
-    } catch(e) { createTest = '❌ ERROR: ' + e.message; }
+    } catch(e) { createTest = 'ERROR: ' + e.message; }
 
     // Cross-reference: check if the habit IDs in log records match current config
     const cfg = this._config || { habits: [], categories: [] };
@@ -3299,20 +3608,22 @@ This cannot be undone.`)) return;
         const d = JSON.parse(raw);
         const hasCompletions = d.completions && Object.keys(d.completions).length > 0;
         const hasCatDone = d.categoryDone && Object.keys(d.categoryDone).length > 0;
-        if (!hasCompletions && !hasCatDone) toDelete.push(r);
+        const hasNotesInJson = d.notes != null && String(d.notes).trim() !== '';
+        const hasNotesProp = String(this._readNotesProp(r) || '').trim() !== '';
+        if (!hasCompletions && !hasCatDone && !hasNotesInJson && !hasNotesProp) toDelete.push(r);
       } catch(e) { toDelete.push(r); }
     }
     if (toDelete.length === 0) {
-      this.ui.addToaster({ title: '✅ No empty log records found', autoDestroyTime: 3000 });
+      this.ui.addToaster({ title: 'No empty log records found', autoDestroyTime: 3000 });
       return;
     }
     if (!confirm(`Delete ${toDelete.length} empty log records? These are leftover from a failed import.`)) return;
-    this.ui.addToaster({ title: `🗑 Deleting ${toDelete.length} empty records…`, autoDestroyTime: 3000 });
+    this.ui.addToaster({ title: `Deleting ${toDelete.length} empty records…`, autoDestroyTime: 3000 });
     for (const r of toDelete) {
       try { await r.delete?.(); } catch(e) { try { r.prop('data')?.set?.('{"date":"","completions":{},"categoryDone":{}}'); } catch(e2) {} }
       await htSleep(30);
     }
-    this.ui.addToaster({ title: `✅ Deleted ${toDelete.length} empty log records`, autoDestroyTime: 4000 });
+    this.ui.addToaster({ title: `Deleted ${toDelete.length} empty log records`, autoDestroyTime: 4000 });
     this.refreshAllPanels();
   }
 
@@ -3338,11 +3649,11 @@ This cannot be undone.`)) return;
   _importerShowUpload(modal) {
     modal.innerHTML = `
       <div class="ht-modal-header">
-        <span class="ht-modal-title">📥 Import from TickTick</span>
-        <button class="ht-modal-close">✕</button>
+        <span class="ht-modal-title">${htIcon('download')} Import from TickTick</span>
+        <button class="ht-modal-close">${htIcon('x')}</button>
       </div>
       <div class="ht-modal-body" style="display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px 24px;text-align:center;">
-        <div style="font-size:48px;">📊</div>
+        <div style="font-size:48px;line-height:1;">${htIcon('chart-bar')}</div>
         <div style="font-size:15px;font-weight:600;color:#e8e0d0;">Upload your TickTick export</div>
         <div style="font-size:12px;color:#8a7e6a;max-width:380px;">
           Export your habits from TickTick (Settings → Export → Excel), then upload the .xlsx file here.
@@ -3371,7 +3682,7 @@ This cannot be undone.`)) return;
         await htSleep(300);
         this._importerShowMapping(modal, habits);
       } catch(e) {
-        status.textContent = '❌ Error parsing file: ' + e.message;
+        status.textContent = 'Error parsing file: ' + e.message;
         console.error('[TTImport]', e);
       }
     });
@@ -3486,15 +3797,15 @@ This cannot be undone.`)) return;
 
     modal.innerHTML = `
       <div class="ht-modal-header">
-        <span class="ht-modal-title">📥 Map TickTick Habits (${ttHabits.length})</span>
-        <button class="ht-modal-close">✕</button>
+        <span class="ht-modal-title">${htIcon('download')} Map TickTick Habits (${ttHabits.length})</span>
+        <button class="ht-modal-close">${htIcon('x')}</button>
       </div>
       <div style="padding:8px 16px;background:rgba(124,106,247,0.1);border-bottom:1px solid rgba(255,255,255,0.07);font-size:11px;color:#8a7e6a;display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
         <span>
-          <span style="color:#c4b8ff;">🔗 Map to habit</span> ·
-          <span style="color:#ffaa44;">🗂 Map to category</span> ·
-          <span style="color:#4caf50;">✨ Add new</span> ·
-          <span>⏭ Skip</span>
+          <span style="color:#c4b8ff;">${htIcon('link')} Map to habit</span> ·
+          <span style="color:#ffaa44;">${htIcon('folders')} Map to category</span> ·
+          <span style="color:#4caf50;">${htIcon('sparkles')} Add new</span> ·
+          <span>${htIcon('player-skip-forward')} Skip</span>
         </span>
         <span style="margin-left:auto;display:flex;gap:6px;">
           <button id="ht-map-all-new" style="background:none;border:1px solid #4caf50;color:#4caf50;border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer;">Unmapped → New</button>
@@ -3505,7 +3816,7 @@ This cannot be undone.`)) return;
       <div class="ht-modal-footer" style="display:flex;gap:8px;justify-content:space-between;align-items:center;">
         <span id="ht-map-summary" style="font-size:11px;color:#8a7e6a;"></span>
         <div style="display:flex;gap:8px;">
-          <button class="ht-btn ht-btn-secondary" id="ht-map-back">← Back</button>
+          <button class="ht-btn ht-btn-secondary" id="ht-map-back">${htIcon('arrow-left')} Back</button>
           <button class="ht-btn ht-btn-primary" id="ht-map-import">Review →</button>
         </div>
       </div>
@@ -3559,7 +3870,7 @@ This cannot be undone.`)) return;
 
       const actionSel = document.createElement('select');
       actionSel.style.cssText = 'background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.12);color:#e8e0d0;border-radius:4px;padding:2px 4px;font-size:11px;cursor:pointer;';
-      [['map','🔗 Map to habit…'],['cat','🗂 Map to category…'],['new','✨ Add as new habit'],['skip','⏭ Skip']].forEach(([val,label]) => {
+      [['map','Map to habit…'],['cat','Map to category…'],['new','Add as new habit'],['skip','Skip']].forEach(([val,label]) => {
         const o = document.createElement('option');
         o.value=val; o.textContent=label; o.selected=(val===mapping.action);
         actionSel.appendChild(o);
@@ -3589,7 +3900,7 @@ This cannot be undone.`)) return;
             if (h.categoryId !== lastCat) {
               const cat = config.categories.find(c=>c.id===h.categoryId);
               const og = document.createElement('optgroup');
-              og.label = cat ? `${cat.emoji||''} ${cat.name}` : 'Uncategorized';
+              og.label = cat ? `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')}` : 'Uncategorized';
               picker.appendChild(og); lastCat = h.categoryId;
             }
             const o = document.createElement('option');
@@ -3602,7 +3913,7 @@ This cannot be undone.`)) return;
           blank.value=''; blank.textContent='— choose category —'; picker.appendChild(blank);
           for (const c of config.categories) {
             const o = document.createElement('option');
-            o.value=c.id; o.textContent=`${c.emoji||''} ${c.name}`; o.selected=(c.id===mapping.thymerCatId);
+            o.value=c.id; o.textContent=`${[htCategoryGlyphText(c.emoji), c.name].filter(Boolean).join(' ')}`; o.selected=(c.id===mapping.thymerCatId);
             picker.appendChild(o);
           }
           picker.style.display=''; archToggle.style.display='none';
@@ -3654,8 +3965,8 @@ This cannot be undone.`)) return;
 
     modal.innerHTML = `
       <div class="ht-modal-header">
-        <span class="ht-modal-title">📥 Confirm Import</span>
-        <button class="ht-modal-close">✕</button>
+        <span class="ht-modal-title">${htIcon('download')} Confirm Import</span>
+        <button class="ht-modal-close">${htIcon('x')}</button>
       </div>
       <div class="ht-modal-body" style="padding:24px;display:flex;flex-direction:column;gap:12px;">
         <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;">
@@ -3680,7 +3991,7 @@ This cannot be undone.`)) return;
           ~${totalLogs.toLocaleString()} completion logs to write · existing Thymer logs won't be overwritten
         </div>
         ${unmapped.length ? `<div style="font-size:11px;color:#ffaa44;padding:8px 12px;background:rgba(255,170,68,0.1);border-radius:6px;">
-          ⚠️ ${unmapped.length} "Map to habit" with no target selected — will be added as new instead.
+          ${htIcon('alert-triangle')} ${unmapped.length} "Map to habit" with no target selected — will be added as new instead.
         </div>` : ''}
         <label style="display:flex;align-items:center;gap:8px;font-size:12px;color:#e8e0d0;cursor:pointer;padding:8px 12px;background:rgba(255,255,255,0.05);border-radius:6px;">
           <input type="checkbox" id="ht-overwrite-cb" style="accent-color:#7c6af7;cursor:pointer;">
@@ -3694,7 +4005,7 @@ This cannot be undone.`)) return;
         </div>
       </div>
       <div class="ht-modal-footer" style="justify-content:space-between;">
-        <button class="ht-btn ht-btn-secondary" id="ht-confirm-back">← Back</button>
+        <button class="ht-btn ht-btn-secondary" id="ht-confirm-back">${htIcon('arrow-left')} Back</button>
         <button class="ht-btn ht-btn-primary" id="ht-confirm-go">Run Import</button>
       </div>
     `;
@@ -3871,11 +4182,11 @@ This cannot be undone.`)) return;
     // Show completion screen
     modal.innerHTML = `
       <div class="ht-modal-header">
-        <span class="ht-modal-title">🎉 Import Complete</span>
-        <button class="ht-modal-close">✕</button>
+        <span class="ht-modal-title">${htIcon('confetti')} Import Complete</span>
+        <button class="ht-modal-close">${htIcon('x')}</button>
       </div>
       <div class="ht-modal-body" style="padding:40px 24px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:16px;">
-        <div style="font-size:48px;">✅</div>
+        <div style="font-size:48px;line-height:1;">${htIcon('circle-check')}</div>
         <div style="font-size:15px;font-weight:600;color:#e8e0d0;">${written.toLocaleString()} log records written</div>
         <div style="font-size:12px;color:#8a7e6a;">Your habit history has been imported.<br>Refresh the page if the sidebar doesn't update.</div>
       </div>
