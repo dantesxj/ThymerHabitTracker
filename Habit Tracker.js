@@ -1,5 +1,6 @@
 /**
  * HabitTracker — Standalone CollectionPlugin
+ * @version 1.0.2
  *
  * Data model (all stored as records in own collection):
  *   - One "config" record (title: "__config__") — stores categories/habits as JSON in `data`
@@ -1357,6 +1358,20 @@ class Plugin extends CollectionPlugin {
     return state.bodyEl?.dataset?.mode === 'stats';
   }
 
+  /** 7d/30d stats window — persisted across journal navigation (same as sidebar collapse) */
+  _getStatsRangeDays(state) {
+    const stored = parseInt(localStorage.getItem('ht_stats_range'), 10);
+    if (stored === 7 || stored === 30) return stored;
+    const mem = state.statsRange === 90 ? 30 : state.statsRange;
+    if (mem === 7 || mem === 30) return mem;
+    return this._collapsed ? 30 : 7;
+  }
+
+  _persistStatsRangeDays(state, days) {
+    state.statsRange = days;
+    localStorage.setItem('ht_stats_range', String(days));
+  }
+
   async _renderSidebar(state) {
     const body = state.bodyEl;
     if (!body || this._inStatsMode(state)) return;
@@ -1824,7 +1839,12 @@ class Plugin extends CollectionPlugin {
     body.appendChild(wrap);
 
     const config = this._config || { categories: [], habits: [] };
-    let rangeDays = (state.statsRange === 90 ? 30 : state.statsRange) || 30;
+    let rangeDays = this._getStatsRangeDays(state);
+    const storedRangeOk = (() => {
+      const s = parseInt(localStorage.getItem('ht_stats_range'), 10);
+      return s === 7 || s === 30;
+    })();
+    if (!storedRangeOk) this._persistStatsRangeDays(state, rangeDays);
     let selectedId = state.statsSelected || '__overall__';
 
     const buildSelect = () => {
@@ -1863,7 +1883,7 @@ class Plugin extends CollectionPlugin {
       btn.textContent = label;
       btn.addEventListener('click', () => {
         rangeDays = days;
-        state.statsRange = days;
+        this._persistStatsRangeDays(state, days);
         rangeRow.querySelectorAll('.ht-range-btn').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         renderContent();
@@ -2255,10 +2275,10 @@ class Plugin extends CollectionPlugin {
 
       } else {
         // ── 30-day monthly calendar grid ──
-        // Show the month that contains the most days in our range
-        const midDate = new Date(dates[Math.floor(dates.length / 2)] + 'T12:00:00');
-        let calYear = midDate.getFullYear();
-        let calMonth = midDate.getMonth();
+        // Default to the month of the open journal / viewed day (same as sidebar date)
+        const refAnchor = new Date((state.dateStr || htToday()) + 'T12:00:00');
+        let calYear = refAnchor.getFullYear();
+        let calMonth = refAnchor.getMonth();
 
         const renderMonth = (year, month) => {
           calSection.querySelector('.ht-cal-month-view')?.remove();
@@ -2531,6 +2551,9 @@ class Plugin extends CollectionPlugin {
   _renderSettings(container, draft) {
     container.innerHTML = '';
 
+    // Filled in when the “add habit” row builds `catSelect`; end of renderCats() calls this
+    let refreshCatSelect = () => {};
+
     // ── Categories section ───────────────────────────────────────────────
     const catTitle = document.createElement('div');
     catTitle.className = 'ht-section-title';
@@ -2656,6 +2679,7 @@ class Plugin extends CollectionPlugin {
             cat.name = newName;
             finish();
             renderCats();
+            renderHabits(); // habit rows + per-habit category dropdowns use category labels
           });
           cancelBtn.addEventListener('click', finish);
           nameInput.addEventListener('keydown', (e) => {
@@ -2681,6 +2705,7 @@ class Plugin extends CollectionPlugin {
         });
         catList.appendChild(item);
       }
+      refreshCatSelect();
     };
     renderCats();
 
@@ -3089,7 +3114,7 @@ This cannot be undone.`)) return;
     catSelect.className = 'ht-select';
     catSelect.id = 'ht-new-habit-cat';
 
-    const refreshCatSelect = () => {
+    refreshCatSelect = () => {
       catSelect.innerHTML = '';
       if (draft.categories.length === 0) {
         const opt = document.createElement('option');
@@ -3106,10 +3131,6 @@ This cannot be undone.`)) return;
       }
     };
     refreshCatSelect();
-
-    // Observe category changes to refresh select
-    const origRenderCats = renderCats;
-    const patchedRenderCats = () => { origRenderCats(); refreshCatSelect(); };
 
     const habitNameInput = document.createElement('input');
     habitNameInput.className = 'ht-input';
