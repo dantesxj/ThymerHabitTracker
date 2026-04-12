@@ -1,6 +1,6 @@
 # Thymer Habit Tracker
 
-**Version 1.0.4** · Habit Tracker collection plugin for [Thymer](https://thymer.com) (collection plugin, not a global plugin).
+**Version 1.0.5** · Habit Tracker collection plugin for [Thymer](https://thymer.com) (collection plugin, not a global plugin).
 
 Track habits from the journal sidebar: categories, streaks, numeric targets, stats, and daily logs stored in a **`HabitTracker`** collection.
 
@@ -25,6 +25,8 @@ Track habits from the journal sidebar: categories, streaks, numeric targets, sta
 - Possible lag updating the viewed day when changing dates quickly
 
 ### Changelog
+
+**1.0.5** — **Category labels in native dropdowns** (stats filter, settings habit category, importer mapping): show **only the category name**, not the Tabler icon’s text label prefixed to it (e.g. “Exercise” instead of “Trophy Exercise”). Icons remain visible where the UI renders HTML (sidebar headers, habit rows, etc.).
 
 **1.0.4** — **Tabler Icons** across the sidebar, settings, stats, and importer (webfont `ti ti-*`). **Category icon** is chosen from a **dropdown** of curated Tabler icons with a live preview (stored in the existing `emoji` field as a slug; legacy emoji still supported). **Per-day notes**: collection **`notes`** field + `page_field_ids`, with a scrollable notes area under the habit list, persisted per journal date. **Performance:** sidebar uses **one** `getAllRecords` pass to build the log map and compute all category/habit streaks (instead of one full scan per streak badge).
 

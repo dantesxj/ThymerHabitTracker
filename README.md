@@ -1,5 +1,5 @@
 # ThymerHabitTracker
-Habit Tracker Plugin for Thymer · **v1.0.4**  
+Habit Tracker Plugin for Thymer · **v1.0.5**  
 _(COLLECTION Plugin; not global plugin)_
 
 ‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️

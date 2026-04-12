@@ -1,6 +1,6 @@
 /**
  * HabitTracker — Standalone CollectionPlugin
- * @version 1.0.4
+ * @version 1.0.5
  *
  * UI icons: Tabler Icons (https://tabler.io/icons) via webfont classes `ti ti-{name}`.
  *
@@ -886,17 +886,6 @@ function htCategoryGlyphHtml(raw) {
   if (!s) return htIcon('folder');
   if (/^[a-z][a-z0-9-]*$/.test(s) && s.length < 48) return htIcon(s);
   return `<span class="ht-emoji-inline">${htEsc(s)}</span>`;
-}
-
-/** Plain-text label for native <select> / optgroup (no HTML). */
-function htCategoryGlyphText(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return '';
-  if (/^[a-z][a-z0-9-]*$/.test(s) && s.length < 48) {
-    const hit = HT_CATEGORY_ICONS.find(x => x.slug === s);
-    return hit ? hit.label : s;
-  }
-  return s;
 }
 
 function htFillIconSelect(selectEl, currentValue) {
@@ -2139,7 +2128,7 @@ class Plugin extends CollectionPlugin {
       for (const cat of config.categories) {
         const o = document.createElement('option');
         o.value = 'cat:' + cat.id;
-        o.textContent = `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')} (category)`;
+        o.textContent = `${cat.name} (category)`;
         sel.appendChild(o);
         for (const h of config.habits.filter(h2 => h2.categoryId === cat.id && !h2.archived)) {
           const oh = document.createElement('option');
@@ -3286,7 +3275,7 @@ This cannot be undone.`)) return;
           for (const c of draft.categories) {
             const o = document.createElement('option');
             o.value = c.id;
-            o.textContent = `${[htCategoryGlyphText(c.emoji), c.name].filter(Boolean).join(' ')}`;
+            o.textContent = c.name || '';
             if (c.id === habit.categoryId) o.selected = true;
             catSel.appendChild(o);
           }
@@ -3434,7 +3423,7 @@ This cannot be undone.`)) return;
         for (const cat of draft.categories) {
           const opt = document.createElement('option');
           opt.value = cat.id;
-          opt.textContent = `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')}`;
+          opt.textContent = cat.name || '';
           catSelect.appendChild(opt);
         }
       }
@@ -3900,7 +3889,7 @@ This cannot be undone.`)) return;
             if (h.categoryId !== lastCat) {
               const cat = config.categories.find(c=>c.id===h.categoryId);
               const og = document.createElement('optgroup');
-              og.label = cat ? `${[htCategoryGlyphText(cat.emoji), cat.name].filter(Boolean).join(' ')}` : 'Uncategorized';
+              og.label = cat ? (cat.name || '') : 'Uncategorized';
               picker.appendChild(og); lastCat = h.categoryId;
             }
             const o = document.createElement('option');
@@ -3913,7 +3902,7 @@ This cannot be undone.`)) return;
           blank.value=''; blank.textContent='— choose category —'; picker.appendChild(blank);
           for (const c of config.categories) {
             const o = document.createElement('option');
-            o.value=c.id; o.textContent=`${[htCategoryGlyphText(c.emoji), c.name].filter(Boolean).join(' ')}`; o.selected=(c.id===mapping.thymerCatId);
+            o.value=c.id; o.textContent=c.name || ''; o.selected=(c.id===mapping.thymerCatId);
             picker.appendChild(o);
           }
           picker.style.display=''; archToggle.style.display='none';
