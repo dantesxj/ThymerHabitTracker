@@ -1,5 +1,5 @@
 # ThymerHabitTracker
-Habit Tracker Plugin for Thymer
+Habit Tracker Plugin for Thymer · **v1.0.5**  
 _(COLLECTION Plugin; not global plugin)_
 
 ‼️ _In progress. Created by Claude and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
@@ -12,6 +12,3 @@ _(COLLECTION Plugin; not global plugin)_
 - Stats menu with 30 day / 7 day calendar view
 - Habit date automatically links with journal date but can be changed manually if desired
 
-### CURRENT KNOWN CHALLENGES
-- Population delay on journal page change and load
-- Issue during date change with delay on habits updating to reflect the correct day
