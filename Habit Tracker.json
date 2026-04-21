@@ -4,16 +4,14 @@
 	"icon": "ti-flame",
 	"color": null,
 	"home": false,
-	"page_field_ids": [
-		"notes"
-	],
+	"page_field_ids": [],
 	"item_name": "Record",
 	"description": "Category-based habit tracking with collapsible sidebar panel and streak tracking",
 	"show_sidebar_items": false,
 	"show_cmdpal_items": true,
 	"fields": [
 		{
-			"icon": "ti-typography",
+			"icon": "ti-abc",
 			"id": "title",
 			"label": "Title",
 			"many": false,
@@ -43,15 +41,6 @@
 					"active": true
 				}
 			]
-		},
-		{
-			"icon": "ti-notes",
-			"id": "notes",
-			"label": "Notes",
-			"many": false,
-			"read_only": false,
-			"active": true,
-			"type": "text"
 		},
 		{
 			"icon": "ti-align-left",
@@ -90,7 +79,7 @@
 			"type": "banner"
 		},
 		{
-			"icon": "ti-icons",
+			"icon": "ti-align-left",
 			"id": "icon",
 			"label": "Icon",
 			"many": false,
@@ -108,5 +97,5 @@
 	},
 	"custom": {},
 	"views": [],
-	"version": "1.0.5"
+	"version": "1.0.6"
 }

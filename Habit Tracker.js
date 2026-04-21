@@ -1,3 +1,316 @@
+// @generated BEGIN thymer-ext-path-b (source: plugins/plugin-settings/ThymerExtPathBRuntime.js — edit that file, then npm run embed-path-b)
+/**
+ * ThymerExtPathB — shared path-B storage (Plugin Settings collection + localStorage mirror).
+ * Edit this file in the repo, then run `npm run embed-path-b` to refresh embedded copies inside each Path B plugin.
+ *
+ * API: ThymerExtPathB.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerExtPathB.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerExtPathB.openStorageDialog(plugin, { pluginId, modeKey, mirrorKeys, label, data, ui })
+ */
+(function pathBRuntime(g) {
+  if (g.ThymerExtPathB) return;
+
+  const COL_NAME = 'Plugin Settings';
+  const q = [];
+  let busy = false;
+
+  function drain() {
+    if (busy || !q.length) return;
+    busy = true;
+    const job = q.shift();
+    Promise.resolve(typeof job === 'function' ? job() : job)
+      .catch((e) => console.error('[ThymerExtPathB]', e))
+      .finally(() => {
+        busy = false;
+        if (q.length) setTimeout(drain, 450);
+      });
+  }
+
+  function enqueue(job) {
+    q.push(job);
+    drain();
+  }
+
+  async function findColl(data) {
+    try {
+      const all = await data.getAllCollections();
+      return all.find((c) => (c.getName?.() || '') === COL_NAME) || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function readDoc(data, pluginId) {
+    const coll = await findColl(data);
+    if (!coll) return null;
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return null;
+    }
+    const r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) return null;
+    let raw = '';
+    try {
+      raw = r.text?.('settings_json') || '';
+    } catch (_) {}
+    if (!raw || !String(raw).trim()) return null;
+    try {
+      return JSON.parse(raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function writeDoc(data, pluginId, doc) {
+    const coll = await findColl(data);
+    if (!coll) return;
+    const json = JSON.stringify(doc);
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    let r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    if (!r) {
+      let guid = null;
+      try {
+        guid = coll.createRecord?.(pluginId);
+      } catch (_) {}
+      if (guid) {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+          try {
+            const again = await coll.getAllRecords();
+            r = again.find((x) => x.guid === guid) || again.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+            if (r) break;
+          } catch (_) {}
+        }
+      }
+    }
+    if (!r) return;
+    try {
+      const pId = r.prop?.('plugin_id');
+      if (pId && typeof pId.set === 'function') pId.set(pluginId);
+    } catch (_) {}
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+  }
+
+  function showFirstRunDialog(ui, label, preferred, onPick) {
+    const id = 'thymerext-pathb-first-' + Math.random().toString(36).slice(2);
+    const box = document.createElement('div');
+    box.id = id;
+    box.style.cssText =
+      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const card = document.createElement('div');
+    card.style.cssText =
+      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
+    const title = document.createElement('div');
+    title.textContent = label + ' — where to store settings?';
+    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
+    const hint = document.createElement('div');
+    hint.textContent = 'Change later via Command Palette → “Storage location…”';
+    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
+    const mk = (t, sub, prim) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.cssText =
+        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
+        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
+        ';color:inherit;';
+      const x = document.createElement('div');
+      x.textContent = t;
+      x.style.fontWeight = '600';
+      b.appendChild(x);
+      if (sub) {
+        const s = document.createElement('div');
+        s.textContent = sub;
+        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
+        b.appendChild(s);
+      }
+      return b;
+    };
+    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
+    const bSyn = mk('Sync via Plugin Settings', 'Workspace collection “' + COL_NAME + '”.', preferred === 'synced');
+    const fin = (m) => {
+      try {
+        box.remove();
+      } catch (_) {}
+      onPick(m);
+    };
+    bLoc.addEventListener('click', () => fin('local'));
+    bSyn.addEventListener('click', () => fin('synced'));
+    card.appendChild(title);
+    card.appendChild(hint);
+    card.appendChild(bLoc);
+    card.appendChild(bSyn);
+    box.appendChild(card);
+    document.body.appendChild(box);
+  }
+
+  g.ThymerExtPathB = {
+    COL_NAME,
+    enqueue,
+    async init(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      let mode = null;
+      try {
+        mode = localStorage.getItem(modeKey);
+      } catch (_) {}
+
+      const remote = await readDoc(data, pluginId);
+      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
+        mode = remote.storageMode;
+        try {
+          localStorage.setItem(modeKey, mode);
+        } catch (_) {}
+      }
+
+      if (!mode) {
+        const coll = await findColl(data);
+        const preferred = coll ? 'synced' : 'local';
+        await new Promise((outerResolve) => {
+          enqueue(async () => {
+            const picked = await new Promise((r) => {
+              showFirstRunDialog(ui, label, preferred, r);
+            });
+            try {
+              localStorage.setItem(modeKey, picked);
+            } catch (_) {}
+            outerResolve(picked);
+          });
+        });
+        try {
+          mode = localStorage.getItem(modeKey);
+        } catch (_) {}
+      }
+
+      plugin._pathBMode = mode === 'synced' ? 'synced' : 'local';
+      plugin._pathBPluginId = pluginId;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+
+      if (plugin._pathBMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
+        for (const k of keys) {
+          const v = remote.payload[k];
+          if (typeof v === 'string') {
+            try {
+              localStorage.setItem(k, v);
+            } catch (_) {}
+          }
+        }
+      }
+
+      if (plugin._pathBMode === 'synced') {
+        try {
+          await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+        } catch (_) {}
+      }
+    },
+
+    scheduleFlush(plugin, mirrorKeys) {
+      if (plugin._pathBMode !== 'synced') return;
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (plugin._pathBFlushTimer) clearTimeout(plugin._pathBFlushTimer);
+      plugin._pathBFlushTimer = setTimeout(() => {
+        plugin._pathBFlushTimer = null;
+        const data = plugin.data;
+        const pid = plugin._pathBPluginId;
+        if (!pid || !data) return;
+        g.ThymerExtPathB.flushNow(data, pid, keys).catch((e) => console.error('[ThymerExtPathB] flush', e));
+      }, 500);
+    },
+
+    async flushNow(data, pluginId, mirrorKeys) {
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      const payload = {};
+      for (const k of keys) {
+        try {
+          const v = localStorage.getItem(k);
+          if (v !== null) payload[k] = v;
+        } catch (_) {}
+      }
+      const doc = {
+        v: 1,
+        storageMode: 'synced',
+        updatedAt: new Date().toISOString(),
+        payload,
+      };
+      await writeDoc(data, pluginId, doc);
+    },
+
+    async openStorageDialog(opts) {
+      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
+      const cur = plugin._pathBMode === 'synced' ? 'synced' : 'local';
+      const pick = await new Promise((resolve) => {
+        const close = (v) => {
+          try {
+            box.remove();
+          } catch (_) {}
+          resolve(v);
+        };
+        const box = document.createElement('div');
+        box.style.cssText =
+          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
+        box.addEventListener('click', (e) => {
+          if (e.target === box) close(null);
+        });
+        const card = document.createElement('div');
+        card.style.cssText =
+          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
+        card.addEventListener('click', (e) => e.stopPropagation());
+        const t = document.createElement('div');
+        t.textContent = label + ' — storage';
+        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
+        const b1 = document.createElement('button');
+        b1.type = 'button';
+        b1.textContent = 'This device only';
+        const b2 = document.createElement('button');
+        b2.type = 'button';
+        b2.textContent = 'Sync via Plugin Settings';
+        [b1, b2].forEach((b) => {
+          b.style.cssText =
+            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
+        });
+        b1.addEventListener('click', () => close('local'));
+        b2.addEventListener('click', () => close('synced'));
+        const bx = document.createElement('button');
+        bx.type = 'button';
+        bx.textContent = 'Cancel';
+        bx.style.cssText =
+          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
+        bx.addEventListener('click', () => close(null));
+        card.appendChild(t);
+        card.appendChild(b1);
+        card.appendChild(b2);
+        card.appendChild(bx);
+        box.appendChild(card);
+        document.body.appendChild(box);
+      });
+      if (!pick || pick === cur) return;
+      try {
+        localStorage.setItem(modeKey, pick);
+      } catch (_) {}
+      plugin._pathBMode = pick === 'synced' ? 'synced' : 'local';
+      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') await g.ThymerExtPathB.flushNow(data, pluginId, keys);
+      ui.addToaster?.({
+        title: label,
+        message: 'Storage: ' + (pick === 'synced' ? 'synced' : 'local only'),
+        dismissible: true,
+        autoDestroyTime: 3500,
+      });
+    },
+  };
+
+})(typeof globalThis !== 'undefined' ? globalThis : window);
+// @generated END thymer-ext-path-b
+
+
 /**
  * HabitTracker — Standalone CollectionPlugin
  * @version 1.0.6
@@ -246,39 +559,45 @@ const HT_CSS = `
   }
   .ht-category-habits.ht-hidden { display: none; }
 
-  /* ── Habit row ── */
+  /* ── Habit row (TickTick-inspired: airy rows, rounded square checks, teal done state) ── */
   .ht-habit {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 4px 8px;
-    border-radius: 4px;
+    gap: 10px;
+    padding: 7px 10px;
+    margin: 0 4px 3px;
+    border-radius: 8px;
+    border: 1px solid transparent;
     cursor: pointer;
-    transition: background 0.1s;
+    transition: background 0.12s, border-color 0.12s;
   }
-  .ht-habit:hover { background: rgba(255,255,255,0.05); }
+  .ht-habit:hover {
+    background: rgba(255,255,255,0.06);
+    border-color: rgba(255,255,255,0.06);
+  }
   .ht-habit-check {
-    width: 16px;
-    height: 16px;
-    border: 1.5px solid rgba(255,255,255,0.2);
-    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid rgba(255,255,255,0.22);
+    border-radius: 6px;
     flex-shrink: 0;
     display: flex;
     align-items: center;
     justify-content: center;
     transition: all 0.15s;
-    font-size: 9px;
+    font-size: 10px;
     color: transparent;
   }
   .ht-habit.ht-done .ht-habit-check {
-    background: rgba(76,175,80,0.18);
-    border-color: #4caf50;
-    color: #4caf50;
+    background: linear-gradient(160deg, #41d6a8, #2bbd8e);
+    border-color: rgba(46, 189, 142, 0.95);
+    color: #0d1f18;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
   }
   .ht-habit-name {
     flex: 1;
     color: #e8e0d0;
-    font-size: 12px;
+    font-size: 13px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -926,13 +1245,35 @@ function htGenId() {
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 class Plugin extends CollectionPlugin {
 
+  _htPathBMirrorKeys() {
+    return ['ht_sidebar_collapsed', 'ht_cat_collapsed', 'ht_stats_range'];
+  }
+
+  _htPathBFlush() {
+    if (!this._persistState) return;
+    globalThis.ThymerExtPathB?.scheduleFlush?.(this, () => this._htPathBMirrorKeys());
+  }
+
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   async onLoad() {
     this._panelStates = new Map();
     this._eventIds = [];
-    this._collapsed = localStorage.getItem('ht_sidebar_collapsed') === 'true';
-    this._catCollapsed = JSON.parse(localStorage.getItem('ht_cat_collapsed') || '{}');
+    this._htNavTimers = new Map();
+    this._persistState = this.config.custom?.persist_habit_panel_state !== false;
+    if (this._persistState) {
+      await (globalThis.ThymerExtPathB?.init?.({
+        plugin: this,
+        pluginId: 'habit-tracker',
+        modeKey: 'thymerext_ps_mode_habit_tracker',
+        mirrorKeys: () => this._htPathBMirrorKeys(),
+        label: 'Habit Tracker',
+        data: this.data,
+        ui: this.ui,
+      }) ?? (console.warn('[HabitTracker] ThymerExtPathB runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+    }
+    this._collapsed = this._persistState ? (localStorage.getItem('ht_sidebar_collapsed') === 'true') : false;
+    this._catCollapsed = this._persistState ? JSON.parse(localStorage.getItem('ht_cat_collapsed') || '{}') : {};
     this._config = null;      // { categories: [], habits: [] }
     this._collection = null;
 
@@ -962,14 +1303,37 @@ class Plugin extends CollectionPlugin {
       icon: 'ti-bug',
       onSelected: () => this._diagnose(),
     });
-
+    this._cmdStorage = this.ui.addCommandPaletteCommand({
+      label: 'Habit Tracker: Storage location…',
+      icon: 'ti-database',
+      onSelected: () => {
+        if (!this._persistState) {
+          this.ui.addToaster?.({
+            title: 'Habit Tracker',
+            message: 'Panel state persistence is off (plugin.json custom.persist_habit_panel_state).',
+            dismissible: true,
+            autoDestroyTime: 5000,
+          });
+          return;
+        }
+        globalThis.ThymerExtPathB?.openStorageDialog?.({
+          plugin: this,
+          pluginId: 'habit-tracker',
+          modeKey: 'thymerext_ps_mode_habit_tracker',
+          mirrorKeys: () => this._htPathBMirrorKeys(),
+          label: 'Habit Tracker',
+          data: this.data,
+          ui: this.ui,
+        });
+      },
+    });
 
     // Load collection + config, then mount
     await this._loadCollection();
     await this._loadConfig();
 
-    // Listen to panel events
-    this._eventIds.push(this.events.on('panel.navigated', (ev) => this._onPanelChanged(ev.panel)));
+    // Listen to panel events (defer navigated so journal record/date match the UI)
+    this._eventIds.push(this.events.on('panel.navigated', (ev) => this._deferPanelChanged(ev.panel)));
     this._eventIds.push(this.events.on('panel.focused',   (ev) => this._onPanelChanged(ev.panel)));
     this._eventIds.push(this.events.on('panel.closed',    (ev) => this._onPanelClosed(ev.panel)));
 
@@ -987,8 +1351,13 @@ class Plugin extends CollectionPlugin {
       try { this.events.off(id); } catch(e) {}
     }
     this._eventIds = [];
+    for (const t of (this._htNavTimers || new Map()).values()) {
+      try { clearTimeout(t); } catch (e) {}
+    }
+    this._htNavTimers?.clear();
     this._cmdSettings?.remove?.();
     this._cmdRefresh?.remove?.();
+    this._cmdStorage?.remove?.();
 
     for (const [, state] of (this._panelStates || [])) {
       this._disposeState(state);
@@ -1241,24 +1610,62 @@ class Plugin extends CollectionPlugin {
 
   // ── Panel mounting ───────────────────────────────────────────────────────
 
+  _deferPanelChanged(panel) {
+    const panelId = panel?.getId?.();
+    if (!panelId) return;
+    const prev = this._htNavTimers.get(panelId);
+    if (prev) clearTimeout(prev);
+    this._htNavTimers.set(panelId, setTimeout(() => {
+      this._htNavTimers.delete(panelId);
+      this._onPanelChanged(panel);
+    }, 150));
+  }
+
+  /** Remove sidebar when this panel is not a journal day page (avoids stale UI on other records). */
+  _cleanupHabitPanel(panelId) {
+    if (!panelId) return;
+    const nt = this._htNavTimers?.get(panelId);
+    if (nt) {
+      try { clearTimeout(nt); } catch (e) {}
+      this._htNavTimers.delete(panelId);
+    }
+    const state = this._panelStates.get(panelId);
+    if (state) {
+      this._disposeState(state);
+      this._panelStates.delete(panelId);
+    }
+  }
+
   _onPanelChanged(panel) {
     const panelId = panel?.getId?.();
     if (!panelId) return;
 
     const panelEl = panel?.getElement?.();
-    if (!panelEl) return;
+    if (!panelEl) {
+      this._cleanupHabitPanel(panelId);
+      return;
+    }
 
     // Only mount on journal/daily note pages
     const nav = panel?.getNavigation?.();
     const navType = nav?.type || '';
-    if (navType === 'custom' || navType === 'custom_panel') return;
+    if (navType === 'custom' || navType === 'custom_panel') {
+      this._cleanupHabitPanel(panelId);
+      return;
+    }
 
     const record = panel?.getActiveRecord?.();
-    if (!record) return;
+    if (!record) {
+      this._cleanupHabitPanel(panelId);
+      return;
+    }
 
     // Only show on journal records (daily notes) — must have journal details
     const journalDetails = record.getJournalDetails?.();
-    if (!journalDetails) return;
+    if (!journalDetails) {
+      this._cleanupHabitPanel(panelId);
+      return;
+    }
 
     // Extract journal date from the record — journal GUIDs typically end with YYYYMMDD
     let journalDateStr = htToday();
@@ -1302,9 +1709,7 @@ class Plugin extends CollectionPlugin {
   _onPanelClosed(panel) {
     const panelId = panel?.getId?.();
     if (!panelId) return;
-    const state = this._panelStates.get(panelId);
-    if (state) this._disposeState(state);
-    this._panelStates.delete(panelId);
+    this._cleanupHabitPanel(panelId);
   }
 
   _disposeState(state) {
@@ -1563,7 +1968,10 @@ class Plugin extends CollectionPlugin {
 
   _toggleCollapse() {
     this._collapsed = !this._collapsed;
-    localStorage.setItem('ht_sidebar_collapsed', String(this._collapsed));
+    if (this._persistState) {
+      localStorage.setItem('ht_sidebar_collapsed', String(this._collapsed));
+      this._htPathBFlush();
+    }
     for (const [, state] of (this._panelStates || [])) {
       if (!state.sidebarEl) continue;
       state.sidebarEl.classList.toggle('ht-collapsed', this._collapsed);
@@ -1584,7 +1992,7 @@ class Plugin extends CollectionPlugin {
 
   /** 7d/30d stats window — persisted across journal navigation (same as sidebar collapse) */
   _getStatsRangeDays(state) {
-    const stored = parseInt(localStorage.getItem('ht_stats_range'), 10);
+    const stored = this._persistState ? parseInt(localStorage.getItem('ht_stats_range'), 10) : NaN;
     if (stored === 7 || stored === 30) return stored;
     const mem = state.statsRange === 90 ? 30 : state.statsRange;
     if (mem === 7 || mem === 30) return mem;
@@ -1593,7 +2001,10 @@ class Plugin extends CollectionPlugin {
 
   _persistStatsRangeDays(state, days) {
     state.statsRange = days;
-    localStorage.setItem('ht_stats_range', String(days));
+    if (this._persistState) {
+      localStorage.setItem('ht_stats_range', String(days));
+      this._htPathBFlush();
+    }
   }
 
   /** Day notes textarea under the habit list; persists to log record `notes` field + JSON. */
@@ -1869,7 +2280,10 @@ class Plugin extends CollectionPlugin {
 
   _toggleCategory(catId, state) {
     this._catCollapsed[catId] = !this._catCollapsed[catId];
-    localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
+    if (this._persistState) {
+      localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
+      this._htPathBFlush();
+    }
 
     const body = state.bodyEl;
     if (!body) return;
@@ -2109,7 +2523,7 @@ class Plugin extends CollectionPlugin {
     const config = this._config || { categories: [], habits: [] };
     let rangeDays = this._getStatsRangeDays(state);
     const storedRangeOk = (() => {
-      const s = parseInt(localStorage.getItem('ht_stats_range'), 10);
+      const s = this._persistState ? parseInt(localStorage.getItem('ht_stats_range'), 10) : NaN;
       return s === 7 || s === 30;
     })();
     if (!storedRangeOk) this._persistStatsRangeDays(state, rangeDays);
