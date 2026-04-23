@@ -2,9 +2,9 @@
 
 Habit Tracker collection plugin for Thymer.
 
-‼️ _In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome!_ ‼️
+‼️ In progress. Created by AI, vibes, and someone who knows nothing about coding! Suggestions and support very welcome! ‼️
 
-Current collection schema version in this repo: **v1.0.6** (see `Habit Tracker.json`).
+Current collection schema version in this repo: **v1.0.6** (see `plugin.json`).
 
 ## Overview
 
@@ -37,6 +37,6 @@ Habit Tracker mounts a sidebar-style panel on journal pages for daily habit chec
 
 ## Files
 
-- `Habit Tracker.js` - plugin code
-- `Habit Tracker.json` - collection configuration/schema
+- `plugin.js` - plugin code
+- `plugin.json` - collection configuration/schema
 
