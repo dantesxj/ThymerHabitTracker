@@ -5,14 +5,25 @@
  *
  * Edit this file, then from repo root: npm run embed-plugin-settings
  *
+ * Rows:
+ * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
+ * - **Other rows** (`record_kind` = `log`, `config`, …): same **Plugin** field (`plugin`) for filtering;
+ *   use a **distinct** `plugin_id` per row (e.g. `habit-tracker:log:2026-04-24`) so vault lookup stays unambiguous.
+ *
  * API: ThymerPluginSettings.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
  *      ThymerPluginSettings.scheduleFlush(plugin, mirrorKeys)
+ *      ThymerPluginSettings.flushNow(data, pluginId, mirrorKeys)
  *      ThymerPluginSettings.openStorageDialog({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
+ *      ThymerPluginSettings.listRows(data, { pluginSlug, recordKind? })
+ *      ThymerPluginSettings.createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle?, settingsDoc? })
  */
 (function pluginSettingsRuntime(g) {
   if (g.ThymerPluginSettings) return;
 
   const COL_NAME = 'Plugin Settings';
+  const KIND_VAULT = 'vault';
+  const FIELD_PLUGIN = 'plugin';
+  const FIELD_KIND = 'record_kind';
   const q = [];
   let busy = false;
 
@@ -20,12 +31,12 @@
   let _ensureChain = Promise.resolve();
 
   const PLUGIN_SETTINGS_SHAPE = {
-    ver: 1,
+    ver: 2,
     name: COL_NAME,
     icon: 'ti-adjustments',
     item_name: 'Setting',
     description:
-      'Workspace storage for plugin preferences (cross-device when you choose synced settings). One row per plugin.',
+      'Workspace storage for plugins: one vault row per plugin (synced prefs) plus optional extra rows (logs, etc.). Use the Plugin column to filter by plugin.',
     show_sidebar_items: true,
     show_cmdpal_items: false,
     views: [],
@@ -34,6 +45,24 @@
         icon: 'ti-id',
         id: 'plugin_id',
         label: 'Plugin ID',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-apps',
+        id: FIELD_PLUGIN,
+        label: 'Plugin',
+        type: 'text',
+        read_only: false,
+        active: true,
+        many: false,
+      },
+      {
+        icon: 'ti-category',
+        id: FIELD_KIND,
+        label: 'Record kind',
         type: 'text',
         read_only: false,
         active: true,
@@ -49,7 +78,7 @@
         many: false,
       },
     ],
-    page_field_ids: ['plugin_id', 'settings_json'],
+    page_field_ids: [FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'settings_json'],
     sidebar_record_sort_field_id: 'updated_at',
     sidebar_record_sort_dir: 'desc',
     managed: { fields: false, views: false, sidebar: false },
@@ -64,6 +93,60 @@
     } catch (_) {
       return JSON.parse(JSON.stringify(PLUGIN_SETTINGS_SHAPE));
     }
+  }
+
+  function rowField(r, id) {
+    if (!r) return '';
+    let v = '';
+    try {
+      v = r.text?.(id);
+    } catch (_) {}
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+    try {
+      const p = r.prop?.(id);
+      if (p && typeof p.get === 'function') {
+        const g = p.get();
+        return g == null ? '' : String(g).trim();
+      }
+      if (p && typeof p.text === 'function') {
+        const t = p.text();
+        return t == null ? '' : String(t).trim();
+      }
+    } catch (_) {}
+    return '';
+  }
+
+  function setRowField(r, id, value) {
+    if (!r) return;
+    const s = value == null ? '' : String(value);
+    try {
+      const p = r.prop?.(id);
+      if (p && typeof p.set === 'function') p.set(s);
+    } catch (_) {}
+  }
+
+  /** True for the single mirror row per logical plugin (plugin_id === pluginId and kind vault or legacy). */
+  function isVaultRow(r, pluginId) {
+    const pid = rowField(r, 'plugin_id');
+    if (pid !== pluginId) return false;
+    const kind = rowField(r, FIELD_KIND);
+    if (kind === KIND_VAULT) return true;
+    if (!kind) return true;
+    return false;
+  }
+
+  function findVaultRecord(records, pluginId) {
+    if (!records) return null;
+    for (const x of records) {
+      if (isVaultRow(x, pluginId)) return x;
+    }
+    return null;
+  }
+
+  function applyVaultRowMeta(r, pluginId) {
+    setRowField(r, 'plugin_id', pluginId);
+    setRowField(r, FIELD_PLUGIN, pluginId);
+    setRowField(r, FIELD_KIND, KIND_VAULT);
   }
 
   function drain() {
@@ -129,7 +212,7 @@
     } catch (_) {
       return null;
     }
-    const r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    const r = findVaultRecord(records, pluginId);
     if (!r) return null;
     let raw = '';
     try {
@@ -153,7 +236,7 @@
     } catch (_) {
       return;
     }
-    let r = records.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+    let r = findVaultRecord(records, pluginId);
     if (!r) {
       let guid = null;
       try {
@@ -164,21 +247,93 @@
           await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
           try {
             const again = await coll.getAllRecords();
-            r = again.find((x) => x.guid === guid) || again.find((x) => (x.text?.('plugin_id') || '').trim() === pluginId);
+            r = again.find((x) => x.guid === guid) || findVaultRecord(again, pluginId);
             if (r) break;
           } catch (_) {}
         }
       }
     }
     if (!r) return;
-    try {
-      const pId = r.prop?.('plugin_id');
-      if (pId && typeof pId.set === 'function') pId.set(pluginId);
-    } catch (_) {}
+    applyVaultRowMeta(r, pluginId);
     try {
       const pj = r.prop?.('settings_json');
       if (pj && typeof pj.set === 'function') pj.set(json);
     } catch (_) {}
+  }
+
+  async function listRows(data, { pluginSlug, recordKind } = {}) {
+    const slug = (pluginSlug || '').trim();
+    if (!slug) return [];
+    const coll = await findColl(data);
+    if (!coll) return [];
+    let records;
+    try {
+      records = await coll.getAllRecords();
+    } catch (_) {
+      return [];
+    }
+    return records.filter((r) => {
+      let rowSlug = rowField(r, FIELD_PLUGIN);
+      if (!rowSlug) {
+        const pid = rowField(r, 'plugin_id');
+        const kind = rowField(r, FIELD_KIND);
+        if (!kind && pid) rowSlug = pid;
+      }
+      if (rowSlug !== slug) return false;
+      if (recordKind != null && String(recordKind) !== '') {
+        return rowField(r, FIELD_KIND) === String(recordKind);
+      }
+      return true;
+    });
+  }
+
+  async function createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle, settingsDoc } = {}) {
+    const ps = (pluginSlug || '').trim();
+    const rid = (rowPluginId || '').trim();
+    const kind = (recordKind || '').trim();
+    if (!ps || !rid || !kind) {
+      console.warn('[ThymerPluginSettings] createDataRow: pluginSlug, recordKind, and rowPluginId are required');
+      return null;
+    }
+    if (rid === ps && kind !== KIND_VAULT) {
+      console.warn('[ThymerPluginSettings] createDataRow: rowPluginId must differ from plugin slug unless record_kind is vault');
+    }
+    await ensurePluginSettingsCollection(data);
+    const coll = await findColl(data);
+    if (!coll) return null;
+    const title = (recordTitle || rid).trim() || rid;
+    let guid = null;
+    try {
+      guid = coll.createRecord?.(title);
+    } catch (e) {
+      console.error('[ThymerPluginSettings] createDataRow createRecord', e);
+      return null;
+    }
+    if (!guid) return null;
+    let r = null;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
+      try {
+        const again = await coll.getAllRecords();
+        r = again.find((x) => x.guid === guid) || again.find((x) => rowField(x, 'plugin_id') === rid);
+        if (r) break;
+      } catch (_) {}
+    }
+    if (!r) return null;
+    setRowField(r, 'plugin_id', rid);
+    setRowField(r, FIELD_PLUGIN, ps);
+    setRowField(r, FIELD_KIND, kind);
+    const json =
+      settingsDoc !== undefined && settingsDoc !== null
+        ? typeof settingsDoc === 'string'
+          ? settingsDoc
+          : JSON.stringify(settingsDoc)
+        : '{}';
+    try {
+      const pj = r.prop?.('settings_json');
+      if (pj && typeof pj.set === 'function') pj.set(json);
+    } catch (_) {}
+    return r;
   }
 
   function showFirstRunDialog(ui, label, preferred, onPick) {
@@ -239,7 +394,15 @@
 
   g.ThymerPluginSettings = {
     COL_NAME,
+    FIELD_PLUGIN,
+    FIELD_RECORD_KIND: FIELD_KIND,
+    RECORD_KIND_VAULT: KIND_VAULT,
     enqueue,
+    rowField,
+    findVaultRecord,
+    listRows,
+    createDataRow,
+
     async init(opts) {
       const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
 
@@ -382,8 +545,8 @@
         localStorage.setItem(modeKey, pick);
       } catch (_) {}
       plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (pick === 'synced') await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
+      const keyList = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
+      if (pick === 'synced') await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
       ui.addToaster?.({
         title: label,
         message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
@@ -397,26 +560,30 @@
 
 
 /**
- * HabitTracker — Standalone CollectionPlugin
- * @version 1.0.6
+ * HabitTracker — Global plugin (journal sidebar)
+ * @version 1.1.0
  *
  * UI icons: Tabler Icons (https://tabler.io/icons) via webfont classes `ti ti-{name}`.
  *
- * Data model (all stored as records in own collection):
- *   - One "config" record (title: "__config__") — stores categories/habits as JSON in `data`
- *   - One "log" record per date (title: "log-YYYY-MM-DD") — stores completions as JSON in `data`
+ * Data model — workspace **Plugin Settings** collection (`ThymerPluginSettings`):
+ *   - **Vault** row (`plugin_id` = `habit-tracker`, `record_kind` = `vault`): synced localStorage mirror for panel UI keys.
+ *   - **Config** row (`record_kind` = `config`, `plugin_id` = `habit-tracker:config`, record title `config`): categories/habits JSON in `settings_json`.
+ *   - **Log** rows (`record_kind` = `log`, `plugin_id` = `habit-tracker:log:YYYY-MM-DD`, title = date): per-day completions JSON in `settings_json`.
+ *   Use the **Plugin** column (`habit-tracker`) in Thymer to filter Kanban/list views across row kinds.
  *
- * Config JSON shape:
- *   { categories: [ { id, name, emoji, order }, ... ], habits: [ { id, name, categoryId, order }, ... ] }
- *   `emoji` holds a Tabler icon slug (e.g. folder, flame) or legacy Unicode emoji for display.
+ * One-time migration: if a legacy **HabitTracker** collection exists, its `__config__` and `log-*` records are copied into Plugin Settings (see `HT_PS_MIGRATE_KEY` in localStorage).
  *
- * Log JSON shape:
- *   { date: "YYYY-MM-DD", completions: { habitId: true, ... }, categoryDone: { categoryId: true, ... }, notes?: string }
- *   Per-day text also stored on the record field `notes` (collection schema) when supported.
+ * Config / log JSON shapes unchanged from the old collection plugin.
  *
- * Streaks are calculated on-the-fly by scanning log records.
+ * Streaks are calculated on-the-fly by scanning log rows.
  */
 
+const HT_PS_SLUG = 'habit-tracker';
+const HT_PS_ROW_CONFIG = 'habit-tracker:config';
+const HT_PS_MIGRATE_KEY = 'ht_global_ps_migration_v1';
+function htPsRowLog(dateStr) {
+  return `${HT_PS_SLUG}:log:${dateStr}`;
+}
 
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 const HT_CSS = `
@@ -1328,7 +1495,7 @@ function htGenId() {
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
-class Plugin extends CollectionPlugin {
+class Plugin extends AppPlugin {
 
   _htPluginSettingsMirrorKeys() {
     return ['ht_sidebar_collapsed', 'ht_cat_collapsed', 'ht_stats_range'];
@@ -1345,7 +1512,7 @@ class Plugin extends CollectionPlugin {
     this._panelStates = new Map();
     this._eventIds = [];
     this._htNavTimers = new Map();
-    this._persistState = this.config.custom?.persist_habit_panel_state !== false;
+    this._persistState = (this.getConfiguration?.()?.custom ?? this.config?.custom)?.persist_habit_panel_state !== false;
     if (this._persistState) {
       await (globalThis.ThymerPluginSettings?.init?.({
         plugin: this,
@@ -1359,8 +1526,7 @@ class Plugin extends CollectionPlugin {
     }
     this._collapsed = this._persistState ? (localStorage.getItem('ht_sidebar_collapsed') === 'true') : false;
     this._catCollapsed = this._persistState ? JSON.parse(localStorage.getItem('ht_cat_collapsed') || '{}') : {};
-    this._config = null;      // { categories: [], habits: [] }
-    this._collection = null;
+    this._config = null; // { categories: [], habits: [] }
 
     this.ui.injectCSS(HT_CSS);
 
@@ -1413,8 +1579,7 @@ class Plugin extends CollectionPlugin {
       },
     });
 
-    // Load collection + config, then mount
-    await this._loadCollection();
+    await this._migrateLegacyHabitTrackerToPluginSettings();
     await this._loadConfig();
 
     // Listen to panel events (defer navigated so journal record/date match the UI)
@@ -1442,6 +1607,8 @@ class Plugin extends CollectionPlugin {
     this._htNavTimers?.clear();
     this._cmdSettings?.remove?.();
     this._cmdRefresh?.remove?.();
+    this._cmdCleanup?.remove?.();
+    this._cmdDiag?.remove?.();
     this._cmdStorage?.remove?.();
 
     for (const [, state] of (this._panelStates || [])) {
@@ -1450,127 +1617,208 @@ class Plugin extends CollectionPlugin {
     this._panelStates?.clear?.();
   }
 
-  // ── Collection & Config ──────────────────────────────────────────────────
+  // ── Plugin Settings storage ───────────────────────────────────────────────
 
-  async _loadCollection() {
+  _tps() {
+    return globalThis.ThymerPluginSettings;
+  }
+
+  _readJsonStore(r) {
+    if (!r) return '';
+    const tps = this._tps();
+    if (tps?.rowField) {
+      const j = tps.rowField(r, 'settings_json');
+      if (j) return j;
+    }
+    return (
+      r.text?.('settings_json') ||
+      r.prop?.('settings_json')?.text?.() ||
+      r.prop?.('settings_json')?.get?.() ||
+      r.text?.('data') ||
+      r.prop?.('data')?.text?.() ||
+      r.prop?.('data')?.get?.() ||
+      ''
+    );
+  }
+
+  _writeJsonStore(rec, obj) {
+    if (!rec) return;
+    const json = typeof obj === 'string' ? obj : JSON.stringify(obj);
     try {
-      const collections = await this.data.getAllCollections();
-      this._collection = collections.find(c => c.getName() === 'HabitTracker');
-      if (!this._collection) {
-        console.warn('[HabitTracker] Collection not found — check plugin name matches collection name');
-      }
-    } catch(e) {
-      console.error('[HabitTracker] Error loading collection:', e);
+      rec.prop('settings_json')?.set?.(json);
+    } catch (e) {
+      try {
+        rec.prop('data')?.set?.(json);
+      } catch (e2) {}
     }
   }
 
-  async _loadConfig() {
-    if (!this._collection) return;
+  async _psListByKind(recordKind) {
+    const tps = this._tps();
+    if (!tps?.listRows || !this.data) return [];
     try {
-      const records = await this._collection.getAllRecords();
-      const configRecord = records.find(r => r.getName() === '__config__');
-      if (configRecord) {
-        const raw = configRecord.prop('data')?.get?.() || configRecord.text?.('data') || '';
-        if (raw) {
-          this._config = JSON.parse(raw);
+      return await tps.listRows(this.data, { pluginSlug: HT_PS_SLUG, recordKind });
+    } catch (e) {
+      console.error('[HabitTracker] listRows', e);
+      return [];
+    }
+  }
+
+  async _migrateLegacyHabitTrackerToPluginSettings() {
+    let done = false;
+    try {
+      done = localStorage.getItem(HT_PS_MIGRATE_KEY) === '1';
+    } catch (_) {}
+    if (done) return;
+    const tps = this._tps();
+    if (!tps?.createDataRow || !this.data) return;
+    let legacy = null;
+    try {
+      const all = await this.data.getAllCollections();
+      legacy = all.find((c) => (c.getName?.() || '') === 'HabitTracker') || null;
+    } catch (_) {}
+    if (!legacy) {
+      try {
+        localStorage.setItem(HT_PS_MIGRATE_KEY, '1');
+      } catch (_) {}
+      return;
+    }
+    let records = [];
+    try {
+      records = await legacy.getAllRecords();
+    } catch (_) {
+      return;
+    }
+    const readLegacyData = (rec) =>
+      rec.text?.('data') || rec.prop?.('data')?.text?.() || rec.prop?.('data')?.get?.() || '';
+    const readLegacyNotes = (rec) => {
+      const t =
+        rec.text?.('notes') || rec.prop?.('notes')?.text?.() || rec.prop?.('notes')?.get?.();
+      return t == null ? '' : String(t);
+    };
+    const cfgRows = await this._psListByKind('config');
+    if (cfgRows.length === 0) {
+      const cfgRec = records.find((r) => (r.getName?.() || '') === '__config__');
+      const raw = cfgRec ? readLegacyData(cfgRec) : '';
+      if (raw && String(raw).trim()) {
+        try {
+          const doc = JSON.parse(raw);
+          await tps.createDataRow(this.data, {
+            pluginSlug: HT_PS_SLUG,
+            recordKind: 'config',
+            rowPluginId: HT_PS_ROW_CONFIG,
+            recordTitle: 'config',
+            settingsDoc: doc,
+          });
+        } catch (e) {
+          console.warn('[HabitTracker] migrate config', e);
         }
       }
-      if (!this._config) {
-        this._config = { categories: [], habits: [] };
+    }
+    const existingLogs = await this._psListByKind('log');
+    const existingIds = new Set(existingLogs.map((r) => tps.rowField(r, 'plugin_id')));
+    for (const r of records) {
+      const name = r.getName?.() || '';
+      if (!name.startsWith('log-')) continue;
+      const dateStr = name.slice(4);
+      const rowId = htPsRowLog(dateStr);
+      if (existingIds.has(rowId)) continue;
+      const raw = readLegacyData(r);
+      if (!raw || !String(raw).trim()) continue;
+      try {
+        const d = JSON.parse(raw);
+        const notes = readLegacyNotes(r);
+        if (notes) d.notes = notes;
+        if (!d.date) d.date = dateStr;
+        await tps.createDataRow(this.data, {
+          pluginSlug: HT_PS_SLUG,
+          recordKind: 'log',
+          rowPluginId: rowId,
+          recordTitle: dateStr,
+          settingsDoc: d,
+        });
+        existingIds.add(rowId);
+      } catch (e) {
+        console.warn('[HabitTracker] migrate log', dateStr, e);
       }
-    } catch(e) {
+    }
+    try {
+      localStorage.setItem(HT_PS_MIGRATE_KEY, '1');
+    } catch (_) {}
+  }
+
+  async _loadConfig() {
+    this._config = { categories: [], habits: [] };
+    try {
+      const rows = await this._psListByKind('config');
+      const row = rows[0];
+      if (!row) return;
+      const raw = this._readJsonStore(row);
+      if (raw && String(raw).trim()) this._config = JSON.parse(raw);
+    } catch (e) {
       console.error('[HabitTracker] Error loading config:', e);
       this._config = { categories: [], habits: [] };
     }
   }
 
   async _saveConfig() {
-    if (!this._collection) return;
     try {
-      const records = await this._collection.getAllRecords();
-      let configRecord = records.find(r => r.getName() === '__config__');
-      if (!configRecord) {
-        const guid = this._collection.createRecord('__config__');
-        await htSleep(200);
-        const updated = await this._collection.getAllRecords();
-        configRecord = updated.find(r => r.guid === guid);
+      const rows = await this._psListByKind('config');
+      if (rows.length) {
+        this._writeJsonStore(rows[0], this._config);
+        return;
       }
-      if (configRecord) {
-        const typeProp = configRecord.prop('record_type');
-        if (typeProp) typeProp.set('config');
-        const dataProp = configRecord.prop('data');
-        if (dataProp) dataProp.set(JSON.stringify(this._config));
-      }
-    } catch(e) {
+      const tps = this._tps();
+      if (!tps?.createDataRow || !this.data) return;
+      await tps.createDataRow(this.data, {
+        pluginSlug: HT_PS_SLUG,
+        recordKind: 'config',
+        rowPluginId: HT_PS_ROW_CONFIG,
+        recordTitle: 'config',
+        settingsDoc: this._config,
+      });
+    } catch (e) {
       console.error('[HabitTracker] Error saving config:', e);
     }
   }
 
-  // Read the data field — text() works, get() does not for records created by createRecord()
-  _readDataProp(r) {
-    return r.text?.('data') ||
-           r.prop('data')?.text?.() ||
-           r.prop('data')?.get?.() ||
-           '';
-  }
-
-  _readNotesProp(r) {
-    if (!r) return '';
-    const t = r.text?.('notes') ||
-      r.prop?.('notes')?.text?.() ||
-      r.prop?.('notes')?.get?.();
-    return t == null ? '' : String(t);
-  }
-
-  _writeNotesProp(rec, text) {
-    if (!rec) return;
-    const s = text == null ? '' : String(text);
-    try {
-      rec.prop('notes')?.set?.(s);
-    } catch(e) {}
-  }
-
   async _loadLog(dateStr) {
     const empty = () => ({ date: dateStr, completions: {}, categoryDone: {}, notes: '' });
-    if (!this._collection) return empty();
     try {
-      const records = await this._collection.getAllRecords();
-      const logRecords = records.filter(r => r.getName() === `log-${dateStr}`);
-      if (logRecords.length === 0) return empty();
+      const rows = await this._psListByKind('log');
+      const rid = htPsRowLog(dateStr);
+      const tps = this._tps();
+      const logRows = rows.filter((r) => (tps?.rowField?.(r, 'plugin_id') || '') === rid);
+      if (logRows.length === 0) return empty();
       const merged = empty();
-      for (const r of logRecords) {
-        const raw = this._readDataProp(r);
+      for (const r of logRows) {
+        const raw = this._readJsonStore(r);
         if (raw) {
           try {
             const d = JSON.parse(raw);
             Object.assign(merged.completions, d.completions || {});
             Object.assign(merged.categoryDone, d.categoryDone || {});
             if (d.notes != null && String(d.notes) !== '') merged.notes = String(d.notes);
-          } catch(e) {}
+          } catch (e) {}
         }
-        const propNotes = this._readNotesProp(r);
-        if (propNotes) merged.notes = propNotes;
       }
       return merged;
-    } catch(e) {}
+    } catch (e) {}
     return empty();
   }
 
   /**
-   * One pass over all records: merged log data per calendar day (for streaks + sidebar).
-   * Matches merge rules used by _loadLog / streak calculators.
+   * Merge log rows from Plugin Settings (`record_kind` log) keyed by `date` inside JSON.
    */
-  _buildLogsByDateMap(records) {
+  _buildLogsByDateMapFromRows(rows) {
     const logsByDate = new Map();
-    for (const r of records) {
-      const name = r.getName() || '';
-      if (!name.startsWith('log-')) continue;
-      const raw = this._readDataProp(r);
+    for (const r of rows) {
+      const raw = this._readJsonStore(r);
       if (!raw) continue;
       let data;
       try {
         data = JSON.parse(raw);
-      } catch(e) {
+      } catch (e) {
         continue;
       }
       if (!data.date) continue;
@@ -1582,10 +1830,12 @@ class Plugin extends CollectionPlugin {
       Object.assign(ex.completions, data.completions || {});
       Object.assign(ex.categoryDone, data.categoryDone || {});
       if (data.notes != null && String(data.notes) !== '') ex.notes = String(data.notes);
-      const propNotes = this._readNotesProp(r);
-      if (propNotes) ex.notes = propNotes;
     }
     return logsByDate;
+  }
+
+  async _getAllLogRows() {
+    return this._psListByKind('log');
   }
 
   _getLogForDateFromMap(logsByDate, dateStr) {
@@ -1637,34 +1887,28 @@ class Plugin extends CollectionPlugin {
   }
 
   async _saveLog(dateStr, logData) {
-    if (!this._collection) return;
+    const tps = this._tps();
+    if (!tps?.createDataRow || !this.data) return;
     try {
-      const records = await this._collection.getAllRecords();
       if (logData.notes == null) logData.notes = '';
-      const json = JSON.stringify(logData);
-      const notesStr = String(logData.notes);
-
-      // Find an existing record for this date that ALREADY HAS DATA (skip empty shells)
-      const allForDate = records.filter(r => r.getName() === `log-${dateStr}`);
-      for (const r of allForDate) {
-        const raw = this._readDataProp(r);
-        if (raw) {
-          r.prop('data')?.set(json);
-          this._writeNotesProp(r, notesStr);
+      const rid = htPsRowLog(dateStr);
+      const rows = await this._psListByKind('log');
+      const existing = rows.filter((r) => (tps.rowField?.(r, 'plugin_id') || '') === rid);
+      for (const r of existing) {
+        const raw = this._readJsonStore(r);
+        if (raw && String(raw).trim()) {
+          this._writeJsonStore(r, logData);
           return;
         }
       }
-
-      // No record with real data — create a fresh record (never write to empty shells)
-      const guid = this._collection.createRecord(`log-${dateStr}`);
-      await htSleep(200);
-      const updated = await this._collection.getAllRecords();
-      const newRec = updated.find(r => r.guid === guid);
-      if (!newRec) { console.warn('[HT] saveLog: record not found', dateStr); return; }
-      try { newRec.prop('record_type')?.setChoice('Log'); } catch(e) {}
-      newRec.prop('data')?.set(json);
-      this._writeNotesProp(newRec, notesStr);
-    } catch(e) {
+      await tps.createDataRow(this.data, {
+        pluginSlug: HT_PS_SLUG,
+        recordKind: 'log',
+        rowPluginId: rid,
+        recordTitle: dateStr,
+        settingsDoc: logData,
+      });
+    } catch (e) {
       console.error('[HabitTracker] Error saving log:', e);
     }
   }
@@ -1672,25 +1916,27 @@ class Plugin extends CollectionPlugin {
   // Calculate streak for a category: consecutive days (back from refDate) where categoryDone[catId] is true
   // Respects seedDate: if logs run out but seedDate is set, adds those days to the streak
   async _getCategoryStreak(catId, refDate) {
-    if (!this._collection) return 0;
-    const cat = this._config?.categories?.find(c => c.id === catId);
+    const cat = this._config?.categories?.find((c) => c.id === catId);
     try {
-      const records = await this._collection.getAllRecords();
-      const logsByDate = this._buildLogsByDateMap(records);
+      const logRows = await this._getAllLogRows();
+      const logsByDate = this._buildLogsByDateMapFromRows(logRows);
       return this._categoryStreakFromMap(catId, refDate, logsByDate, cat);
-    } catch(e) { return 0; }
+    } catch (e) {
+      return 0;
+    }
   }
 
   // Calculate streak for a habit: consecutive days where completions[habitId] is true
   // Respects seedDate on the habit for bringing over existing streaks
   async _getHabitStreak(habitId, refDate) {
-    if (!this._collection) return 0;
-    const habit = this._config?.habits?.find(h => h.id === habitId);
+    const habit = this._config?.habits?.find((h) => h.id === habitId);
     try {
-      const records = await this._collection.getAllRecords();
-      const logsByDate = this._buildLogsByDateMap(records);
+      const logRows = await this._getAllLogRows();
+      const logsByDate = this._buildLogsByDateMapFromRows(logRows);
       return this._habitStreakFromMap(habitId, refDate, logsByDate, habit);
-    } catch(e) { return 0; }
+    } catch (e) {
+      return 0;
+    }
   }
 
   // ── Panel mounting ───────────────────────────────────────────────────────
@@ -2144,9 +2390,9 @@ class Plugin extends CollectionPlugin {
     if (!config || config.categories.length === 0) {
       if (stale()) return;
       const dateStrEmpty = state.dateStr || htToday();
-      const recordsEmpty = this._collection ? await this._collection.getAllRecords() : [];
+      const logRowsEmpty = await this._getAllLogRows();
       if (stale()) return;
-      const logEmpty = this._getLogForDateFromMap(this._buildLogsByDateMap(recordsEmpty), dateStrEmpty);
+      const logEmpty = this._getLogForDateFromMap(this._buildLogsByDateMapFromRows(logRowsEmpty), dateStrEmpty);
       body.innerHTML = '';
       const emptyDiv = document.createElement('div');
       emptyDiv.className = 'ht-empty';
@@ -2162,11 +2408,11 @@ class Plugin extends CollectionPlugin {
       return;
     }
 
-    // One collection load: current-day log + shared map for all streak badges (avoids N× getAllRecords)
+    // One Plugin Settings load: log rows + merged map for streak badges
     const dateStr = state.dateStr || htToday();
-    const records = this._collection ? await this._collection.getAllRecords() : [];
+    const logRows = await this._getAllLogRows();
     if (stale()) return;
-    const logsByDate = this._buildLogsByDateMap(records);
+    const logsByDate = this._buildLogsByDateMapFromRows(logRows);
     const log = this._getLogForDateFromMap(logsByDate, dateStr);
 
     // Progress bar — keep stable (update in-place if it exists)
@@ -2905,28 +3151,8 @@ class Plugin extends CollectionPlugin {
       if (!contentEl.isConnected) return;
       contentEl.innerHTML = '';
 
-      // Load all log records, merging any duplicates per date
-      const records = await this._collection?.getAllRecords() || [];
-      const logsByDate = new Map();
-      for (const r of records) {
-        const name = r.getName() || '';
-        if (name.startsWith('log-')) {
-          const raw = this._readDataProp(r);
-          if (raw) {
-            try {
-              const d = JSON.parse(raw);
-              if (!d.date) continue;
-              if (logsByDate.has(d.date)) {
-                const ex = logsByDate.get(d.date);
-                Object.assign(ex.completions, d.completions || {});
-                Object.assign(ex.categoryDone, d.categoryDone || {});
-              } else {
-                logsByDate.set(d.date, { date: d.date, completions: d.completions || {}, categoryDone: d.categoryDone || {} });
-              }
-            } catch(e) {}
-          }
-        }
-      }
+      const logRowsStats = await this._getAllLogRows();
+      const logsByDate = this._buildLogsByDateMapFromRows(logRowsStats);
 
       // Build date range for stats cards (rolling window)
       const today = htToday();
@@ -3989,42 +4215,46 @@ This cannot be undone.`)) return;
   // ══════════════════════════════════════════════════════════════════════════
 
   async _diagnose() {
-    if (!this._collection) { alert('No collection'); return; }
-    const records = await this._collection.getAllRecords();
+    const tps = this._tps();
+    if (!tps?.listRows) {
+      alert('ThymerPluginSettings runtime missing from plugin.js');
+      return;
+    }
+    const configRows = await this._psListByKind('config');
+    const logRows = await this._getAllLogRows();
+    const vaultRows = await tps.listRows(this.data, { pluginSlug: HT_PS_SLUG, recordKind: tps.RECORD_KIND_VAULT });
 
-    // Count by type
-    let configCount = 0, logCount = 0, emptyLogCount = 0, noDateCount = 0;
-    const dateCounts = new Map(); // date → count of records
+    let emptyLogCount = 0;
+    let noDateCount = 0;
+    const dateCounts = new Map();
     const sampleDate = '2026-02-01';
     const sampleRecords = [];
-
-    for (const r of records) {
-      const name = r.getName?.() || '';
-      if (name === '__config__') { configCount++; continue; }
-      if (!name.startsWith('log-')) continue;
-      logCount++;
-
-      const raw = this._readDataProp(r);
-      if (!raw) { emptyLogCount++; continue; }
-
+    for (const r of logRows) {
+      const raw = this._readJsonStore(r);
+      if (!raw || !String(raw).trim()) {
+        emptyLogCount++;
+        continue;
+      }
       try {
         const d = JSON.parse(raw);
-        if (!d.date) { noDateCount++; continue; }
+        if (!d.date) {
+          noDateCount++;
+          continue;
+        }
         dateCounts.set(d.date, (dateCounts.get(d.date) || 0) + 1);
         if (d.date === sampleDate) {
           sampleRecords.push({
-            name,
+            plugin_id: tps.rowField(r, 'plugin_id'),
             completionKeys: Object.keys(d.completions || {}),
             catDoneKeys: Object.keys(d.categoryDone || {}),
           });
         }
-      } catch(e) { noDateCount++; }
+      } catch (e) {
+        noDateCount++;
+      }
     }
+    const duplicateDates = [...dateCounts.entries()].filter(([, c]) => c > 1);
 
-    const duplicateDates = [...dateCounts.entries()].filter(([,c]) => c > 1);
-    const maxDups = duplicateDates.reduce((m, [,c]) => Math.max(m,c), 0);
-
-    // Test write — also check if prior session's write persisted
     let writeTest = 'not tested';
     try {
       const testDate = '1970-01-01-test';
@@ -4034,112 +4264,93 @@ This cannot be undone.`)) return;
       await htSleep(400);
       const verify = await this._loadLog(testDate);
       const writeOk = verify.completions?.test === true;
-      writeTest = (priorPersisted ? 'OK persisted · ' : 'NOT persisted across reload · ') +
-                  (writeOk ? 'OK write works' : 'write failed');
-    } catch(e) { writeTest = 'ERROR: ' + e.message; }
+      writeTest =
+        (priorPersisted ? 'OK persisted · ' : 'NOT persisted across reload · ') +
+        (writeOk ? 'OK write works' : 'write failed');
+    } catch (e) {
+      writeTest = 'ERROR: ' + e.message;
+    }
 
-    // Test createRecord directly
-    let createTest = 'not tested';
-    try {
-      const testName = 'log-1970-01-02-test';
-      const guid = this._collection.createRecord(testName);
-      createTest = guid ? `OK got guid: ${guid.slice(0,8)}…` : 'createRecord returned null/undefined';
-      if (guid) {
-        await htSleep(300);
-        const all2 = await this._collection.getAllRecords();
-        const found = all2.find(r => r.guid === guid);
-        if (found) {
-          found.prop('data')?.set(JSON.stringify({ date: testName, completions: { create_test: true }, categoryDone: {} }));
-          await htSleep(200);
-          const readback = found.prop('data')?.get?.() || found.text?.('data') || '';
-          createTest += readback ? ` · data set+read ok` : ` · data set but read empty`;
-        } else {
-          createTest += ' · record not found after creation';
-        }
-      }
-    } catch(e) { createTest = 'ERROR: ' + e.message; }
-
-    // Cross-reference: check if the habit IDs in log records match current config
     const cfg = this._config || { habits: [], categories: [] };
-    const activeHabits = cfg.habits.filter(h => !h.archived);
-    const configHabitIds = new Set(cfg.habits.map(h => h.id));
+    const configHabitIds = new Set(cfg.habits.map((h) => h.id));
     let idMatchTest = '';
     try {
-      const sampleLogRec = records.find(r => r.getName() === 'log-2026-02-01');
+      const rid = htPsRowLog(sampleDate);
+      const sampleLogRec = logRows.find((r) => (tps.rowField(r, 'plugin_id') || '') === rid);
       if (sampleLogRec) {
-        const raw = this._readDataProp(sampleLogRec);
+        const raw = this._readJsonStore(sampleLogRec);
         if (raw) {
           const d = JSON.parse(raw);
           const logIds = Object.keys(d.completions || {});
-          const matched = logIds.filter(id => configHabitIds.has(id));
-          const unmatched = logIds.filter(id => !configHabitIds.has(id));
-          idMatchTest = `log-2026-02-01 has ${logIds.length} completions: ${matched.length} match config, ${unmatched.length} stale. Config has ${cfg.habits.length} habits total.`;
-          if (unmatched.length > 0) idMatchTest += `\nStale IDs: ${unmatched.slice(0,3).join(',')}`;
-          if (matched.length > 0) idMatchTest += `\nMatched IDs: ${matched.slice(0,3).join(',')}`;
+          const matched = logIds.filter((id) => configHabitIds.has(id));
+          const unmatched = logIds.filter((id) => !configHabitIds.has(id));
+          idMatchTest = `${sampleDate} log has ${logIds.length} completions: ${matched.length} match config, ${unmatched.length} stale.`;
+          if (unmatched.length > 0) idMatchTest += `\nStale IDs: ${unmatched.slice(0, 3).join(',')}`;
         }
+      } else {
+        idMatchTest = `No log row for ${sampleDate}`;
       }
-    } catch(e) { idMatchTest = 'error: ' + e.message; }
-
-    // Sample actual record names to verify getName() format
-    const namesamples = records.slice(0, 10).map(r => {
-      const n = r.getName?.();
-      const raw = this._readDataProp(r);
-      return `"${n}" hasData:${!!raw}`;
-    });
+    } catch (e) {
+      idMatchTest = 'error: ' + e.message;
+    }
 
     const msg = [
-      `Write test: ${writeTest}`,
-      `Create test: ${createTest}`,
-      `ID match: ${idMatchTest}`,
-      `Deep inspect: (removed)`,
-      `Total records: ${records.length}`,
-      `Config records: ${configCount}`,
-      `Log records: ${logCount}`,
-      `  Empty (no data): ${emptyLogCount}`,
-      `  No date field: ${noDateCount}`,
+      `Storage: Plugin Settings (slug "${HT_PS_SLUG}")`,
+      `Vault rows (sync mirror): ${vaultRows.length}`,
+      `Config rows: ${configRows.length}`,
+      `Log rows: ${logRows.length}`,
+      `  Empty JSON: ${emptyLogCount}`,
+      `  Missing date in JSON: ${noDateCount}`,
       `  Unique dates: ${dateCounts.size}`,
-      `  Dates with duplicates: ${duplicateDates.length}`,
-      `  Max duplicates per date: ${maxDups}`,
+      `  Dates with duplicate rows: ${duplicateDates.length}`,
       ``,
-      `Sample date ${sampleDate}: ${sampleRecords.length} records`,
-      ...sampleRecords.map((r,i) => `  [${i}] keys: ${r.completionKeys.slice(0,3).join(',')}... cats: ${r.catDoneKeys.join(',')}`),
+      `Write test: ${writeTest}`,
+      `ID check: ${idMatchTest}`,
       ``,
-      `First 10 record names:`,
-      ...namesamples,
+      `Sample ${sampleDate}: ${sampleRecords.length} row(s)`,
+      ...sampleRecords.map((row, i) => `  [${i}] ${row.plugin_id} habits:${row.completionKeys.slice(0, 3).join(',')}`),
     ].join('\n');
 
-    console.log('[HT Diagnose]', msg);
+    console.log('[HT Diagnose]', { configRows: configRows.length, logRows: logRows.length, vaultRows, sampleRecords });
     alert(msg);
   }
 
-  // Delete log records with no completions AND no categoryDone (artifacts from bad imports)
+  // Delete Plugin Settings log rows with no completions AND no categoryDone
   async _cleanEmptyLogs() {
-    if (!this._collection) return;
-    const records = await this._collection.getAllRecords();
+    const logRows = await this._getAllLogRows();
     const toDelete = [];
-    for (const r of records) {
-      const name = r.getName?.() || '';
-      if (!name.startsWith('log-')) continue;
+    for (const r of logRows) {
       try {
-        const raw = this._readDataProp(r);
-        if (!raw) { toDelete.push(r); continue; }
+        const raw = this._readJsonStore(r);
+        if (!raw || !String(raw).trim()) {
+          toDelete.push(r);
+          continue;
+        }
         const d = JSON.parse(raw);
         const hasCompletions = d.completions && Object.keys(d.completions).length > 0;
         const hasCatDone = d.categoryDone && Object.keys(d.categoryDone).length > 0;
         if (!hasCompletions && !hasCatDone) toDelete.push(r);
-      } catch(e) { toDelete.push(r); }
+      } catch (e) {
+        toDelete.push(r);
+      }
     }
     if (toDelete.length === 0) {
       this.ui.addToaster({ title: 'No empty log records found', autoDestroyTime: 3000 });
       return;
     }
-    if (!confirm(`Delete ${toDelete.length} empty log records? These are leftover from a failed import.`)) return;
-    this.ui.addToaster({ title: `Deleting ${toDelete.length} empty records…`, autoDestroyTime: 3000 });
+    if (!confirm(`Delete ${toDelete.length} empty log rows in Plugin Settings?`)) return;
+    this.ui.addToaster({ title: `Deleting ${toDelete.length} empty rows…`, autoDestroyTime: 3000 });
     for (const r of toDelete) {
-      try { await r.delete?.(); } catch(e) { try { r.prop('data')?.set?.('{"date":"","completions":{},"categoryDone":{}}'); } catch(e2) {} }
+      try {
+        if (typeof r.delete === 'function') await r.delete();
+      } catch (e) {
+        try {
+          this._writeJsonStore(r, { date: '', completions: {}, categoryDone: {} });
+        } catch (e2) {}
+      }
       await htSleep(30);
     }
-    this.ui.addToaster({ title: `Deleted ${toDelete.length} empty log records`, autoDestroyTime: 4000 });
+    this.ui.addToaster({ title: `Deleted ${toDelete.length} empty log rows`, autoDestroyTime: 4000 });
     this.refreshAllPanels();
   }
 
