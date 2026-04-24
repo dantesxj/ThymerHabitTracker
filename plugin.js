@@ -2397,6 +2397,42 @@ class Plugin extends CollectionPlugin {
       }
     }
 
+    // Recompute streaks immediately so click updates are visible without refresh.
+    try {
+      const logsByDate = await this._loadAllLogsByDate();
+      const habitStreak = this._habitStreakFromMap(habit.id, undefined, logsByDate, habit);
+      const habitNameEl = habitEl.querySelector('.ht-habit-name');
+      let habitStreakEl = habitEl.querySelector('.ht-habit-streak');
+      if (habitStreak > 0) {
+        if (!habitStreakEl && habitNameEl) {
+          habitStreakEl = document.createElement('span');
+          habitEl.appendChild(habitStreakEl);
+        }
+        if (habitStreakEl) {
+          habitStreakEl.className = `ht-habit-streak ${habitStreak >= 7 ? 'hot' : ''}`.trim();
+          habitStreakEl.innerHTML = `${htIcon('flame')}${habitStreak}d`;
+        }
+      } else if (habitStreakEl) {
+        habitStreakEl.remove();
+      }
+
+      if (catHeader) {
+        const cat = (this._config?.categories || []).find((c) => c.id === catId) || null;
+        const catStreak = this._categoryStreakFromMap(catId, undefined, logsByDate, cat);
+        let catStreakEl = catHeader.querySelector('.ht-streak-badge');
+        if (catStreak > 0) {
+          if (!catStreakEl) {
+            catStreakEl = document.createElement('span');
+            catStreakEl.className = 'ht-streak-badge';
+            catHeader.appendChild(catStreakEl);
+          }
+          catStreakEl.innerHTML = `${htIcon('flame')}${catStreak}d`;
+        } else if (catStreakEl) {
+          catStreakEl.remove();
+        }
+      }
+    } catch (_) {}
+
     // Update progress bar
     const body = state.bodyEl;
     if (body) {
