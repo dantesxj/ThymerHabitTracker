@@ -2,7 +2,7 @@
 
 ## Global plugin (current)
 
-**1.1.0** — This repository now ships the **global** AppPlugin only. Habits and logs live in **Plugin Settings** (`record_kind` `config` / `log`, plugin slug `habit-tracker`). One-time import from a legacy **`HabitTracker`** collection when present. See **[README.md](./README.md)** for install and migration from the old collection model.
+**1.1.0** — This repository now ships the **global** AppPlugin only. Habits and logs live in **Plugin Backend** (`record_kind` `config` / `log`, plugin slug `habit-tracker`). One-time import from a legacy **`HabitTracker`** collection when present. See **[README.md](./README.md)** for install and migration from the old collection model.
 
 ---
 

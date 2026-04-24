@@ -1,7 +1,7 @@
 {
   "name": "Habit Tracker",
   "icon": "ti-flame",
-  "description": "Journal habit sidebar: categories, streaks, and stats. Data lives in the workspace Plugin Settings collection (no separate HabitTracker collection).",
+  "description": "Journal habit sidebar: categories, streaks, and stats. Data lives in the workspace Plugin Backend collection (no separate HabitTracker collection).",
   "custom": {
     "persist_habit_panel_state": true
   },
