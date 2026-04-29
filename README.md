@@ -18,7 +18,7 @@ If you need the old collection-only workflow, pin or check out a **pre–1.1.0**
 
 ## Install
 
-1. Ensure the workspace has a **Plugin Backend** collection with the expanded schema: fields **`plugin`**, **`record_kind`**, **`plugin_id`**, **`settings_json`**. If you develop from the ThymerExtensions workspace, the reference collection JSON is `plugins/plugin-settings/Plugin Backend.json` there; otherwise merge those fields into your existing collection in Thymer (legacy display name **Plugin Settings** is still resolved).
+1. Ensure the workspace has a **Plugin Backend** collection with the expanded schema: fields **`plugin`**, **`record_kind`**, **`plugin_id`**, **`settings_json`**. If you develop from the ThymerExtensions workspace, the reference collection JSON is `plugins/public repo/plugin-settings/Plugin Backend.json` there; otherwise merge those fields into your existing collection in Thymer (legacy display name **Plugin Settings** is still resolved).
 2. In Thymer **global** custom code, paste **`plugin.js`**.
 3. For the global plugin slot, paste **`plugin.json`** (minimal manifest: `name`, `icon`, `description`, optional `custom.persist_habit_panel_state`).
 
