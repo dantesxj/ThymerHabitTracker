@@ -4804,6 +4804,10 @@ function htDaysAfter(dateStr, n) {
 /** Serialized completion markers (JSON-safe strings). */
 const HT_COMP_NA = '__na__';
 const HT_COMP_FAIL = '__x__';
+/** Long-press (× / numeric entry) and sidebar drag-paint timing. */
+const HT_LONG_PRESS_MS = 500;
+const HT_SIDEBAR_DRAG_CLICK_GAP_MS = 450;
+const HT_DRAG_MOVE_PX = 8;
 
 function htWeekdayFromDateStr(dateStr) {
   return new Date(dateStr + 'T12:00:00').getDay();
@@ -7753,6 +7757,95 @@ class Plugin extends AppPlugin {
     }
   }
 
+  _htSidebarDragClickBump(state) {
+    const now = Date.now();
+    if (now - (state._htSidebarDragLastUp || 0) < HT_SIDEBAR_DRAG_CLICK_GAP_MS) {
+      state._htSidebarDragClickSeq = Math.min(3, (state._htSidebarDragClickSeq || 0) + 1);
+    } else {
+      state._htSidebarDragClickSeq = 1;
+    }
+    return state._htSidebarDragClickSeq;
+  }
+
+  _htSidebarDragModeFromClickCount(count) {
+    if (count >= 3) return 'na';
+    if (count === 2) return 'fail';
+    return 'done';
+  }
+
+  _htSyncDayLogState(state, dateStr, log) {
+    state._htDayLogDate = dateStr;
+    state._htDayLog = JSON.parse(
+      JSON.stringify(log || { date: dateStr, completions: {}, categoryDone: {}, notes: '' })
+    );
+    state._htDayLog.date = dateStr;
+  }
+
+  async _htEnsureSidebarDragLog(state, dateStr) {
+    if (state._htSidebarDragLog && state._htSidebarDragLog.date === dateStr) {
+      return state._htSidebarDragLog;
+    }
+    let base =
+      state._htDayLogDate === dateStr && state._htDayLog
+        ? state._htDayLog
+        : await this._loadLog(dateStr);
+    state._htSidebarDragLog = JSON.parse(JSON.stringify(base));
+    state._htSidebarDragLog.date = dateStr;
+    return state._htSidebarDragLog;
+  }
+
+  _htArmSidebarDragPaintFlush(state, dateStr) {
+    if (state._htSidebarDragFlushArmed) return;
+    state._htSidebarDragFlushArmed = true;
+    const finish = async () => {
+      window.removeEventListener('pointerup', finish, true);
+      window.removeEventListener('pointercancel', finish, true);
+      state._htSidebarDragFlushArmed = false;
+      state._htSidebarDragArmed = false;
+      state._htSidebarDragMode = null;
+      const seen = state._htSidebarDragSeen;
+      state._htSidebarDragSeen = null;
+      const batch = state._htSidebarDragLog;
+      state._htSidebarDragLog = null;
+      if (!batch || !seen?.size) return;
+      try {
+        const latest = await this._loadLog(dateStr);
+        for (const hid of seen) {
+          if (Object.prototype.hasOwnProperty.call(batch.completions, hid)) {
+            latest.completions[hid] = batch.completions[hid];
+          }
+        }
+        this._htRecomputeCategoryDone(latest, this._config, dateStr);
+        await this._saveLog(dateStr, latest);
+        this._htSyncDayLogState(state, dateStr, latest);
+      } catch (_) {}
+    };
+    window.addEventListener('pointerup', finish, { once: true, capture: true });
+    window.addEventListener('pointercancel', finish, { once: true, capture: true });
+  }
+
+  _htPaintSidebarHabitDrag(state, habitEl, dateStr, config) {
+    if (!state._htSidebarDragArmed || !state._htSidebarDragMode) return false;
+    const hid = habitEl?.dataset?.habitId;
+    if (!hid) return false;
+    if (!state._htSidebarDragSeen) state._htSidebarDragSeen = new Set();
+    if (state._htSidebarDragSeen.has(hid)) return false;
+    const habit = (config.habits || []).find((h) => h.id === hid && !h.archived);
+    if (!habit || (habit.target || 0) > 0) return false;
+    state._htSidebarDragSeen.add(hid);
+    state._htSidebarDragDidPaint = true;
+    const batch = state._htSidebarDragLog;
+    if (!batch) return false;
+    const mode = state._htSidebarDragMode;
+    if (mode === 'done') batch.completions[hid] = true;
+    else if (mode === 'fail') batch.completions[hid] = HT_COMP_FAIL;
+    else if (mode === 'na') batch.completions[hid] = HT_COMP_NA;
+    this._htRecomputeCategoryDone(batch, config, dateStr);
+    this._htSyncDayLogState(state, dateStr, batch);
+    void this._patchHabitEl(habitEl, habit, batch, dateStr, habit.categoryId, state);
+    return true;
+  }
+
   /** Habits always list by category; tags are a filter only (see tag filter button). */
   _htGetGroupMode() {
     return 'category';
@@ -8566,6 +8659,7 @@ class Plugin extends AppPlugin {
     }
     const logsByDate = this._buildLogsByDateMapFromRows(logRows);
     const log = this._getLogForDateFromMap(logsByDate, dateStr);
+    this._htSyncDayLogState(state, dateStr, log);
 
     // Progress bar — categories with ≥1 habit done today (unfiltered full setup).
     const activeTagF = this._htGetTagFilter();
@@ -8825,73 +8919,92 @@ class Plugin extends AppPlugin {
         let didLongPress = false;
         let pressStartX = 0;
         let pressStartY = 0;
-
         let pressDownTime = 0;
-
-        const startPress = (e) => {
-          if (state.htManageMode) return;
-          didLongPress = false;
-          pressDownTime = Date.now();
-          pressStartX = e.clientX || e.touches?.[0]?.clientX || 0;
-          pressStartY = e.clientY || e.touches?.[0]?.clientY || 0;
-          if (isNumeric) {
-            longPressTimer = setTimeout(() => {
-              didLongPress = true;
-              clearTimeout(longPressTimer);
-              longPressTimer = null;
-              this._showNumericInput(habitEl, habit, habit.categoryId, log, dateStr, state);
-            }, 800);
-          } else {
-            longPressTimer = setTimeout(async () => {
-              didLongPress = true;
-              clearTimeout(longPressTimer);
-              longPressTimer = null;
-              try {
-                const fresh = await this._loadLog(dateStr);
-                fresh.completions[habit.id] = HT_COMP_FAIL;
-                this._htRecomputeCategoryDone(fresh, this._config, dateStr);
-                await this._saveLog(dateStr, fresh);
-                await this._patchHabitEl(habitEl, habit, fresh, dateStr, habit.categoryId, state);
-              } catch (_) {}
-            }, 800);
-          }
-        };
+        let localDragArmed = false;
+        let pressClickCount = 1;
 
         const cancelPress = () => {
           clearTimeout(longPressTimer);
           longPressTimer = null;
         };
 
-        const checkMove = (e) => {
-          const x = e.clientX || e.touches?.[0]?.clientX || 0;
-          const y = e.clientY || e.touches?.[0]?.clientY || 0;
-          const threshold = e.touches ? 12 : 8;
-          if (Math.abs(x - pressStartX) > threshold || Math.abs(y - pressStartY) > threshold) {
-            cancelPress();
-          }
+        const armDragPaint = () => {
+          if (localDragArmed || state._htSidebarDragArmed || isNumeric) return;
+          localDragArmed = true;
+          state._htSidebarDragMode = this._htSidebarDragModeFromClickCount(pressClickCount);
+          this._htArmSidebarDragPaintFlush(state, dateStr);
+          void (async () => {
+            try {
+              await this._htEnsureSidebarDragLog(state, dateStr);
+              state._htSidebarDragArmed = true;
+              this._htPaintSidebarHabitDrag(state, habitEl, dateStr, config);
+            } catch (_) {}
+          })();
         };
 
-        habitEl.addEventListener('mousedown', startPress);
-        habitEl.addEventListener('touchstart', startPress, { passive: true });
-        habitEl.addEventListener('mousemove', checkMove);
-        habitEl.addEventListener('touchmove', checkMove, { passive: true });
-        habitEl.addEventListener('mouseup', () => {
-          if (Date.now() - pressDownTime < 600) cancelPress();
+        habitEl.addEventListener('pointerdown', (e) => {
+          if (state.htManageMode || e.button !== 0) return;
+          if (e.target.closest?.('.ht-habit-stats-link')) return;
+          didLongPress = false;
+          localDragArmed = false;
+          pressClickCount = this._htSidebarDragClickBump(state);
+          pressDownTime = Date.now();
+          pressStartX = e.clientX;
+          pressStartY = e.clientY;
+          if (isNumeric) {
+            longPressTimer = setTimeout(() => {
+              didLongPress = true;
+              cancelPress();
+              this._showNumericInput(habitEl, habit, habit.categoryId, log, dateStr, state);
+            }, HT_LONG_PRESS_MS);
+          } else {
+            longPressTimer = setTimeout(async () => {
+              if (localDragArmed || state._htSidebarDragArmed) return;
+              if (pressClickCount !== 1) return;
+              didLongPress = true;
+              cancelPress();
+              try {
+                const fresh = await this._loadLog(dateStr);
+                fresh.completions[habit.id] = HT_COMP_FAIL;
+                this._htRecomputeCategoryDone(fresh, this._config, dateStr);
+                await this._saveLog(dateStr, fresh);
+                this._htSyncDayLogState(state, dateStr, fresh);
+                await this._patchHabitEl(habitEl, habit, fresh, dateStr, habit.categoryId, state);
+              } catch (_) {}
+            }, HT_LONG_PRESS_MS);
+          }
         });
-        habitEl.addEventListener('mouseleave', cancelPress);
-        habitEl.addEventListener(
-          'touchend',
-          (e) => {
-            if (didLongPress) e.preventDefault();
-            if (Date.now() - pressDownTime < 600) cancelPress();
-          },
-          { passive: false }
-        );
+
+        habitEl.addEventListener('pointermove', (e) => {
+          if (!(e.buttons & 1)) return;
+          const threshold = e.pointerType === 'touch' ? 12 : HT_DRAG_MOVE_PX;
+          if (
+            Math.abs(e.clientX - pressStartX) > threshold ||
+            Math.abs(e.clientY - pressStartY) > threshold
+          ) {
+            cancelPress();
+            if (!isNumeric) armDragPaint();
+          }
+        });
+
+        habitEl.addEventListener('pointerenter', (e) => {
+          if (!(e.buttons & 1)) return;
+          if (!state._htSidebarDragArmed) return;
+          this._htPaintSidebarHabitDrag(state, habitEl, dateStr, config);
+        });
+
+        habitEl.addEventListener('pointerup', () => {
+          state._htSidebarDragLastUp = Date.now();
+          cancelPress();
+        });
+
+        habitEl.addEventListener('pointercancel', cancelPress);
 
         habitEl.addEventListener('click', (e) => {
           if (state.htManageMode) return;
-          if (didLongPress) {
+          if (didLongPress || state._htSidebarDragDidPaint) {
             didLongPress = false;
+            state._htSidebarDragDidPaint = false;
             return;
           }
           if (habitEl.querySelector('.ht-num-input')) return;
@@ -9114,6 +9227,7 @@ class Plugin extends AppPlugin {
 
     this._htRecomputeCategoryDone(log, cfg, dateStr);
     await this._saveLog(dateStr, log);
+    this._htSyncDayLogState(state, dateStr, log);
     await this._patchHabitEl(habitEl, habit, log, dateStr, catId, state);
   }
 
@@ -9721,7 +9835,7 @@ class Plugin extends AppPlugin {
         longTimer = setTimeout(() => {
           didLong = true;
           showStatsNumericInput(el, dateStr, h);
-        }, 800);
+        }, HT_LONG_PRESS_MS);
       });
       el.addEventListener('mouseup', () => {
         if (isNumeric && Date.now() - pressDownTime < 600) clearTimeout(longTimer);
