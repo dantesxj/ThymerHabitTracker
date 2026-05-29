@@ -52,6 +52,237 @@
   const DEBUG_PATHB_ID =
     'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
 
+  /** In-flight dedupe: parallel plugin `init()` calls share one `getAllCollections()` snapshot. */
+  const DATA_GET_ALL_P = '__thymerExtGetAllCollectionsInflight';
+
+  function preferDeferredHeavyWork() {
+    try {
+      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
+    } catch (_) {}
+    try {
+      return Number(navigator?.maxTouchPoints) > 0;
+    } catch (_) {}
+    return false;
+  }
+
+  const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
+  const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
+  const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
+  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
+  const MOBILE_GRACE_MS = 45000;
+  const MOBILE_RESUME_GRACE_MS = 35000;
+  const MOBILE_RESUME_AWAY_MS = 15000;
+  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
+  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
+  const MOBILE_INTERACTION_THROTTLE_MS = 2500;
+  const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
+
+  // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
+  // Running them concurrently causes long-task storms that block navigation.
+  const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
+  const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
+
+  function ensureMobileLoadGraceStarted(extraMs) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function inMobileLoadGrace() {
+    if (!preferDeferredHeavyWork()) return false;
+    try {
+      return Date.now() < (g[MOBILE_GRACE_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function bumpMobileLoadGrace(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_RESUME_GRACE_MS);
+    try {
+      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
+        g[MOBILE_GRACE_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function installMobileResumeGraceListener() {
+    if (g.__thymerExtMobileGraceListenerInstalled) return;
+    g.__thymerExtMobileGraceListenerInstalled = true;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+    document.addEventListener(
+      'visibilitychange',
+      () => {
+        try {
+          if (document.visibilityState === 'hidden') {
+            g[MOBILE_HIDDEN_AT_KEY] = Date.now();
+          } else if (document.visibilityState === 'visible') {
+            const hiddenAt = g[MOBILE_HIDDEN_AT_KEY] || 0;
+            const away = hiddenAt ? Date.now() - hiddenAt : 0;
+            if (away >= MOBILE_RESUME_AWAY_MS) bumpMobileLoadGrace(MOBILE_RESUME_GRACE_MS);
+          }
+        } catch (_) {}
+      },
+      { passive: true }
+    );
+  }
+
+  function pauseHeavyWorkQueue(ms) {
+    if (!preferDeferredHeavyWork()) return;
+    const until = Date.now() + (ms > 0 ? ms : MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+    try {
+      if (!g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] < until) {
+        g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] = until;
+      }
+    } catch (_) {}
+  }
+
+  function isHeavyWorkQueuePaused() {
+    try {
+      return Date.now() < (g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
+  function shouldDeferPanelFooterWork() {
+    return inMobileLoadGrace();
+  }
+
+  function installMobileInteractionGraceListener() {
+    if (g.__thymerExtMobileInteractGraceInstalled) return;
+    g.__thymerExtMobileInteractGraceInstalled = true;
+    if (!preferDeferredHeavyWork()) return;
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+
+    const onInteract = () => {
+      try {
+        const now = Date.now();
+        const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
+        if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
+        g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
+        pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
+      } catch (_) {}
+    };
+
+    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+      try {
+        document.addEventListener(ev, onInteract, { passive: true, capture: true });
+      } catch (_) {}
+    }
+  }
+
+  async function yieldToHostOneTick() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        setTimeout(r, 0);
+      }
+    });
+  }
+
+  async function runNextHeavyWork() {
+    if (g[HEAVY_BUSY_KEY]) return;
+    const q = g[HEAVY_Q_KEY];
+    if (!Array.isArray(q) || q.length === 0) return;
+    g[HEAVY_BUSY_KEY] = true;
+    try {
+      while (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        if (inMobileLoadGrace() || isHeavyWorkQueuePaused()) break;
+        const job = g[HEAVY_Q_KEY].shift();
+        if (!job || typeof job.run !== 'function') continue;
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+        // Prefer running during idle; fallback is still serialized.
+        try {
+          if (typeof requestIdleCallback === 'function') {
+            await new Promise((resolve) => requestIdleCallback(resolve, { timeout: 1200 }));
+          }
+        } catch (_) {}
+        try {
+          await job.run();
+        } catch (_) {}
+        // Yield after each heavy job so navigation events can be processed.
+        try {
+          await yieldToHostOneTick();
+        } catch (_) {}
+      }
+    } finally {
+      g[HEAVY_BUSY_KEY] = false;
+      // If we stopped due to grace, try again later.
+      if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
+        setTimeout(() => runNextHeavyWork(), 1500);
+      }
+    }
+  }
+
+  function enqueueHeavyWork(run, opts) {
+    if (typeof run !== 'function') return;
+    if (!g[HEAVY_Q_KEY]) g[HEAVY_Q_KEY] = [];
+    const delayMs = Math.max(0, Number(opts?.delayMs) || 0);
+    const push = () => {
+      try {
+        g[HEAVY_Q_KEY].push({ run });
+      } catch (_) {}
+      setTimeout(() => runNextHeavyWork(), 0);
+    };
+    if (delayMs > 0) setTimeout(push, delayMs);
+    else push();
+  }
+
+  async function yieldToHostBeforePathB() {
+    await new Promise((r) => {
+      try {
+        requestAnimationFrame(() => requestAnimationFrame(() => r()));
+      } catch (_) {
+        r();
+      }
+    });
+    await new Promise((resolve) => {
+      try {
+        if (typeof requestIdleCallback === 'function') {
+          requestIdleCallback(() => resolve(), {
+            timeout: preferDeferredHeavyWork() ? 8000 : 1500,
+          });
+        } else {
+          setTimeout(resolve, preferDeferredHeavyWork() ? 48 : 16);
+        }
+      } catch (_) {
+        setTimeout(resolve, 32);
+      }
+    });
+  }
+
+  async function getAllCollectionsDeduped(data) {
+    if (!data || typeof data.getAllCollections !== 'function') return [];
+    const inflight = data[DATA_GET_ALL_P];
+    if (inflight && typeof inflight.then === 'function') {
+      try {
+        return await inflight;
+      } catch (_) {
+        // fall through to fresh fetch
+      }
+    }
+    const p = Promise.resolve()
+      .then(() => data.getAllCollections())
+      .then((all) => (Array.isArray(all) ? all : []))
+      .finally(() => {
+        try {
+          if (data[DATA_GET_ALL_P] === p) delete data[DATA_GET_ALL_P];
+        } catch (_) {}
+      });
+    data[DATA_GET_ALL_P] = p;
+    return p;
+  }
+
   /** If true, Thymer ignores programmatic field updates — force off on every schema save. */
   const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
 
@@ -941,7 +1172,7 @@
   async function countExactPluginBackendNamedCollections(data) {
     let all;
     try {
-      all = await data.getAllCollections();
+      all = await getAllCollectionsDeduped(data);
     } catch (_) {
       return 0;
     }
@@ -1151,7 +1382,7 @@
 
   async function findColl(data) {
     try {
-      const all = await data.getAllCollections();
+      const all = await getAllCollectionsDeduped(data);
       return pickCollFromAll(all);
     } catch (_) {
       return null;
@@ -1160,13 +1391,12 @@
 
   /** Brute list scan — catches a Backend another iframe just created if `findColl` lags. */
   async function hasPluginBackendOnWorkspace(data) {
-    let all;
     try {
-      all = await data.getAllCollections();
+      const all = await getAllCollectionsDeduped(data);
+      return hasPluginBackendInAll(all);
     } catch (_) {
       return false;
     }
-    return hasPluginBackendInAll(all);
   }
 
   const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
@@ -1272,7 +1502,7 @@
       dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
       try {
         if (data && data.getAllCollections) {
-          const a = await data.getAllCollections();
+          const a = await getAllCollectionsDeduped(data);
           const list = Array.isArray(a) ? a : [];
           const collNames = list.map((c) => {
             try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
@@ -1311,7 +1541,7 @@
       for (let attempt = 0; attempt < 4; attempt++) {
         let allAttempt;
         try {
-          allAttempt = await data.getAllCollections();
+          allAttempt = await getAllCollectionsDeduped(data);
         } catch (_) {
           allAttempt = null;
         }
@@ -1340,7 +1570,7 @@
       }
       let allPost;
       try {
-        allPost = await data.getAllCollections();
+        allPost = await getAllCollectionsDeduped(data);
       } catch (_) {
         allPost = null;
       }
@@ -1368,7 +1598,7 @@
       await new Promise((r) => setTimeout(r, 120));
       let allAfterWait;
       try {
-        allAfterWait = await data.getAllCollections();
+        allAfterWait = await getAllCollectionsDeduped(data);
       } catch (_) {
         allAfterWait = null;
       }
@@ -1394,14 +1624,14 @@
       let preCreateLen = 0;
       try {
         if (data && data.getAllCollections) {
-          const all0 = await data.getAllCollections();
+          const all0 = await getAllCollectionsDeduped(data);
           preCreateLen = Array.isArray(all0) ? all0.length : 0;
           if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
         }
         if (preCreateLen === 0) {
           await new Promise((r) => setTimeout(r, 150));
           if (data && data.getAllCollections) {
-            const all1 = await data.getAllCollections();
+            const all1 = await getAllCollectionsDeduped(data);
             preCreateLen = Array.isArray(all1) ? all1.length : 0;
             if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
           }
@@ -1409,7 +1639,7 @@
         if (preCreateLen > 0) {
           let allPre;
           try {
-            allPre = await data.getAllCollections();
+            allPre = await getAllCollectionsDeduped(data);
           } catch (_) {
             allPre = null;
           }
@@ -1453,7 +1683,7 @@
       try {
         let allLease;
         try {
-          allLease = await data.getAllCollections();
+          allLease = await getAllCollectionsDeduped(data);
         } catch (_) {
           allLease = null;
         }
@@ -1483,7 +1713,7 @@
             await new Promise((r) => setTimeout(r, 130 + i * 70));
             let allCont;
             try {
-              allCont = await data.getAllCollections();
+              allCont = await getAllCollectionsDeduped(data);
             } catch (_) {
               allCont = null;
             }
@@ -1516,7 +1746,7 @@
             await new Promise((r) => setTimeout(r, 120 + i * 60));
             let allSettle;
             try {
-              allSettle = await data.getAllCollections();
+              allSettle = await getAllCollectionsDeduped(data);
             } catch (_) {
               allSettle = null;
             }
@@ -1974,8 +2204,18 @@
     createDataRow,
     upgradeCollectionSchema: (data) => upgradePluginSettingsSchema(data),
     registerPluginSlug,
+    preferDeferredHeavyWork,
+    yieldToHostBeforePathB,
+    ensureMobileLoadGraceStarted,
+    inMobileLoadGrace,
+    bumpMobileLoadGrace,
+    installMobileResumeGraceListener,
 
     async init(opts) {
+      ensureMobileLoadGraceStarted();
+      installMobileResumeGraceListener();
+      installMobileInteractionGraceListener();
+      await yieldToHostBeforePathB();
       const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
 
       let mode = null;
@@ -2133,6 +2373,15 @@
       });
     },
   };
+
+  g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
+  g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
+  g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
+  g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
+  g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
+  g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
+  g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
+  g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
 })(typeof globalThis !== 'undefined' ? globalThis : window);
 // @generated END thymer-plugin-settings
 
@@ -5209,20 +5458,7 @@ class Plugin extends AppPlugin {
     this._htLogRowsFetchGen = 0;
     this._htDedicatedCollEnsurePromise = null;
     this._persistState = (this.getConfiguration?.()?.custom ?? this.config?.custom)?.persist_habit_panel_state !== false;
-    try {
-      await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, { slug: HT_PS_SLUG, label: 'Habit Tracker' });
-    } catch (_) {}
-    if (this._persistState) {
-      await (globalThis.ThymerPluginSettings?.init?.({
-        plugin: this,
-        pluginId: 'habit-tracker',
-        modeKey: 'thymerext_ps_mode_habit_tracker',
-        mirrorKeys: () => this._htPluginSettingsMirrorKeys(),
-        label: 'Habit Tracker',
-        data: this.data,
-        ui: this.ui,
-      }) ?? (console.warn('[HabitTracker] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
-    }
+    void this._htDeferredPathB();
     this._collapsed = this._persistState ? (localStorage.getItem('ht_sidebar_collapsed') === 'true') : false;
     this._catCollapsed = this._persistState ? JSON.parse(localStorage.getItem('ht_cat_collapsed') || '{}') : {};
     this._config = { categories: [], habits: [] };
@@ -5296,6 +5532,30 @@ class Plugin extends AppPlugin {
       const p = this.ui.getActivePanel();
       if (p) this._onPanelChanged(p);
     }, 300);
+  }
+
+  async _htDeferredPathB() {
+    try {
+      await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? Promise.resolve());
+      try {
+        await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, { slug: HT_PS_SLUG, label: 'Habit Tracker' });
+      } catch (_) {}
+      if (this._persistState) {
+        await (globalThis.ThymerPluginSettings?.init?.({
+          plugin: this,
+          pluginId: 'habit-tracker',
+          modeKey: 'thymerext_ps_mode_habit_tracker',
+          mirrorKeys: () => this._htPluginSettingsMirrorKeys(),
+          label: 'Habit Tracker',
+          data: this.data,
+          ui: this.ui,
+        }) ?? (console.warn('[HabitTracker] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
+      }
+    } catch (e) {
+      try {
+        console.warn('[HabitTracker] deferred Path B init', e);
+      } catch (_) {}
+    }
   }
 
   onUnload() {
@@ -7757,20 +8017,58 @@ class Plugin extends AppPlugin {
     }
   }
 
-  _htSidebarDragClickBump(state) {
+  _htCancelPendingHabitTap(state) {
+    if (state._htPendingHabitTapTimer) {
+      clearTimeout(state._htPendingHabitTapTimer);
+      state._htPendingHabitTapTimer = null;
+    }
+    state._htPendingHabitTap = null;
+  }
+
+  /** Multi-press counter; locks whether the stroke started on an empty cell. */
+  _htSidebarPressSeqBump(state, habit, dayLog, hId, dateStr) {
     const now = Date.now();
     if (now - (state._htSidebarDragLastUp || 0) < HT_SIDEBAR_DRAG_CLICK_GAP_MS) {
       state._htSidebarDragClickSeq = Math.min(3, (state._htSidebarDragClickSeq || 0) + 1);
     } else {
       state._htSidebarDragClickSeq = 1;
+      state._htDragSeqSourceEmpty =
+        this._htDragModeFromCompletion(habit, dayLog, hId, dateStr) === null;
     }
     return state._htSidebarDragClickSeq;
+  }
+
+  _htDragModeForPressSeq(state, habit, log, hId, dateStr, clickCount) {
+    if (state._htDragSeqSourceEmpty) {
+      return this._htSidebarDragModeFromClickCount(clickCount);
+    }
+    return this._htDragModeFromCompletion(habit, log, hId, dateStr) || 'done';
   }
 
   _htSidebarDragModeFromClickCount(count) {
     if (count >= 3) return 'na';
     if (count === 2) return 'fail';
     return 'done';
+  }
+
+  /** Drag paint mode from an existing mark; null = empty (use click-count). */
+  _htDragModeFromCompletion(habit, log, hId, dateStr) {
+    const raw = log?.completions?.[hId];
+    const norm = htCompletionNorm(raw, habit);
+    const surf = htHabitDaySurface(log, habit, dateStr);
+    if (norm.kind === 'fail') return 'fail';
+    if (norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')) return 'na';
+    if (norm.done || norm.kind === 'partial') return 'done';
+    return null;
+  }
+
+  _htApplyDragCompletion(batch, habit, hId, mode) {
+    if (mode === 'fail') batch.completions[hId] = HT_COMP_FAIL;
+    else if (mode === 'na') batch.completions[hId] = HT_COMP_NA;
+    else if (mode === 'done') {
+      const target = habit.target || 0;
+      batch.completions[hId] = target > 0 ? target : true;
+    }
   }
 
   _htSyncDayLogState(state, dateStr, log) {
@@ -7831,15 +8129,12 @@ class Plugin extends AppPlugin {
     if (!state._htSidebarDragSeen) state._htSidebarDragSeen = new Set();
     if (state._htSidebarDragSeen.has(hid)) return false;
     const habit = (config.habits || []).find((h) => h.id === hid && !h.archived);
-    if (!habit || (habit.target || 0) > 0) return false;
+    if (!habit) return false;
     state._htSidebarDragSeen.add(hid);
     state._htSidebarDragDidPaint = true;
     const batch = state._htSidebarDragLog;
     if (!batch) return false;
-    const mode = state._htSidebarDragMode;
-    if (mode === 'done') batch.completions[hid] = true;
-    else if (mode === 'fail') batch.completions[hid] = HT_COMP_FAIL;
-    else if (mode === 'na') batch.completions[hid] = HT_COMP_NA;
+    this._htApplyDragCompletion(batch, habit, hid, state._htSidebarDragMode);
     this._htRecomputeCategoryDone(batch, config, dateStr);
     this._htSyncDayLogState(state, dateStr, batch);
     void this._patchHabitEl(habitEl, habit, batch, dateStr, habit.categoryId, state);
@@ -8922,6 +9217,8 @@ class Plugin extends AppPlugin {
         let pressDownTime = 0;
         let localDragArmed = false;
         let pressClickCount = 1;
+        const dayLog =
+          state._htDayLogDate === dateStr && state._htDayLog ? state._htDayLog : log;
 
         const cancelPress = () => {
           clearTimeout(longPressTimer);
@@ -8929,13 +9226,21 @@ class Plugin extends AppPlugin {
         };
 
         const armDragPaint = () => {
-          if (localDragArmed || state._htSidebarDragArmed || isNumeric) return;
+          if (localDragArmed || state._htSidebarDragArmed) return;
           localDragArmed = true;
-          state._htSidebarDragMode = this._htSidebarDragModeFromClickCount(pressClickCount);
+          this._htCancelPendingHabitTap(state);
           this._htArmSidebarDragPaintFlush(state, dateStr);
           void (async () => {
             try {
-              await this._htEnsureSidebarDragLog(state, dateStr);
+              const batch = await this._htEnsureSidebarDragLog(state, dateStr);
+              state._htSidebarDragMode = this._htDragModeForPressSeq(
+                state,
+                habit,
+                batch,
+                habit.id,
+                dateStr,
+                pressClickCount
+              );
               state._htSidebarDragArmed = true;
               this._htPaintSidebarHabitDrag(state, habitEl, dateStr, config);
             } catch (_) {}
@@ -8947,30 +9252,24 @@ class Plugin extends AppPlugin {
           if (e.target.closest?.('.ht-habit-stats-link')) return;
           didLongPress = false;
           localDragArmed = false;
-          pressClickCount = this._htSidebarDragClickBump(state);
+          const prevSeq = state._htSidebarDragClickSeq || 0;
+          pressClickCount = this._htSidebarPressSeqBump(
+            state,
+            habit,
+            dayLog,
+            habit.id,
+            dateStr
+          );
+          if (pressClickCount > 1 && prevSeq >= 1) this._htCancelPendingHabitTap(state);
           pressDownTime = Date.now();
           pressStartX = e.clientX;
           pressStartY = e.clientY;
           if (isNumeric) {
             longPressTimer = setTimeout(() => {
+              if (localDragArmed || state._htSidebarDragArmed) return;
               didLongPress = true;
               cancelPress();
               this._showNumericInput(habitEl, habit, habit.categoryId, log, dateStr, state);
-            }, HT_LONG_PRESS_MS);
-          } else {
-            longPressTimer = setTimeout(async () => {
-              if (localDragArmed || state._htSidebarDragArmed) return;
-              if (pressClickCount !== 1) return;
-              didLongPress = true;
-              cancelPress();
-              try {
-                const fresh = await this._loadLog(dateStr);
-                fresh.completions[habit.id] = HT_COMP_FAIL;
-                this._htRecomputeCategoryDone(fresh, this._config, dateStr);
-                await this._saveLog(dateStr, fresh);
-                this._htSyncDayLogState(state, dateStr, fresh);
-                await this._patchHabitEl(habitEl, habit, fresh, dateStr, habit.categoryId, state);
-              } catch (_) {}
             }, HT_LONG_PRESS_MS);
           }
         });
@@ -8983,7 +9282,7 @@ class Plugin extends AppPlugin {
             Math.abs(e.clientY - pressStartY) > threshold
           ) {
             cancelPress();
-            if (!isNumeric) armDragPaint();
+            armDragPaint();
           }
         });
 
@@ -9008,7 +9307,20 @@ class Plugin extends AppPlugin {
             return;
           }
           if (habitEl.querySelector('.ht-num-input')) return;
-          this._tapHabit(habit, habit.categoryId, log, dateStr, state, habitEl, isDone);
+          const runTap = () => this._tapHabit(habit, habit.categoryId, log, dateStr, state, habitEl, isDone);
+          if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
+            this._htCancelPendingHabitTap(state);
+            state._htPendingHabitTap = runTap;
+            state._htPendingHabitTapTimer = setTimeout(() => {
+              state._htPendingHabitTapTimer = null;
+              const fn = state._htPendingHabitTap;
+              state._htPendingHabitTap = null;
+              fn?.();
+            }, HT_SIDEBAR_DRAG_CLICK_GAP_MS);
+            return;
+          }
+          this._htCancelPendingHabitTap(state);
+          runTap();
         });
 
         if (state.htManageMode) {
@@ -9533,6 +9845,8 @@ class Plugin extends AppPlugin {
     state._htStatsDragBatch = null;
     state._htStatsDragSeen = null;
     state._htStatsDragArmed = false;
+    state._htStatsDragMode = null;
+    state._htStatsDragDidPaint = false;
 
     const config = this._config || { categories: [], habits: [] };
     let rangeDays = this._getStatsRangeDays(state);
@@ -9774,6 +10088,7 @@ class Plugin extends AppPlugin {
         window.removeEventListener('pointerup', finish, true);
         window.removeEventListener('pointercancel', finish, true);
         state._htStatsDragArmed = false;
+        state._htStatsDragMode = null;
         const batch = state._htStatsDragBatch;
         state._htStatsDragBatch = null;
         state._htStatsDragSeen = null;
@@ -9800,12 +10115,15 @@ class Plugin extends AppPlugin {
     };
 
     const paintStatsHabitDragCell = (dateStr, el, logsByDate, hId, habit) => {
+      const mode = state._htStatsDragMode;
+      if (!mode) return;
       if (!state._htStatsDragSeen) state._htStatsDragSeen = new Set();
       const key = `${dateStr}:${hId}`;
       if (state._htStatsDragSeen.has(key)) return;
       state._htStatsDragSeen.add(key);
+      state._htStatsDragDidPaint = true;
       const log = mergeStatsDragLog(dateStr, logsByDate);
-      this._htCycleHabitCompletion(log, habit, hId);
+      this._htApplyDragCompletion(log, habit, hId, mode);
       this._htRecomputeCategoryDone(log, config, dateStr);
       const surf = htHabitDaySurface(log, habit, dateStr);
       const nm = htCompletionNorm(log.completions[hId], habit);
@@ -9825,53 +10143,134 @@ class Plugin extends AppPlugin {
       const h = hId ? config.habits.find(x => x.id === hId) : null;
       const isNumeric = h && (h.target||0) > 0;
 
-      let longTimer = null, didLong = false, startX = 0, startY = 0;
+      let longTimer = null;
+      let didLong = false;
+      let statsDragStarted = false;
+      let pressClickCount = 1;
+      let pressStartX = 0;
+      let pressStartY = 0;
 
-      let pressDownTime = 0;
-      el.addEventListener('mousedown', (e) => {
-        if (!isHabitSel || !h || !isNumeric) return;
-        didLong = false; startX = e.clientX; startY = e.clientY;
-        pressDownTime = Date.now();
-        longTimer = setTimeout(() => {
-          didLong = true;
-          showStatsNumericInput(el, dateStr, h);
-        }, HT_LONG_PRESS_MS);
-      });
-      el.addEventListener('mouseup', () => {
-        if (isNumeric && Date.now() - pressDownTime < 600) clearTimeout(longTimer);
-      });
-      el.addEventListener('mousemove', (e) => {
-        if (!isNumeric) return;
-        if (Math.abs(e.clientX - startX) > 8 || Math.abs(e.clientY - startY) > 8) clearTimeout(longTimer);
-      });
-      el.addEventListener('mouseleave', () => { if (isNumeric) clearTimeout(longTimer); });
+      const cancelStatsPress = () => {
+        clearTimeout(longTimer);
+        longTimer = null;
+      };
 
-      if (isHabitSel && h && !isNumeric) {
+      const armStatsDrag = () => {
+        if (!isHabitSel || !h || statsDragStarted) return;
+        statsDragStarted = true;
+        cancelStatsPress();
+        this._htCancelPendingHabitTap(state);
+        armStatsHabitDragFlush();
+        const log = mergeStatsDragLog(dateStr, logsByDate);
+        state._htStatsDragMode = this._htDragModeForPressSeq(
+          state,
+          h,
+          log,
+          hId,
+          dateStr,
+          pressClickCount
+        );
+        paintStatsHabitDragCell(dateStr, el, logsByDate, hId, h);
+      };
+
+      if (isHabitSel && h) {
+        const statsDayLog = () => {
+          const base = logsByDate.get(dateStr);
+          return base
+            ? {
+                date: dateStr,
+                completions: { ...base.completions },
+                categoryDone: { ...base.categoryDone },
+                notes: base.notes || '',
+              }
+            : { date: dateStr, completions: {}, categoryDone: {}, notes: '' };
+        };
+
         el.addEventListener('pointerdown', (e) => {
           if (e.button !== 0) return;
-          e.preventDefault();
-          armStatsHabitDragFlush();
-          paintStatsHabitDragCell(dateStr, el, logsByDate, hId, h);
+          didLong = false;
+          statsDragStarted = false;
+          const prevSeq = state._htSidebarDragClickSeq || 0;
+          pressClickCount = this._htSidebarPressSeqBump(
+            state,
+            h,
+            statsDayLog(),
+            hId,
+            dateStr
+          );
+          if (pressClickCount > 1 && prevSeq >= 1) this._htCancelPendingHabitTap(state);
+          pressStartX = e.clientX;
+          pressStartY = e.clientY;
+          if (isNumeric) {
+            longTimer = setTimeout(() => {
+              if (statsDragStarted) return;
+              didLong = true;
+              cancelStatsPress();
+              showStatsNumericInput(el, dateStr, h);
+            }, HT_LONG_PRESS_MS);
+          }
+        });
+        el.addEventListener('pointermove', (e) => {
+          if (!(e.buttons & 1)) return;
+          const threshold = e.pointerType === 'touch' ? 12 : HT_DRAG_MOVE_PX;
+          if (
+            Math.abs(e.clientX - pressStartX) > threshold ||
+            Math.abs(e.clientY - pressStartY) > threshold
+          ) {
+            armStatsDrag();
+          }
         });
         el.addEventListener('pointerenter', (e) => {
           if (!(e.buttons & 1)) return;
-          if (!state._htStatsDragBatch) return;
+          if (!statsDragStarted) return;
           paintStatsHabitDragCell(dateStr, el, logsByDate, hId, h);
         });
+        el.addEventListener('pointerup', () => {
+          state._htSidebarDragLastUp = Date.now();
+          cancelStatsPress();
+        });
+        el.addEventListener('pointercancel', cancelStatsPress);
       }
 
       el.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (isHabitSel && h && !isNumeric) return;
-        if (didLong) { didLong = false; return; }
+        if (isHabitSel && h && state._htStatsDragDidPaint) {
+          state._htStatsDragDidPaint = false;
+          return;
+        }
+        if (didLong) {
+          didLong = false;
+          return;
+        }
         if (el.querySelector('.ht-num-input')) return;
+
+        if (isHabitSel && h) {
+          const runCycle = async () => {
+            const log = await this._loadLog(dateStr);
+            this._htCycleHabitCompletion(log, h, hId);
+            await applyLogChange(dateStr, log, el, hId, null);
+          };
+          if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
+            this._htCancelPendingHabitTap(state);
+            state._htPendingHabitTap = () => {
+              void runCycle();
+            };
+            state._htPendingHabitTapTimer = setTimeout(() => {
+              state._htPendingHabitTapTimer = null;
+              const fn = state._htPendingHabitTap;
+              state._htPendingHabitTap = null;
+              fn?.();
+            }, HT_SIDEBAR_DRAG_CLICK_GAP_MS);
+            return;
+          }
+          this._htCancelPendingHabitTap(state);
+          await runCycle();
+          return;
+        }
 
         const log = await this._loadLog(dateStr);
 
-        if (isHabitSel && h) {
-          this._htCycleHabitCompletion(log, h, hId);
-          await applyLogChange(dateStr, log, el, hId, null);
-        } else if (isCatSel && cId) {
+        if (isCatSel && cId) {
           if (log.categoryDone[cId]) delete log.categoryDone[cId];
           else log.categoryDone[cId] = true;
           await this._saveLog(dateStr, log);
