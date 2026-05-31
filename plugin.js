@@ -9307,10 +9307,26 @@ class Plugin extends AppPlugin {
             return;
           }
           if (habitEl.querySelector('.ht-num-input')) return;
-          const runTap = () => this._tapHabit(habit, habit.categoryId, log, dateStr, state, habitEl, isDone);
+          const runTap = async () => {
+            const seq = state._htSidebarDragClickSeq || 1;
+            if (state._htDragSeqSourceEmpty && seq >= 2) {
+              const freshLog = await this._loadLog(dateStr);
+              const mode = this._htSidebarDragModeFromClickCount(seq);
+              this._htApplyDragCompletion(freshLog, habit, habit.id, mode);
+              this._htRecomputeCategoryDone(freshLog, this._config, dateStr);
+              await this._saveLog(dateStr, freshLog);
+              this._htSyncDayLogState(state, dateStr, freshLog);
+              if (mode === 'done') this._celebrate(habitEl);
+              await this._patchHabitEl(habitEl, habit, freshLog, dateStr, habit.categoryId, state);
+              return;
+            }
+            await this._tapHabit(habit, habit.categoryId, log, dateStr, state, habitEl, isDone);
+          };
           if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
             this._htCancelPendingHabitTap(state);
-            state._htPendingHabitTap = runTap;
+            state._htPendingHabitTap = () => {
+              void runTap();
+            };
             state._htPendingHabitTapTimer = setTimeout(() => {
               state._htPendingHabitTapTimer = null;
               const fn = state._htPendingHabitTap;
@@ -9320,7 +9336,7 @@ class Plugin extends AppPlugin {
             return;
           }
           this._htCancelPendingHabitTap(state);
-          runTap();
+          void runTap();
         });
 
         if (state.htManageMode) {
@@ -10247,7 +10263,13 @@ class Plugin extends AppPlugin {
         if (isHabitSel && h) {
           const runCycle = async () => {
             const log = await this._loadLog(dateStr);
-            this._htCycleHabitCompletion(log, h, hId);
+            const seq = state._htSidebarDragClickSeq || 1;
+            if (state._htDragSeqSourceEmpty && seq >= 2) {
+              const mode = this._htSidebarDragModeFromClickCount(seq);
+              this._htApplyDragCompletion(log, h, hId, mode);
+            } else {
+              this._htCycleHabitCompletion(log, h, hId);
+            }
             await applyLogChange(dateStr, log, el, hId, null);
           };
           if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
