@@ -5769,20 +5769,8 @@ function dawnMixInHabitQuickAccess(Cls) {
   };
 
   Cls.prototype._refreshQuickAccess = function _refreshQuickAccess() {
-    this._injectQuickAccessCss();
+    // Parked: no Quick habits status-bar flame / popover for now.
     this._clearQuickAccessAnchors();
-    const pinned = this._pinnedHabits();
-    const ui = this.ui || this._app?.ui;
-    if (!pinned.length || typeof ui?.addStatusBarItem !== 'function') return;
-    try {
-      this._htQuickStatusItem = ui.addStatusBarItem({
-        htmlLabel: this._quickAnchorHtml(),
-        tooltip: 'Quick habits',
-        onClick: () => this._toggleQuickPopover(this._htQuickStatusItem?.getElement?.()),
-      });
-    } catch (e) {
-      console.warn('[Dawn/Habits] quick access status bar failed', e);
-    }
   };
 
   Cls.prototype._toggleQuickPopover = function _toggleQuickPopover(anchorEl) {
