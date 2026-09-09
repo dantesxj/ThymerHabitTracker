@@ -1,9793 +1,4998 @@
-// @generated BEGIN thymer-plugin-settings (source: plugins/public repo/plugin-settings/ThymerPluginSettingsRuntime.js — run: npm run embed-plugin-settings)
-/**
- * ThymerPluginSettings — workspace **Plugin Backend** collection + optional localStorage mirror
- * for global plugins that do not own a collection. (Legacy name **Plugin Settings** is still found until renamed.)
- *
- * Edit this file, then from repo root: npm run embed-plugin-settings
- *
- * Debug: console filter `[ThymerExt/PluginBackend]`. Off by default; to enable:
- *   localStorage.setItem('thymerext_debug_collections', '1'); location.reload();
- *
- * Create dedupe: Web Locks + **per-workspace** localStorage lease/recent-create keys (workspaceGuid from
- * `data.getActiveUsers()[0]`), plus abort if an exact-named Plugin Backend collection already exists.
- *
- * Rows:
- * - **Vault** (`record_kind` = `vault`): one per `plugin_id` — holds synced localStorage payload JSON.
- * - **Other rows** (`record_kind` = `log`, `config`, …): same **Plugin** field (`plugin`) for filtering;
- *   use a **distinct** `plugin_id` per row (e.g. `habit-tracker:log:2026-04-24`) so vault lookup stays unambiguous.
- *
- * API: ThymerPluginSettings.init({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
- *      ThymerPluginSettings.scheduleFlush(plugin, mirrorKeys)
- *      ThymerPluginSettings.flushNow(data, pluginId, mirrorKeys)
- *      ThymerPluginSettings.openStorageDialog({ plugin, pluginId, modeKey, mirrorKeys, label, data, ui })
- *      ThymerPluginSettings.listRows(data, { pluginSlug, recordKind? })
- *      ThymerPluginSettings.createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle?, settingsDoc? })
- *      ThymerPluginSettings.upgradeCollectionSchema(data) — merge missing `plugin` / `record_kind` fields into existing collection
- *      ThymerPluginSettings.registerPluginSlug(data, { slug, label? }) — ensure `plugin` choice includes this slug (call once per plugin)
- */
-(function pluginSettingsRuntime(g) {
-  if (g.ThymerPluginSettings) return;
-
-  const COL_NAME = 'Plugin Backend';
-  const COL_NAME_LEGACY = 'Plugin Settings';
-  const KIND_VAULT = 'vault';
-  const FIELD_PLUGIN = 'plugin';
-  const FIELD_KIND = 'record_kind';
-  const q = [];
-  let busy = false;
-
-  /**
-   * Collection ensure diagnostics (read browser console for `[ThymerExt/PluginBackend]`.
-   * Opt-in: `localStorage.setItem('thymerext_debug_collections','1')` then reload.
-   * Opt-out: remove the key or set to `0` / `off` / `false`.
-   */
-  const DEBUG_COLLECTIONS = (() => {
-    try {
-      const o = localStorage.getItem('thymerext_debug_collections');
-      if (o === '0' || o === 'off' || o === 'false') return false;
-      return o === '1' || o === 'true' || o === 'on';
-    } catch (_) {}
-    return false;
-  })();
-  const DEBUG_PATHB_ID =
-    'pb-' + (Date.now() & 0xffffffff).toString(16) + '-' + Math.random().toString(36).slice(2, 7);
-
-  /** In-flight dedupe: parallel plugin `init()` calls share one `getAllCollections()` snapshot. */
-  const DATA_GET_ALL_P = '__thymerExtGetAllCollectionsInflight';
-
-  function preferDeferredHeavyWork() {
-    try {
-      if (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) return true;
-    } catch (_) {}
-    try {
-      return Number(navigator?.maxTouchPoints) > 0;
-    } catch (_) {}
-    return false;
-  }
-
-  const MOBILE_GRACE_UNTIL_KEY = '__thymerExtMobileGraceUntil';
-  const MOBILE_HIDDEN_AT_KEY = '__thymerExtMobileHiddenAt';
-  const MOBILE_INTERACT_THROTTLE_AT_KEY = '__thymerExtMobileInteractThrottleAt';
-  /** Pause footer scans / Path B until host sidebar is up — keep short so navigation is not blocked for ~2 min. */
-  const MOBILE_GRACE_MS = 45000;
-  const MOBILE_RESUME_GRACE_MS = 35000;
-  const MOBILE_RESUME_AWAY_MS = 15000;
-  /** Interaction only pauses the heavy-work queue briefly — do not extend MOBILE_GRACE (that delayed page change until ~2 min). */
-  const MOBILE_HEAVY_PAUSE_ON_INTERACT_MS = 10000;
-  const MOBILE_INTERACTION_THROTTLE_MS = 2500;
-  const HEAVY_QUEUE_PAUSED_UNTIL_KEY = '__thymerExtHeavyQueuePausedUntil';
-
-  // Heavy work scheduler: many plugins "wake up" together after mobile grace ends.
-  // Running them concurrently causes long-task storms that block navigation.
-  const HEAVY_Q_KEY = '__thymerExtHeavyWorkQueue';
-  const HEAVY_BUSY_KEY = '__thymerExtHeavyWorkBusy';
-
-  function ensureMobileLoadGraceStarted(extraMs) {
-    if (!preferDeferredHeavyWork()) return;
-    const until = Date.now() + (extraMs > 0 ? extraMs : MOBILE_GRACE_MS);
-    try {
-      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
-        g[MOBILE_GRACE_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-  }
-
-  function inMobileLoadGrace() {
-    if (!preferDeferredHeavyWork()) return false;
-    try {
-      return Date.now() < (g[MOBILE_GRACE_UNTIL_KEY] || 0);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function bumpMobileLoadGrace(ms) {
-    if (!preferDeferredHeavyWork()) return;
-    const until = Date.now() + (ms > 0 ? ms : MOBILE_RESUME_GRACE_MS);
-    try {
-      if (!g[MOBILE_GRACE_UNTIL_KEY] || g[MOBILE_GRACE_UNTIL_KEY] < until) {
-        g[MOBILE_GRACE_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-  }
-
-  function installMobileResumeGraceListener() {
-    if (g.__thymerExtMobileGraceListenerInstalled) return;
-    g.__thymerExtMobileGraceListenerInstalled = true;
-    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-    document.addEventListener(
-      'visibilitychange',
-      () => {
-        try {
-          if (document.visibilityState === 'hidden') {
-            g[MOBILE_HIDDEN_AT_KEY] = Date.now();
-          } else if (document.visibilityState === 'visible') {
-            const hiddenAt = g[MOBILE_HIDDEN_AT_KEY] || 0;
-            const away = hiddenAt ? Date.now() - hiddenAt : 0;
-            if (away >= MOBILE_RESUME_AWAY_MS) bumpMobileLoadGrace(MOBILE_RESUME_GRACE_MS);
-          }
-        } catch (_) {}
-      },
-      { passive: true }
-    );
-  }
-
-  function pauseHeavyWorkQueue(ms) {
-    if (!preferDeferredHeavyWork()) return;
-    const until = Date.now() + (ms > 0 ? ms : MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
-    try {
-      if (!g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] < until) {
-        g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] = until;
-      }
-    } catch (_) {}
-  }
-
-  function isHeavyWorkQueuePaused() {
-    try {
-      return Date.now() < (g[HEAVY_QUEUE_PAUSED_UNTIL_KEY] || 0);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  /** True during startup window: skip footer mount / panel scans so page navigation stays responsive. */
-  function shouldDeferPanelFooterWork() {
-    return inMobileLoadGrace();
-  }
-
-  function installMobileInteractionGraceListener() {
-    if (g.__thymerExtMobileInteractGraceInstalled) return;
-    g.__thymerExtMobileInteractGraceInstalled = true;
-    if (!preferDeferredHeavyWork()) return;
-    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-
-    const onInteract = () => {
-      try {
-        const now = Date.now();
-        const prev = g[MOBILE_INTERACT_THROTTLE_AT_KEY] || 0;
-        if (now - prev < MOBILE_INTERACTION_THROTTLE_MS) return;
-        g[MOBILE_INTERACT_THROTTLE_AT_KEY] = now;
-        pauseHeavyWorkQueue(MOBILE_HEAVY_PAUSE_ON_INTERACT_MS);
-      } catch (_) {}
-    };
-
-    for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
-      try {
-        document.addEventListener(ev, onInteract, { passive: true, capture: true });
-      } catch (_) {}
-    }
-  }
-
-  async function yieldToHostOneTick() {
-    await new Promise((r) => {
-      try {
-        requestAnimationFrame(() => requestAnimationFrame(() => r()));
-      } catch (_) {
-        setTimeout(r, 0);
-      }
-    });
-  }
-
-  async function runNextHeavyWork() {
-    if (g[HEAVY_BUSY_KEY]) return;
-    const q = g[HEAVY_Q_KEY];
-    if (!Array.isArray(q) || q.length === 0) return;
-    g[HEAVY_BUSY_KEY] = true;
-    try {
-      while (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        if (inMobileLoadGrace() || isHeavyWorkQueuePaused()) break;
-        const job = g[HEAVY_Q_KEY].shift();
-        if (!job || typeof job.run !== 'function') continue;
-        try {
-          await yieldToHostOneTick();
-        } catch (_) {}
-        // Prefer running during idle; fallback is still serialized.
-        try {
-          if (typeof requestIdleCallback === 'function') {
-            await new Promise((resolve) => requestIdleCallback(resolve, { timeout: 1200 }));
-          }
-        } catch (_) {}
-        try {
-          await job.run();
-        } catch (_) {}
-        // Yield after each heavy job so navigation events can be processed.
-        try {
-          await yieldToHostOneTick();
-        } catch (_) {}
-      }
-    } finally {
-      g[HEAVY_BUSY_KEY] = false;
-      // If we stopped due to grace, try again later.
-      if (Array.isArray(g[HEAVY_Q_KEY]) && g[HEAVY_Q_KEY].length) {
-        setTimeout(() => runNextHeavyWork(), 1500);
-      }
-    }
-  }
-
-  function enqueueHeavyWork(run, opts) {
-    if (typeof run !== 'function') return;
-    if (!g[HEAVY_Q_KEY]) g[HEAVY_Q_KEY] = [];
-    const delayMs = Math.max(0, Number(opts?.delayMs) || 0);
-    const push = () => {
-      try {
-        g[HEAVY_Q_KEY].push({ run });
-      } catch (_) {}
-      setTimeout(() => runNextHeavyWork(), 0);
-    };
-    if (delayMs > 0) setTimeout(push, delayMs);
-    else push();
-  }
-
-  async function yieldToHostBeforePathB() {
-    await new Promise((r) => {
-      try {
-        requestAnimationFrame(() => requestAnimationFrame(() => r()));
-      } catch (_) {
-        r();
-      }
-    });
-    await new Promise((resolve) => {
-      try {
-        if (typeof requestIdleCallback === 'function') {
-          requestIdleCallback(() => resolve(), {
-            timeout: preferDeferredHeavyWork() ? 8000 : 1500,
-          });
-        } else {
-          setTimeout(resolve, preferDeferredHeavyWork() ? 48 : 16);
-        }
-      } catch (_) {
-        setTimeout(resolve, 32);
-      }
-    });
-  }
-
-  async function getAllCollectionsDeduped(data) {
-    if (!data || typeof data.getAllCollections !== 'function') return [];
-    const inflight = data[DATA_GET_ALL_P];
-    if (inflight && typeof inflight.then === 'function') {
-      try {
-        return await inflight;
-      } catch (_) {
-        // fall through to fresh fetch
-      }
-    }
-    const p = Promise.resolve()
-      .then(() => data.getAllCollections())
-      .then((all) => (Array.isArray(all) ? all : []))
-      .finally(() => {
-        try {
-          if (data[DATA_GET_ALL_P] === p) delete data[DATA_GET_ALL_P];
-        } catch (_) {}
-      });
-    data[DATA_GET_ALL_P] = p;
-    return p;
-  }
-
-  /** If true, Thymer ignores programmatic field updates — force off on every schema save. */
-  const MANAGED_UNLOCK = { fields: false, views: false, sidebar: false };
-
-  /**
-   * Ensure Plugin Backend collection without duplicate `createCollection` calls.
-   * Sibling **plugin iframes** are often not `window` siblings — walking `parent` can stop at
-   * each plugin’s *own* frame, so a promise on “hierarchy best” is **not** one shared object.
-   * **`window.top` is the same** for all same-tab iframes and, when not cross-origin, is the
-   * one place to attach a cross-iframe lock. Fallback: walk the parent chain for opaque frames.
-   */
-  function getSharedDeduplicationWindow() {
-    try {
-      if (typeof window === 'undefined') return g;
-      const t = window.top;
-      if (t) {
-        void t.document;
-        return t;
-      }
-    } catch (_) {
-      /* cross-origin top */
-    }
-    try {
-      let w = typeof window !== 'undefined' ? window : null;
-      let best = w || g;
-      while (w) {
-        try {
-          void w.document;
-          best = w;
-        } catch (_) {
-          break;
-        }
-        if (w === w.top) break;
-        w = w.parent;
-      }
-      return best;
-    } catch (_) {
-      return typeof window !== 'undefined' ? window : g;
-    }
-  }
-
-  const PB_ENSURE_GLOBAL_P = '__thymerPluginBackendEnsureGlobalP';
-  const SERIAL_DATA_CREATE_P = '__thymerExtSerializedDataCreateP_v1';
-  /** `getAllCollections` can briefly return [] (host UI / race) after a valid non-empty read — refuse create in that window. */
-  const GETALL_COLLECTIONS_SANITY = '__thymerExtGetAllCollectionsSanityV1';
-  function touchGetAllSanityFromCount(len) {
-    const n = Number(len) || 0;
-    const h = getSharedDeduplicationWindow();
-    if (!h[GETALL_COLLECTIONS_SANITY]) h[GETALL_COLLECTIONS_SANITY] = { nLast: 0, tLast: 0 };
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (n > 0) {
-      s.nLast = n;
-      s.tLast = Date.now();
-    }
-  }
-  function isSuspiciousEmptyAfterRecentNonEmptyList(currentLen) {
-    const c = Number(currentLen) || 0;
-    if (c > 0) {
-      touchGetAllSanityFromCount(c);
-      return false;
-    }
-    const h = getSharedDeduplicationWindow();
-    const s = h[GETALL_COLLECTIONS_SANITY];
-    if (!s || s.nLast <= 0 || !s.tLast) return false;
-    return Date.now() - s.tLast < 60_000;
-  }
-
-  function chainPluginBackendEnsure(data, work) {
-    const root = getSharedDeduplicationWindow();
-    try {
-      if (!root[PB_ENSURE_GLOBAL_P]) root[PB_ENSURE_GLOBAL_P] = Promise.resolve();
-    } catch (_) {
-      return Promise.resolve().then(work);
-    }
-    root[PB_ENSURE_GLOBAL_P] = root[PB_ENSURE_GLOBAL_P].catch(() => {}).then(work);
-    return root[PB_ENSURE_GLOBAL_P];
-  }
-
-  function withUnlockedManaged(base) {
-    return { ...(base && typeof base === 'object' ? base : {}), managed: MANAGED_UNLOCK };
-  }
-
-  /** Index of the “Plugin” column (`id` **plugin**, or legacy label match). */
-  function findPluginColumnFieldIndex(fields) {
-    const arr = Array.isArray(fields) ? fields : [];
-    let i = arr.findIndex((f) => f && f.id === FIELD_PLUGIN);
-    if (i >= 0) return i;
-    i = arr.findIndex(
-      (f) =>
-        f &&
-        String(f.label || '')
-          .trim()
-          .toLowerCase() === 'plugin' &&
-        (f.type === 'text' || f.type === 'plaintext' || f.type === 'string')
-    );
-    return i;
-  }
-
-  /** Keep internal column identity when replacing field shape (text → choice). */
-  function copyStableFieldKeys(prev, next) {
-    if (!prev || !next || typeof prev !== 'object' || typeof next !== 'object') return;
-    for (const k of ['guid', 'colguid', 'colGuid', 'field_guid']) {
-      if (prev[k] != null && next[k] == null) next[k] = prev[k];
-    }
-  }
-
-  function getPluginFieldDef(coll) {
-    if (!coll || typeof coll.getConfiguration !== 'function') return null;
-    try {
-      const fields = coll.getConfiguration()?.fields || [];
-      const i = findPluginColumnFieldIndex(fields);
-      return i >= 0 ? fields[i] : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function pluginColumnPropId(coll, requestedId) {
-    if (requestedId !== FIELD_PLUGIN || !coll) return requestedId;
-    const f = getPluginFieldDef(coll);
-    return (f && f.id) || FIELD_PLUGIN;
-  }
-
-  function cloneFieldDef(f) {
-    if (!f || typeof f !== 'object') return f;
-    try {
-      return structuredClone(f);
-    } catch (_) {
-      try {
-        return JSON.parse(JSON.stringify(f));
-      } catch (__) {
-        return { ...f };
-      }
-    }
-  }
-
-  const PLUGIN_SETTINGS_SHAPE = {
-    ver: 1,
-    name: COL_NAME,
-    icon: 'ti-adjustments',
-    color: null,
-    home: false,
-    page_field_ids: [FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at', 'settings_json'],
-    item_name: 'Setting, Config, or Log',
-    description: 'Workspace storage for plugins: Use the Plugin column to filter by plugin.',
-    show_sidebar_items: true,
-    show_cmdpal_items: false,
-    fields: [
-      {
-        icon: 'ti-apps',
-        id: FIELD_PLUGIN,
-        label: 'Plugin',
-        type: 'choice',
-        read_only: false,
-        active: true,
-        many: false,
-        choices: [
-          { id: 'quick-notes', label: 'quick-notes', color: '0', active: true },
-          { id: 'habit-tracker', label: 'Habit Tracker', color: '0', active: true },
-          { id: 'ynab', label: 'ynab', color: '0', active: true },
-        ],
-      },
-      {
-        icon: 'ti-category',
-        id: FIELD_KIND,
-        label: 'Record kind',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-id',
-        id: 'plugin_id',
-        label: 'Plugin ID',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-clock-plus',
-        id: 'created_at',
-        label: 'Created',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-clock-edit',
-        id: 'updated_at',
-        label: 'Modified',
-        many: false,
-        read_only: true,
-        active: true,
-        type: 'datetime',
-      },
-      {
-        icon: 'ti-code',
-        id: 'settings_json',
-        label: 'Settings JSON',
-        type: 'text',
-        read_only: false,
-        active: true,
-        many: false,
-      },
-      {
-        icon: 'ti-abc',
-        id: 'title',
-        label: 'Title',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-      {
-        icon: 'ti-photo',
-        id: 'banner',
-        label: 'Banner',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'banner',
-      },
-      {
-        icon: 'ti-align-left',
-        id: 'icon',
-        label: 'Icon',
-        many: false,
-        read_only: false,
-        active: true,
-        type: 'text',
-      },
-    ],
-    sidebar_record_sort_dir: 'desc',
-    sidebar_record_sort_field_id: 'updated_at',
-    managed: { fields: false, views: false, sidebar: false },
-    custom: {},
-    views: [
-      {
-        id: 'V0YBPGDDZ0MHRSQ',
-        shown: true,
-        icon: 'ti-table',
-        label: 'All',
-        description: '',
-        field_ids: ['title', FIELD_PLUGIN, FIELD_KIND, 'plugin_id', 'created_at', 'updated_at'],
-        type: 'table',
-        read_only: false,
-        group_by_field_id: null,
-        sort_dir: 'desc',
-        sort_field_id: 'updated_at',
-        opts: {},
-      },
-      {
-        id: 'VPGAWVGVKZD57C9',
-        shown: true,
-        icon: 'ti-layout-kanban',
-        label: 'By Plugin...',
-        description: '',
-        field_ids: ['title', FIELD_KIND, 'created_at', 'updated_at'],
-        type: 'board',
-        read_only: false,
-        group_by_field_id: FIELD_PLUGIN,
-        sort_dir: 'desc',
-        sort_field_id: 'updated_at',
-        opts: {},
-      },
-    ],
-  };
-
-  function cloneShape() {
-    try {
-      return structuredClone(PLUGIN_SETTINGS_SHAPE);
-    } catch (_) {
-      return JSON.parse(JSON.stringify(PLUGIN_SETTINGS_SHAPE));
-    }
-  }
-
-  /** Append default views from the canonical shape when the workspace collection is missing them (by view `id`). */
-  function mergeViewsArray(baseViews, desiredViews) {
-    const desired = Array.isArray(desiredViews) ? desiredViews.map((v) => cloneFieldDef(v)) : [];
-    const cur = Array.isArray(baseViews) ? baseViews.map((v) => cloneFieldDef(v)) : [];
-    if (cur.length === 0) {
-      return { views: desired, changed: desired.length > 0 };
-    }
-    const ids = new Set(cur.map((v) => v && v.id).filter(Boolean));
-    let changed = false;
-    for (const v of desired) {
-      if (v && v.id && !ids.has(v.id)) {
-        cur.push(cloneFieldDef(v));
-        ids.add(v.id);
-        changed = true;
-      }
-    }
-    return { views: cur, changed };
-  }
-
-  /** Slug before first colon, else whole id (e.g. `habit-tracker:log:2026-04-24` → `habit-tracker`). */
-  function inferPluginSlugFromPid(pid) {
-    if (!pid) return '';
-    const s = String(pid).trim();
-    const i = s.indexOf(':');
-    if (i <= 0) return s;
-    return s.slice(0, i);
-  }
-
-  function inferRecordKindFromPid(pid, slug) {
-    if (!pid || !slug) return '';
-    const p = String(pid);
-    if (p === slug) return KIND_VAULT;
-    if (p === `${slug}:config`) return 'config';
-    if (p.startsWith(`${slug}:log:`)) return 'log';
-    return '';
-  }
-
-  function colorForSlug(slug) {
-    const colors = ['0', '1', '2', '3', '4', '5', '6', '7'];
-    let h = 0;
-    const s = String(slug || '');
-    for (let i = 0; i < s.length; i++) h = (h + s.charCodeAt(i) * (i + 1)) % colors.length;
-    return colors[h];
-  }
-
-  /** Normalize Thymer choice option (object or legacy string). */
-  function normalizeChoiceOption(c) {
-    if (c == null) return null;
-    if (typeof c === 'string') {
-      const s = c.trim();
-      if (!s) return null;
-      return { id: s, label: s, color: colorForSlug(s), active: true };
-    }
-    const id = String(c.id ?? c.label ?? '')
-      .trim();
-    if (!id) return null;
-    return {
-      id,
-      label: String(c.label ?? id).trim() || id,
-      color: String(c.color != null ? c.color : colorForSlug(id)),
-      active: c.active !== false,
-    };
-  }
-
-  /**
-   * Fresh choice field object (no legacy keys). Thymer often ignores `type` changes when merging
-   * onto an existing text field’s full config — same pattern as markdown importer choice fields.
-   */
-  function cleanPluginChoiceField(prev, desiredPlugin, choicesList) {
-    const fieldId = (prev && prev.id) || FIELD_PLUGIN;
-    const next = {
-      id: fieldId,
-      label: (prev && prev.label) || desiredPlugin.label || 'Plugin',
-      icon: (prev && prev.icon) || desiredPlugin.icon || 'ti-apps',
-      type: 'choice',
-      many: false,
-      read_only: false,
-      active: prev ? prev.active !== false : true,
-      choices: Array.isArray(choicesList) ? choicesList : [],
-    };
-    copyStableFieldKeys(prev, next);
-    return next;
-  }
-
-  /**
-   * Ensure the `plugin` field is a choice field and its options cover every slug
-   * already present on rows (migrates legacy `type: 'text'` definitions).
-   */
-  async function reconcilePluginFieldAsChoice(coll, curFields, desired) {
-    const desiredPlugin = desired.fields.find((f) => f && f.id === FIELD_PLUGIN);
-    if (!desiredPlugin) return { fields: curFields, changed: false };
-
-    const idx = findPluginColumnFieldIndex(curFields);
-    const prev = idx >= 0 ? curFields[idx] : null;
-
-    const choices = [];
-    const seen = new Set();
-    const pushOpt = (opt) => {
-      const n = normalizeChoiceOption(opt);
-      if (!n || seen.has(n.id)) return;
-      seen.add(n.id);
-      choices.push(n);
-    };
-
-    if (prev && prev.type === 'choice' && Array.isArray(prev.choices)) {
-      for (const c of prev.choices) pushOpt(c);
-    }
-
-    let records = [];
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {}
-
-    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
-    const slugSet = new Set();
-    for (const r of records) {
-      const a = rowField(r, plugCol);
-      if (a) slugSet.add(a.trim());
-      const inf = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
-      if (inf) slugSet.add(inf);
-    }
-    for (const slug of [...slugSet].sort()) {
-      if (!slug) continue;
-      pushOpt({ id: slug, label: slug, color: colorForSlug(slug), active: true });
-    }
-
-    const useClean = !prev || prev.type !== 'choice';
-    const nextPluginField = useClean
-      ? cleanPluginChoiceField(prev, desiredPlugin, choices)
-      : (() => {
-          const merged = {
-            ...desiredPlugin,
-            type: 'choice',
-            choices,
-            icon: (prev && prev.icon) || desiredPlugin.icon,
-            label: (prev && prev.label) || desiredPlugin.label,
-            id: (prev && prev.id) || desiredPlugin.id || FIELD_PLUGIN,
-          };
-          copyStableFieldKeys(prev, merged);
-          return merged;
-        })();
-
-    let changed = false;
-    if (idx < 0) {
-      curFields.push(nextPluginField);
-      changed = true;
-    } else if (JSON.stringify(prev) !== JSON.stringify(nextPluginField)) {
-      curFields[idx] = nextPluginField;
-      changed = true;
-    }
-
-    return { fields: curFields, changed };
-  }
-
-  async function registerPluginSlug(data, { slug, label } = {}) {
-    const id = (slug || '').trim();
-    if (!id || !data) return;
-    await ensurePluginSettingsCollection(data);
-    const coll = await findColl(data);
-    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
-    await upgradePluginSettingsSchema(data, coll);
-    let slugRegisterSavedOk = false;
-    try {
-      const base = coll.getConfiguration() || {};
-      const fields = Array.isArray(base.fields) ? [...base.fields] : [];
-      const idx = findPluginColumnFieldIndex(fields);
-      if (idx < 0) {
-        await rewritePluginChoiceCells(coll);
-        return;
-      }
-      const prev = fields[idx];
-      if (prev.type !== 'choice') {
-        await rewritePluginChoiceCells(coll);
-        return;
-      }
-      const prevChoices = Array.isArray(prev.choices) ? prev.choices : [];
-      const normalized = prevChoices.map((c) => normalizeChoiceOption(c)).filter(Boolean);
-      const byId = new Map(normalized.map((c) => [c.id, c]));
-      const existing = byId.get(id);
-      if (existing) {
-        if (label && String(existing.label) !== String(label)) {
-          byId.set(id, { ...existing, label: String(label) });
-        } else {
-          await rewritePluginChoiceCells(coll);
-          return;
-        }
-      } else {
-        byId.set(id, { id, label: label || id, color: colorForSlug(id), active: true });
-      }
-      const prevOrder = normalized.map((c) => c.id);
-      const out = [];
-      const used = new Set();
-      for (const pid of prevOrder) {
-        if (byId.has(pid) && !used.has(pid)) {
-          out.push(byId.get(pid));
-          used.add(pid);
-        }
-      }
-      for (const [pid, opt] of byId) {
-        if (!used.has(pid)) {
-          out.push(opt);
-          used.add(pid);
-        }
-      }
-      const next = { ...prev, type: 'choice', choices: out };
-      if (JSON.stringify(prev) !== JSON.stringify(next)) {
-        fields[idx] = next;
-        const ok = await coll.saveConfiguration(withUnlockedManaged({ ...base, fields }));
-        if (ok === false) console.warn('[ThymerPluginSettings] registerPluginSlug: saveConfiguration returned false');
-        else slugRegisterSavedOk = true;
-      }
-    } catch (e) {
-      console.error('[ThymerPluginSettings] registerPluginSlug', e);
-    }
-    if (slugRegisterSavedOk) await rewritePluginChoiceCells(coll);
-  }
-
-  /**
-   * Merge missing field definitions into the Plugin Backend collection
-   * (e.g. after Thymer auto-created a minimal schema, or older two-field configs).
-   */
-  async function upgradePluginSettingsSchema(data, collOpt) {
-    await ensurePluginSettingsCollection(data);
-    const coll = collOpt || (await findColl(data));
-    if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') return;
-    try {
-      let base = coll.getConfiguration() || {};
-      try {
-        if (typeof coll.getExistingCodeAndConfig === 'function') {
-          const pack = coll.getExistingCodeAndConfig();
-          if (pack && pack.json && typeof pack.json === 'object') {
-            base = { ...base, ...pack.json };
-          }
-        }
-      } catch (_) {}
-      const desired = cloneShape();
-      const curFields = Array.isArray(base.fields) ? base.fields.map((f) => cloneFieldDef(f)) : [];
-      const curIds = new Set(curFields.map((f) => (f && f.id ? f.id : null)).filter(Boolean));
-      let changed = false;
-      for (const f of desired.fields) {
-        if (!f || !f.id || curIds.has(f.id)) continue;
-        if (f.id === FIELD_PLUGIN && findPluginColumnFieldIndex(curFields) >= 0) continue;
-        curFields.push(cloneFieldDef(f));
-        curIds.add(f.id);
-        changed = true;
-      }
-      const rec = await reconcilePluginFieldAsChoice(coll, curFields, desired);
-      if (rec.changed) changed = true;
-      const finalFields = rec.fields;
-
-      const vMerge = mergeViewsArray(base.views, desired.views);
-      if (vMerge.changed) changed = true;
-      const finalViews = vMerge.views;
-
-      const curPages = [...(base.page_field_ids || [])];
-      const wantPages = [...(desired.page_field_ids || [])];
-      const mergedPages = [...new Set([...wantPages, ...curPages])];
-      if (JSON.stringify(curPages) !== JSON.stringify(mergedPages)) changed = true;
-      if ((base.description || '') !== desired.description) changed = true;
-      if ((base.item_name || '') !== (desired.item_name || '')) changed = true;
-      if (String(base.name || '').trim() !== COL_NAME) changed = true;
-      if (changed) {
-        const merged = withUnlockedManaged({
-          ...base,
-          name: COL_NAME,
-          description: desired.description,
-          fields: finalFields,
-          page_field_ids: mergedPages.length ? mergedPages : wantPages,
-          item_name: desired.item_name || base.item_name,
-          icon: desired.icon || base.icon,
-          color: desired.color !== undefined ? desired.color : base.color,
-          home: desired.home !== undefined ? desired.home : base.home,
-          views: finalViews,
-          sidebar_record_sort_field_id: desired.sidebar_record_sort_field_id || base.sidebar_record_sort_field_id,
-          sidebar_record_sort_dir: desired.sidebar_record_sort_dir || base.sidebar_record_sort_dir,
-        });
-        const ok = await coll.saveConfiguration(merged);
-        if (ok === false) console.warn('[ThymerPluginSettings] saveConfiguration returned false (schema not applied?)');
-        else {
-          try {
-            const pf = getPluginFieldDef(coll);
-            if (pf && pf.type !== 'choice') {
-              console.error(
-                '[ThymerPluginSettings] saveConfiguration succeeded but "plugin" field is still type',
-                pf.type,
-                '— check collection General tab or re-import plugins/public repo/plugin-settings/Plugin Backend.json.'
-              );
-            }
-          } catch (_) {}
-        }
-      }
-      if (changed) await rewritePluginChoiceCells(coll);
-    } catch (e) {
-      console.error('[ThymerPluginSettings] upgrade schema', e);
-    }
-  }
-
-  /** Re-apply `plugin` via setChoice so rows are not stuck as “(Other)” after text→choice migration. */
-  async function rewritePluginChoiceCells(coll) {
-    if (!coll || typeof coll.getAllRecords !== 'function') return;
-    try {
-      const pluginField = getPluginFieldDef(coll);
-      if (!pluginField || pluginField.type !== 'choice') return;
-    } catch (_) {
-      return;
-    }
-    let records = [];
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return;
-    }
-    for (const r of records) {
-      let slug = inferPluginSlugFromPid(rowField(r, 'plugin_id'));
-      if (!slug) slug = rowField(r, pluginColumnPropId(coll, FIELD_PLUGIN));
-      if (!slug) continue;
-      setRowField(r, FIELD_PLUGIN, slug, coll);
-      // Rows written while setRowField wrongly skipped p.set() for plugin_id (setChoice branch).
-      const pidNow = rowField(r, 'plugin_id').trim();
-      if (!pidNow) {
-        const kind = (rowField(r, FIELD_KIND) || '').trim();
-        let legacyVault = false;
-        if (!kind) {
-          try {
-            const raw = rowField(r, 'settings_json');
-            if (raw && String(raw).includes('"storageMode"')) legacyVault = true;
-          } catch (_) {}
-        }
-        if (kind === KIND_VAULT || legacyVault) {
-          setRowField(r, 'plugin_id', slug, coll);
-        } else if (kind === 'config') {
-          setRowField(r, 'plugin_id', `${slug}:config`, coll);
-        } else if (kind === 'log') {
-          let ds = '';
-          try {
-            const raw = rowField(r, 'settings_json');
-            if (raw) {
-              const j = JSON.parse(raw);
-              if (j && j.date) ds = String(j.date).trim();
-            }
-          } catch (_) {}
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(ds) && typeof r.getName === 'function') {
-            ds = String(r.getName() || '').trim();
-          }
-          if (/^\d{4}-\d{2}-\d{2}$/.test(ds)) {
-            setRowField(r, 'plugin_id', `${slug}:log:${ds}`, coll);
-          }
-        }
-      }
-    }
-  }
-
-  function rowField(r, id) {
-    if (!r) return '';
-    try {
-      const p = r.prop?.(id);
-      if (p && typeof p.choice === 'function') {
-        const c = p.choice();
-        if (c != null && String(c).trim() !== '') return String(c).trim();
-      }
-    } catch (_) {}
-    let v = '';
-    try {
-      v = r.text?.(id);
-    } catch (_) {}
-    if (v != null && String(v).trim() !== '') return String(v).trim();
-    try {
-      const p = r.prop?.(id);
-      if (p && typeof p.get === 'function') {
-        const g = p.get();
-        return g == null ? '' : String(g).trim();
-      }
-      if (p && typeof p.text === 'function') {
-        const t = p.text();
-        return t == null ? '' : String(t).trim();
-      }
-    } catch (_) {}
-    return '';
-  }
-
-  /** Thymer `setChoice` matches option **label** (see YNAB plugins); return label for slug `id`, else slug. */
-  function pluginChoiceSetName(coll, slug) {
-    const s = String(slug || '').trim();
-    if (!s || !coll || typeof coll.getConfiguration !== 'function') return s;
-    try {
-      const f = getPluginFieldDef(coll);
-      if (!f || f.type !== 'choice' || !Array.isArray(f.choices)) return s;
-      const opt = f.choices.find((c) => c && String(c.id || '').trim() === s);
-      if (opt && opt.label != null && String(opt.label).trim() !== '') return String(opt.label).trim();
-    } catch (_) {}
-    return s;
-  }
-
-  /**
-   * @param coll Optional collection — pass when writing `plugin` so setChoice uses the correct option **label**.
-   */
-  function setRowField(r, id, value, coll = null) {
-    if (!r) return;
-    const raw = value == null ? '' : String(value);
-    const s = raw.trim();
-    const propId = pluginColumnPropId(coll, id);
-    try {
-      const p = r.prop?.(propId);
-      if (!p) return;
-      // Thymer exposes setChoice on many property types; it returns false for non-choice fields.
-      // Only use setChoice for the Plugin **slug** column — otherwise we return early and never p.set().
-      const isPluginChoiceCol = id === FIELD_PLUGIN;
-      if (isPluginChoiceCol && typeof p.setChoice === 'function') {
-        if (!s) {
-          if (typeof p.set === 'function') p.set('');
-          return;
-        }
-        const nameTry = coll != null ? pluginChoiceSetName(coll, s) : s;
-        if (p.setChoice(nameTry)) return;
-        if (nameTry !== s && p.setChoice(s)) return;
-        if (typeof p.set === 'function') {
-          try {
-            p.set(s);
-            return;
-          } catch (_) {
-            /* continue to warn */
-          }
-        }
-        console.warn('[ThymerPluginSettings] setChoice: no option matched field', id, 'slug', s, 'tried', nameTry);
-        return;
-      }
-      if (typeof p.set === 'function') p.set(raw);
-    } catch (e) {
-      console.warn('[ThymerPluginSettings] setRowField', id, e);
-    }
-  }
-
-  /** True for the single mirror row per logical plugin (plugin_id === pluginId and kind vault or legacy). */
-  function isVaultRow(r, pluginId) {
-    const pid = rowField(r, 'plugin_id');
-    if (pid !== pluginId) return false;
-    const kind = rowField(r, FIELD_KIND);
-    if (kind === KIND_VAULT) return true;
-    if (!kind) return true;
-    return false;
-  }
-
-  /** Parse ISO-ish timestamps for vault row scoring (duplicates: pick freshest, not first in list). */
-  function parseVaultIsoMs(s) {
-    const n = Date.parse(String(s || ''));
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  function vaultRowFreshnessScore(r) {
-    let score = 0;
-    let raw = '';
-    try {
-      raw = rowField(r, 'settings_json');
-    } catch (_) {}
-    if (raw && String(raw).trim()) {
-      try {
-        const j = JSON.parse(raw);
-        if (j && typeof j.updatedAt === 'string') {
-          const ms = parseVaultIsoMs(j.updatedAt);
-          if (ms > score) score = ms;
-        }
-      } catch (_) {}
-    }
-    try {
-      const ua = rowField(r, 'updated_at');
-      if (ua) {
-        const ms = parseVaultIsoMs(ua);
-        if (ms > score) score = ms;
-      }
-    } catch (_) {}
-    return score;
-  }
-
-  function settingsJsonPayloadLen(r) {
-    try {
-      return String(rowField(r, 'settings_json') || '').length;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  /**
-   * Prefer the **newest** vault row when duplicates exist (same `plugin_id`, multiple vault-shaped rows).
-   * Previously the first list match could be stale while a newer row held the real payload.
-   */
-  function findVaultRecord(records, pluginId) {
-    if (!records) return null;
-    let best = null;
-    let bestScore = -1;
-    for (const x of records) {
-      if (!isVaultRow(x, pluginId)) continue;
-      const sc = vaultRowFreshnessScore(x);
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = x;
-      } else if (sc === bestScore && best) {
-        const lenX = settingsJsonPayloadLen(x);
-        const lenB = settingsJsonPayloadLen(best);
-        if (lenX > lenB) best = x;
-      }
-    }
-    return best;
-  }
-
-  function applyVaultRowMeta(r, pluginId, coll) {
-    setRowField(r, 'plugin_id', pluginId);
-    setRowField(r, FIELD_PLUGIN, pluginId, coll);
-    setRowField(r, FIELD_KIND, KIND_VAULT);
-  }
-
-  function drain() {
-    if (busy || !q.length) return;
-    busy = true;
-    const job = q.shift();
-    Promise.resolve(typeof job === 'function' ? job() : job)
-      .catch((e) => console.error('[ThymerPluginSettings]', e))
-      .finally(() => {
-        busy = false;
-        if (q.length) setTimeout(drain, 450);
-      });
-  }
-
-  function enqueue(job) {
-    q.push(job);
-    drain();
-  }
-
-  /** Sidebar / command palette title may be `getName()` or only `getConfiguration().name`. */
-  function collectionDisplayName(c) {
-    if (!c) return '';
-    let s = '';
-    try {
-      s = String(c.getName?.() || '').trim();
-    } catch (_) {}
-    if (s) return s;
-    try {
-      s = String(c.getConfiguration?.()?.name || '').trim();
-    } catch (_) {}
-    return s;
-  }
-
-  /** Configured collection name only (avoids duplicating `collectionDisplayName` fallbacks). */
-  function collectionBackendConfiguredTitle(c) {
-    if (!c) return '';
-    try {
-      return String(c.getConfiguration?.()?.name || '').trim();
-    } catch (_) {
-      return '';
-    }
-  }
-
-  /**
-   * When plugin iframes are opaque (blob/sandbox), `navigator.locks` and `window.top` globals do not
-   * dedupe across realms. First `localStorage` we can reach on the Thymer app origin is shared.
-   */
-  function getSharedThymerLocalStorage() {
-    const seen = new Set();
-    const tryWin = (w) => {
-      if (!w || seen.has(w)) return null;
-      seen.add(w);
-      try {
-        const ls = w.localStorage;
-        void ls.length;
-        return ls;
-      } catch (_) {
-        return null;
-      }
-    };
-    try {
-      const t = tryWin(window.top);
-      if (t) return t;
-    } catch (_) {}
-    try {
-      const t = tryWin(window);
-      if (t) return t;
-    } catch (_) {}
-    try {
-      let w = window;
-      for (let i = 0; i < 10 && w; i++) {
-        const t = tryWin(w);
-        if (t) return t;
-        if (w === w.parent) break;
-        w = w.parent;
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  /** Unscoped keys (legacy); runtime uses {@link scopedPbLsKey} per workspace. */
-  const LS_CREATE_LEASE_BASE = 'thymerext_plugin_backend_create_lease_v1';
-  const LS_RECENT_CREATE_BASE = 'thymerext_plugin_backend_recent_create_v1';
-  const LS_RECENT_CREATE_ATTEMPT_BASE = 'thymerext_plugin_backend_recent_create_attempt_v1';
-
-  function workspaceSlugFromData(data) {
-    try {
-      const u = data && typeof data.getActiveUsers === 'function' ? data.getActiveUsers() : null;
-      const g = u && u[0] && u[0].workspaceGuid;
-      const s = g != null ? String(g).trim() : '';
-      if (s) return s.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 120);
-    } catch (_) {}
-    return '_unknown_ws';
-  }
-
-  function scopedPbLsKey(base, data) {
-    return `${base}__${workspaceSlugFromData(data)}`;
-  }
-
-  /** Count collections whose sidebar/title name is exactly Plugin Backend (or legacy). */
-  async function countExactPluginBackendNamedCollections(data) {
-    let all;
-    try {
-      all = await getAllCollectionsDeduped(data);
-    } catch (_) {
-      return 0;
-    }
-    if (!Array.isArray(all)) return 0;
-    let n = 0;
-    for (const c of all) {
-      try {
-        const nm = collectionDisplayName(c);
-        if (nm === COL_NAME || nm === COL_NAME_LEGACY) n += 1;
-      } catch (_) {}
-    }
-    return n;
-  }
-
-  /**
-   * Cross-realm mutex for `createCollection` + first `saveConfiguration` only.
-   * Lease keys are **per workspace** so switching workspaces does not inherit another vault’s lease / cooldown.
-   * @returns {{ denied: boolean, release: () => void }}
-   */
-  async function acquirePluginBackendCreationLease(maxWaitMs, data) {
-    const locksOk =
-      typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function';
-    const noop = { denied: false, release() {} };
-    const ls = getSharedThymerLocalStorage();
-    if (!ls) {
-      if (locksOk) return noop;
-      if (DEBUG_COLLECTIONS) {
-        dlogPathB('lease_denied_no_localstorage_no_locks', { ws: workspaceSlugFromData(data) });
-      }
-      return { denied: true, release() {} };
-    }
-    const leaseKey = scopedPbLsKey(LS_CREATE_LEASE_BASE, data);
-    const holder =
-      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
-      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-    const deadline = Date.now() + (Number(maxWaitMs) > 0 ? maxWaitMs : 12000);
-    let acquired = false;
-    let sawContention = false;
-    while (Date.now() < deadline) {
-      try {
-        const raw = ls.getItem(leaseKey);
-        let busy = false;
-        if (raw) {
-          let j = null;
-          try {
-            j = JSON.parse(raw);
-          } catch (_) {
-            j = null;
-          }
-          if (j && typeof j.exp === 'number' && j.h !== holder && j.exp > Date.now()) busy = true;
-        }
-        if (busy) {
-          sawContention = true;
-          await new Promise((r) => setTimeout(r, 40 + Math.floor(Math.random() * 70)));
-          continue;
-        }
-        const exp = Date.now() + 45000;
-        const payload = JSON.stringify({ h: holder, exp });
-        ls.setItem(leaseKey, payload);
-        await new Promise((r) => setTimeout(r, 0));
-        if (ls.getItem(leaseKey) === payload) {
-          acquired = true;
-          if (DEBUG_COLLECTIONS) dlogPathB('lease_acquired', { via: 'localStorage', sawContention, leaseKey });
-          break;
-        }
-      } catch (_) {
-        return locksOk ? noop : { denied: true, release() {} };
-      }
-      await new Promise((r) => setTimeout(r, 30 + Math.floor(Math.random() * 50)));
-    }
-    if (!acquired) {
-      if (DEBUG_COLLECTIONS) dlogPathB('lease_timeout_abort_create', { sawContention, leaseKey });
-      return { denied: true, release() {} };
-    }
-    return {
-      denied: false,
-      release() {
-        if (!acquired) return;
-        acquired = false;
-        try {
-          const cur = ls.getItem(leaseKey);
-          if (!cur) return;
-          let j = null;
-          try {
-            j = JSON.parse(cur);
-          } catch (_) {
-            return;
-          }
-          if (j && j.h === holder) ls.removeItem(leaseKey);
-        } catch (_) {}
-      },
-    };
-  }
-
-  function noteRecentPluginBackendCreate(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return;
-    try {
-      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data), String(Date.now()));
-    } catch (_) {}
-  }
-
-  function getRecentPluginBackendCreateAgeMs(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return null;
-    try {
-      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_BASE, data));
-      const ts = Number(raw);
-      if (!Number.isFinite(ts) || ts <= 0) return null;
-      return Date.now() - ts;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function noteRecentPluginBackendCreateAttempt(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return;
-    try {
-      ls.setItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data), String(Date.now()));
-    } catch (_) {}
-  }
-
-  function getRecentPluginBackendCreateAttemptAgeMs(data) {
-    const ls = getSharedThymerLocalStorage();
-    if (!ls || !data) return null;
-    try {
-      const raw = ls.getItem(scopedPbLsKey(LS_RECENT_CREATE_ATTEMPT_BASE, data));
-      const ts = Number(raw);
-      if (!Number.isFinite(ts) || ts <= 0) return null;
-      return Date.now() - ts;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /** When Thymer omits names on `getAllCollections()` entries, match our Path B schema. */
-  function pathBCollectionScore(c) {
-    if (!c) return 0;
-    try {
-      const conf = c.getConfiguration?.() || {};
-      const fields = Array.isArray(conf.fields) ? conf.fields : [];
-      const ids = new Set(fields.map((f) => f && f.id).filter(Boolean));
-      if (!ids.has('plugin_id') || !ids.has('settings_json')) return 0;
-      let s = 2;
-      if (ids.has(FIELD_PLUGIN)) s += 2;
-      if (ids.has(FIELD_KIND)) s += 1;
-      const nm = collectionDisplayName(c).toLowerCase();
-      if (nm && (nm.includes('plugin') && (nm.includes('backend') || nm.includes('setting')))) s += 1;
-      return s;
-    } catch (_) {
-      return 0;
-    }
-  }
-
-  function pickPathBCollectionHeuristic(all) {
-    const list = Array.isArray(all) ? all : [];
-    const cands = [];
-    let bestS = 0;
-    for (const c of list) {
-      const sc = pathBCollectionScore(c);
-      if (sc > bestS) {
-        bestS = sc;
-        cands.length = 0;
-        cands.push(c);
-      } else if (sc === bestS && sc >= 2) {
-        cands.push(c);
-      }
-    }
-    if (!cands.length) return null;
-    const named = cands.find((c) => {
-      const n = collectionDisplayName(c);
-      const cfg = collectionBackendConfiguredTitle(c);
-      return n === COL_NAME || n === COL_NAME_LEGACY || cfg === COL_NAME || cfg === COL_NAME_LEGACY;
-    });
-    return named || cands[0];
-  }
-
-  function pickCollFromAll(all) {
-    try {
-      const pick = (allIn) => {
-        const list = Array.isArray(allIn) ? allIn : [];
-        return (
-          list.find((c) => collectionDisplayName(c) === COL_NAME) ||
-          list.find((c) => collectionDisplayName(c) === COL_NAME_LEGACY) ||
-          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME) ||
-          list.find((c) => collectionBackendConfiguredTitle(c) === COL_NAME_LEGACY) ||
-          null
-        );
-      };
-      return pick(all) || pickPathBCollectionHeuristic(all) || null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function hasPluginBackendInAll(all) {
-    if (!Array.isArray(all) || all.length === 0) return false;
-    for (const c of all) {
-      const nm = collectionDisplayName(c);
-      if (nm === COL_NAME || nm === COL_NAME_LEGACY) return true;
-      const cfg = collectionBackendConfiguredTitle(c);
-      if (cfg === COL_NAME || cfg === COL_NAME_LEGACY) return true;
-    }
-    return !!pickPathBCollectionHeuristic(all);
-  }
-
-  async function findColl(data) {
-    try {
-      const all = await getAllCollectionsDeduped(data);
-      return pickCollFromAll(all);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /** Brute list scan — catches a Backend another iframe just created if `findColl` lags. */
-  async function hasPluginBackendOnWorkspace(data) {
-    try {
-      const all = await getAllCollectionsDeduped(data);
-      return hasPluginBackendInAll(all);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  const PB_LOCK_NAME = 'thymer-ext-plugin-backend-ensure-v1';
-  const DATA_ENSURE_P = '__thymerExtDataPluginBackendEnsureP';
-  /** Per-workspace: Plugin Backend already ensured — skip repeat bodies (avoids getAllCollections / lock storms). */
-  const WS_ENSURE_OK_MAP = '__thymerExtPbWorkspaceEnsureOkMap_v1';
-
-  function markWorkspacePluginBackendEnsureDone(data) {
-    try {
-      const slug = workspaceSlugFromData(data);
-      const h = getSharedDeduplicationWindow();
-      if (!h[WS_ENSURE_OK_MAP] || typeof h[WS_ENSURE_OK_MAP] !== 'object') h[WS_ENSURE_OK_MAP] = Object.create(null);
-      h[WS_ENSURE_OK_MAP][slug] = true;
-    } catch (_) {}
-  }
-
-  function isWorkspacePluginBackendEnsureDone(data) {
-    try {
-      const slug = workspaceSlugFromData(data);
-      const h = getSharedDeduplicationWindow();
-      const m = h[WS_ENSURE_OK_MAP];
-      return !!(m && m[slug]);
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function dlogPathB(phase, extra) {
-    if (!DEBUG_COLLECTIONS) return;
-    try {
-      const row = { runId: DEBUG_PATHB_ID, phase, t: (typeof performance !== 'undefined' && performance.now) ? +performance.now().toFixed(1) : 0, ...extra };
-      console.info('[ThymerExt/PluginBackend]', row);
-    } catch (_) {
-      void 0;
-    }
-  }
-
-  function pathBWindowSnapshot() {
-    const snap = { runId: DEBUG_PATHB_ID, topReadable: null, hasLocks: null };
-    try {
-      if (typeof window !== 'undefined' && window.top) {
-        void window.top.document;
-        snap.topReadable = true;
-      }
-    } catch (e) {
-      snap.topReadable = false;
-      try {
-        snap.topErr = String((e && e.name) || e) || 'top-doc-threw';
-      } catch (_) {
-        snap.topErr = 'top-doc-threw';
-      }
-    }
-    const host = getSharedDeduplicationWindow();
-    try {
-      snap.hasLocks = !!(typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request);
-    } catch (_) {
-      snap.hasLocks = 'err';
-    }
-    try {
-      snap.locationHref = typeof location !== 'undefined' ? String(location.href) : '';
-    } catch (_) {
-      snap.locationHref = '';
-    }
-    try {
-      snap.hasSelf = typeof self !== 'undefined' && self === window;
-      snap.selfIsTop = typeof window !== 'undefined' && window === window.top;
-      snap.hostIsTop = host === (typeof window !== 'undefined' ? window.top : null);
-      snap.hostIsSelf = host === (typeof window !== 'undefined' ? window : null);
-      snap.hostType = (host && host.constructor && host.constructor.name) || '';
-    } catch (_) {
-      void 0;
-    }
-    try {
-      snap.gHasPbP = host && host[PB_ENSURE_GLOBAL_P] != null;
-      snap.gHasCreateQ = host && host[SERIAL_DATA_CREATE_P] != null;
-    } catch (_) {
-      void 0;
-    }
-    return snap;
-  }
-
-  function queueDataCreateOnSharedWindow(factory) {
-    const host = getSharedDeduplicationWindow();
-    if (DEBUG_COLLECTIONS) {
-      dlogPathB('queueDataCreate_enter', { ...pathBWindowSnapshot() });
-    }
-    try {
-      if (!host[SERIAL_DATA_CREATE_P] || typeof host[SERIAL_DATA_CREATE_P].then !== 'function') {
-        host[SERIAL_DATA_CREATE_P] = Promise.resolve();
-      }
-      const out = (host[SERIAL_DATA_CREATE_P] = host[SERIAL_DATA_CREATE_P].catch(() => {}).then(factory));
-      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_chained', { gHasCreateQ: !!host[SERIAL_DATA_CREATE_P] });
-      return out;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('queueDataCreate_fallback', { err: String((e && e.message) || e) });
-      return factory();
-    }
-  }
-
-  async function runPluginBackendEnsureBody(data) {
-    if (data && isWorkspacePluginBackendEnsureDone(data)) return;
-    if (DEBUG_COLLECTIONS) {
-      dlogPathB('ensureBody_start', { pathB: pathBWindowSnapshot() });
-      try {
-        if (data && data.getAllCollections) {
-          const a = await getAllCollectionsDeduped(data);
-          const list = Array.isArray(a) ? a : [];
-          const collNames = list.map((c) => {
-            try { return String(collectionDisplayName(c) || '').trim() || '(no-name)'; } catch (__) { return '(err)'; }
-          });
-          dlogPathB('ensureBody_collections', { count: (collNames && collNames.length) || 0, names: (collNames || []).slice(0, 40) });
-          if (data && data.getAllCollections) touchGetAllSanityFromCount((collNames && collNames.length) || 0);
-          const dupExact = list.filter((c) => {
-            try {
-              const nm = collectionDisplayName(c);
-              return nm === COL_NAME || nm === COL_NAME_LEGACY;
-            } catch (__) {
-              return false;
-            }
-          });
-          if (dupExact.length > 1) {
-            dlogPathB('duplicate_plugin_backend_named_collections', {
-              count: dupExact.length,
-              guids: dupExact.map((c) => {
-                try {
-                  return c.getGuid?.() || null;
-                } catch (__) {
-                  return null;
-                }
-              }),
-              doc: 'docs/PLUGIN_BACKEND_DUPLICATE_HYGIENE.md',
-            });
-          }
-        }
-      } catch (e) {
-        dlogPathB('ensureBody_getAll_failed', { err: String((e && e.message) || e) });
-      }
-    }
-    try {
-      const markPbOk = () => markWorkspacePluginBackendEnsureDone(data);
-      let existing = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        let allAttempt;
-        try {
-          allAttempt = await getAllCollectionsDeduped(data);
-        } catch (_) {
-          allAttempt = null;
-        }
-        if (allAttempt != null) {
-          existing = pickCollFromAll(allAttempt);
-          if (existing) {
-            markPbOk();
-            return;
-          }
-          if (hasPluginBackendInAll(allAttempt)) {
-            markPbOk();
-            return;
-          }
-        } else {
-          existing = await findColl(data);
-          if (existing) {
-            markPbOk();
-            return;
-          }
-          if (await hasPluginBackendOnWorkspace(data)) {
-            markPbOk();
-            return;
-          }
-        }
-        if (attempt < 3) await new Promise((r) => setTimeout(r, 50 + attempt * 50));
-      }
-      let allPost;
-      try {
-        allPost = await getAllCollectionsDeduped(data);
-      } catch (_) {
-        allPost = null;
-      }
-      if (allPost != null) {
-        existing = pickCollFromAll(allPost);
-        if (existing) {
-          markPbOk();
-          return;
-        }
-        if (hasPluginBackendInAll(allPost)) {
-          markPbOk();
-          return;
-        }
-      } else {
-        existing = await findColl(data);
-        if (existing) {
-          markPbOk();
-          return;
-        }
-        if (await hasPluginBackendOnWorkspace(data)) {
-          markPbOk();
-          return;
-        }
-      }
-      await new Promise((r) => setTimeout(r, 120));
-      let allAfterWait;
-      try {
-        allAfterWait = await getAllCollectionsDeduped(data);
-      } catch (_) {
-        allAfterWait = null;
-      }
-      if (allAfterWait != null) {
-        if (pickCollFromAll(allAfterWait)) {
-          markPbOk();
-          return;
-        }
-        if (hasPluginBackendInAll(allAfterWait)) {
-          markPbOk();
-          return;
-        }
-      } else {
-        if (await findColl(data)) {
-          markPbOk();
-          return;
-        }
-        if (await hasPluginBackendOnWorkspace(data)) {
-          markPbOk();
-          return;
-        }
-      }
-      let preCreateLen = 0;
-      try {
-        if (data && data.getAllCollections) {
-          const all0 = await getAllCollectionsDeduped(data);
-          preCreateLen = Array.isArray(all0) ? all0.length : 0;
-          if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-        }
-        if (preCreateLen === 0) {
-          await new Promise((r) => setTimeout(r, 150));
-          if (data && data.getAllCollections) {
-            const all1 = await getAllCollectionsDeduped(data);
-            preCreateLen = Array.isArray(all1) ? all1.length : 0;
-            if (preCreateLen > 0) touchGetAllSanityFromCount(preCreateLen);
-          }
-        }
-        if (preCreateLen > 0) {
-          let allPre;
-          try {
-            allPre = await getAllCollectionsDeduped(data);
-          } catch (_) {
-            allPre = null;
-          }
-          if (allPre != null) {
-            if (pickCollFromAll(allPre)) {
-              markPbOk();
-              return;
-            }
-            if (hasPluginBackendInAll(allPre)) {
-              markPbOk();
-              return;
-            }
-          } else {
-            if (await findColl(data)) {
-              markPbOk();
-              return;
-            }
-            if (await hasPluginBackendOnWorkspace(data)) {
-              markPbOk();
-              return;
-            }
-          }
-        }
-        if (isSuspiciousEmptyAfterRecentNonEmptyList(preCreateLen) && preCreateLen === 0) {
-          if (DEBUG_COLLECTIONS) {
-            try {
-              const h = getSharedDeduplicationWindow();
-              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot(), s: h[GETALL_COLLECTIONS_SANITY] || null });
-            } catch (_) {
-              dlogPathB('refuse_create_flaky_getall_empty', { pathB: pathBWindowSnapshot() });
-            }
-          }
-          return;
-        }
-      } catch (_) {
-        void 0;
-      }
-      if (DEBUG_COLLECTIONS) dlogPathB('ensureBody_about_to_create', { pathB: pathBWindowSnapshot() });
-      const lease = await acquirePluginBackendCreationLease(14000, data);
-      if (lease.denied) return;
-      try {
-        let allLease;
-        try {
-          allLease = await getAllCollectionsDeduped(data);
-        } catch (_) {
-          allLease = null;
-        }
-        if (allLease != null) {
-          if (pickCollFromAll(allLease)) {
-            markPbOk();
-            return;
-          }
-          if (hasPluginBackendInAll(allLease)) {
-            markPbOk();
-            return;
-          }
-        } else {
-          if (await findColl(data)) {
-            markPbOk();
-            return;
-          }
-          if (await hasPluginBackendOnWorkspace(data)) {
-            markPbOk();
-            return;
-          }
-        }
-        const recentAttemptAge = getRecentPluginBackendCreateAttemptAgeMs(data);
-        if (recentAttemptAge != null && recentAttemptAge >= 0 && recentAttemptAge < 120000) {
-          // Another plugin iframe attempted creation very recently. Avoid burst duplicate creates.
-          for (let i = 0; i < 10; i++) {
-            await new Promise((r) => setTimeout(r, 130 + i * 70));
-            let allCont;
-            try {
-              allCont = await getAllCollectionsDeduped(data);
-            } catch (_) {
-              allCont = null;
-            }
-            if (allCont != null) {
-              if (pickCollFromAll(allCont)) {
-                markPbOk();
-                return;
-              }
-              if (hasPluginBackendInAll(allCont)) {
-                markPbOk();
-                return;
-              }
-            } else {
-              if (await findColl(data)) {
-                markPbOk();
-                return;
-              }
-              if (await hasPluginBackendOnWorkspace(data)) {
-                markPbOk();
-                return;
-              }
-            }
-          }
-          return;
-        }
-        const recentAge = getRecentPluginBackendCreateAgeMs(data);
-        if (recentAge != null && recentAge >= 0 && recentAge < 90000) {
-          // Another plugin/runtime likely just created it; let collection list/indexing settle first.
-          for (let i = 0; i < 8; i++) {
-            await new Promise((r) => setTimeout(r, 120 + i * 60));
-            let allSettle;
-            try {
-              allSettle = await getAllCollectionsDeduped(data);
-            } catch (_) {
-              allSettle = null;
-            }
-            if (allSettle != null) {
-              if (pickCollFromAll(allSettle)) {
-                markPbOk();
-                return;
-              }
-              if (hasPluginBackendInAll(allSettle)) {
-                markPbOk();
-                return;
-              }
-            } else {
-              if (await findColl(data)) {
-                markPbOk();
-                return;
-              }
-              if (await hasPluginBackendOnWorkspace(data)) {
-                markPbOk();
-                return;
-              }
-            }
-          }
-        }
-        noteRecentPluginBackendCreateAttempt(data);
-        const exactN = await countExactPluginBackendNamedCollections(data);
-        if (exactN >= 1) {
-          if (DEBUG_COLLECTIONS) {
-            dlogPathB('abort_create_exact_backend_name_exists', { exactN, ws: workspaceSlugFromData(data) });
-          }
-          markPbOk();
-          return;
-        }
-        const coll = await queueDataCreateOnSharedWindow(() => data.createCollection());
-        if (!coll || typeof coll.getConfiguration !== 'function' || typeof coll.saveConfiguration !== 'function') {
-          return;
-        }
-        const conf = cloneShape();
-        const base = coll.getConfiguration();
-        if (base && typeof base.ver === 'number') conf.ver = base.ver;
-        let ok = await coll.saveConfiguration(conf);
-        if (ok === false) {
-          // Transient host races can reject the first save; retry before giving up.
-          await new Promise((r) => setTimeout(r, 180));
-          ok = await coll.saveConfiguration(conf);
-        }
-        if (ok === false) return;
-        noteRecentPluginBackendCreate(data);
-        markPbOk();
-        await new Promise((r) => setTimeout(r, 250));
-      } finally {
-        try {
-          lease.release();
-        } catch (_) {}
-      }
-    } catch (e) {
-      console.error('[ThymerPluginSettings] ensure collection', e);
-    }
-  }
-
-  function runPluginBackendEnsureWithLocksOrChain(data) {
-    try {
-      if (typeof navigator !== 'undefined' && navigator.locks && typeof navigator.locks.request === 'function') {
-        if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'locks', lockName: PB_LOCK_NAME, pathB: pathBWindowSnapshot() });
-        return navigator.locks.request(PB_LOCK_NAME, () => runPluginBackendEnsureBody(data));
-      }
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('ensure_locks_threw', { err: String((e && e.message) || e) });
-    }
-    if (DEBUG_COLLECTIONS) dlogPathB('ensure_route', { via: 'hierarchyChain', pathB: pathBWindowSnapshot() });
-    return chainPluginBackendEnsure(data, () => runPluginBackendEnsureBody(data));
-  }
-
-  function ensurePluginSettingsCollection(data) {
-    if (!data || typeof data.getAllCollections !== 'function' || typeof data.createCollection !== 'function') {
-      return Promise.resolve();
-    }
-    if (isWorkspacePluginBackendEnsureDone(data)) {
-      return Promise.resolve();
-    }
-    if (DEBUG_COLLECTIONS) {
-      let dHint = 'no-data';
-      try {
-        dHint = data
-          ? `ctor=${(data && data.constructor && data.constructor.name) || '?'},eqPrev=${(data && data === g.__th_lastDataPb) || false},keys=${
-            Object.keys(data).filter((k) => k && (k.includes('thymer') || k.includes('__'))).length
-          }`
-          : 'null';
-        g.__th_lastDataPb = data;
-      } catch (_) {
-        dHint = 'err';
-      }
-      dlogPathB('ensurePluginSettingsCollection', { dataHint: dHint, dataExpand: (() => { try { if (!data) return { ok: false }; return { hasDataEnsure: !!data[DATA_ENSURE_P] }; } catch (_) { return { ok: 'throw' }; } })(), pathB: pathBWindowSnapshot() });
-    }
-    try {
-      if (!data[DATA_ENSURE_P] || typeof data[DATA_ENSURE_P].then !== 'function') {
-        data[DATA_ENSURE_P] = Promise.resolve();
-      }
-      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_chained', { hasPriorTail: true });
-      const next = data[DATA_ENSURE_P]
-        .catch(() => {})
-        .then(() => runPluginBackendEnsureWithLocksOrChain(data));
-      data[DATA_ENSURE_P] = next;
-      return next;
-    } catch (e) {
-      if (DEBUG_COLLECTIONS) dlogPathB('data_ensure_p_throw', { err: String((e && e.message) || e) });
-      return runPluginBackendEnsureWithLocksOrChain(data);
-    }
-  }
-
-  async function readDoc(data, pluginId) {
-    const coll = await findColl(data);
-    if (!coll) return null;
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return null;
-    }
-    const r = findVaultRecord(records, pluginId);
-    if (!r) return null;
-    let raw = '';
-    try {
-      raw = r.text?.('settings_json') || '';
-    } catch (_) {}
-    if (!raw || !String(raw).trim()) return null;
-    try {
-      return JSON.parse(raw);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  async function writeDoc(data, pluginId, doc) {
-    const coll = await findColl(data);
-    if (!coll) return;
-    await upgradePluginSettingsSchema(data, coll);
-    const json = JSON.stringify(doc);
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return;
-    }
-    let r = findVaultRecord(records, pluginId);
-    if (!r) {
-      let guid = null;
-      try {
-        guid = coll.createRecord?.(pluginId);
-      } catch (_) {}
-      if (guid) {
-        for (let i = 0; i < 30; i++) {
-          await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
-          try {
-            const again = await coll.getAllRecords();
-            r = again.find((x) => x.guid === guid) || findVaultRecord(again, pluginId);
-            if (r) break;
-          } catch (_) {}
-        }
-      }
-    }
-    if (!r) return;
-    applyVaultRowMeta(r, pluginId, coll);
-    try {
-      const pj = r.prop?.('settings_json');
-      if (pj && typeof pj.set === 'function') pj.set(json);
-    } catch (_) {}
-  }
-
-  const LOCAL_MIRROR_META_PREFIX = 'thymerext_ps_local_meta_v1:';
-
-  function localMirrorMetaKey(pluginId) {
-    return LOCAL_MIRROR_META_PREFIX + encodeURIComponent(String(pluginId || 'unknown'));
-  }
-
-  function parseIsoMs(s) {
-    const n = Date.parse(String(s || ''));
-    return Number.isFinite(n) ? n : 0;
-  }
-
-  function readLocalMirrorMeta(pluginId) {
-    try {
-      const raw = localStorage.getItem(localMirrorMetaKey(pluginId));
-      const parsed = raw ? JSON.parse(raw) : null;
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch (_) {}
-    return {};
-  }
-
-  function writeLocalMirrorMeta(pluginId, meta) {
-    try {
-      localStorage.setItem(localMirrorMetaKey(pluginId), JSON.stringify(meta || {}));
-    } catch (_) {}
-  }
-
-  function markLocalMirrorKeys(pluginId, keys, updatedAt) {
-    if (!pluginId || !Array.isArray(keys)) return;
-    const meta = readLocalMirrorMeta(pluginId);
-    const ts = updatedAt || new Date().toISOString();
-    let changed = false;
-    for (const k of keys) {
-      if (!k) continue;
-      let exists = false;
-      try {
-        exists = localStorage.getItem(k) !== null;
-      } catch (_) {}
-      if (!exists) continue;
-      meta[k] = { updatedAt: ts };
-      changed = true;
-    }
-    if (changed) writeLocalMirrorMeta(pluginId, meta);
-  }
-
-  function collectLocalMirrorPayload(keys) {
-    const payload = {};
-    if (!Array.isArray(keys)) return payload;
-    for (const k of keys) {
-      if (!k) continue;
-      try {
-        const v = localStorage.getItem(k);
-        if (v !== null) payload[k] = v;
-      } catch (_) {}
-    }
-    return payload;
-  }
-
-  function localPayloadMatchesRemote(keys, remote) {
-    if (!remote || !remote.payload || typeof remote.payload !== 'object') return false;
-    if (!Array.isArray(keys)) return true;
-    for (const k of keys) {
-      if (!k) continue;
-      let localValue = null;
-      try {
-        localValue = localStorage.getItem(k);
-      } catch (_) {}
-      const remoteValue = remote.payload[k];
-      if (localValue === null && typeof remoteValue !== 'string') continue;
-      if (localValue !== remoteValue) return false;
-    }
-    return true;
-  }
-
-  function applyRemoteMirrorPayload(pluginId, keys, remote) {
-    const result = { needsFlush: false };
-    if (!remote || !remote.payload || typeof remote.payload !== 'object') return result;
-    const meta = readLocalMirrorMeta(pluginId);
-    const remoteUpdatedAt = String(remote.updatedAt || '');
-    const remoteMs = parseIsoMs(remoteUpdatedAt);
-    let metaChanged = false;
-    for (const k of keys) {
-      if (!k) continue;
-      const remoteValue = remote.payload[k];
-      if (typeof remoteValue !== 'string') continue;
-
-      let localValue = null;
-      try {
-        localValue = localStorage.getItem(k);
-      } catch (_) {}
-
-      if (localValue === remoteValue) {
-        if (remoteUpdatedAt && (!meta[k] || !meta[k].updatedAt)) {
-          meta[k] = { updatedAt: remoteUpdatedAt };
-          metaChanged = true;
-        }
-        continue;
-      }
-
-      if (localValue === null) {
-        try {
-          localStorage.setItem(k, remoteValue);
-          if (remoteUpdatedAt) {
-            meta[k] = { updatedAt: remoteUpdatedAt };
-            metaChanged = true;
-          }
-        } catch (_) {}
-        continue;
-      }
-
-      const localMs = parseIsoMs(meta[k]?.updatedAt);
-      if (localMs && remoteMs && remoteMs > localMs + 1000) {
-        try {
-          localStorage.setItem(k, remoteValue);
-          meta[k] = { updatedAt: remoteUpdatedAt };
-          metaChanged = true;
-        } catch (_) {}
-        continue;
-      }
-
-      // When freshness is ambiguous, preserve the browser's current settings and let flushNow repair the vault row.
-      result.needsFlush = true;
-      if (!localMs) {
-        meta[k] = { updatedAt: new Date().toISOString() };
-        metaChanged = true;
-      }
-      console.warn('[ThymerPluginSettings] Kept local settings instead of overwriting with older/ambiguous synced payload', {
-        pluginId,
-        key: k,
-        localUpdatedAt: meta[k]?.updatedAt || null,
-        remoteUpdatedAt: remoteUpdatedAt || null,
-      });
-    }
-    if (metaChanged) writeLocalMirrorMeta(pluginId, meta);
-    return result;
-  }
-
-  function shouldFlushMirrorOnInit(keys, remote, applyResult) {
-    if (applyResult?.needsFlush) return true;
-    if (remote && remote.payload && typeof remote.payload === 'object') {
-      return !localPayloadMatchesRemote(keys, remote);
-    }
-    return Object.keys(collectLocalMirrorPayload(keys)).length > 0;
-  }
-
-  async function listRows(data, { pluginSlug, recordKind } = {}) {
-    const slug = (pluginSlug || '').trim();
-    if (!slug) return [];
-    const coll = await findColl(data);
-    if (!coll) return [];
-    let records;
-    try {
-      records = await coll.getAllRecords();
-    } catch (_) {
-      return [];
-    }
-    const plugCol = pluginColumnPropId(coll, FIELD_PLUGIN);
-    return records.filter((r) => {
-      const pid = rowField(r, 'plugin_id');
-      let rowSlug = rowField(r, plugCol);
-      if (!rowSlug) rowSlug = inferPluginSlugFromPid(pid);
-      if (rowSlug !== slug) return false;
-      if (recordKind != null && String(recordKind) !== '') {
-        const rk = rowField(r, FIELD_KIND) || inferRecordKindFromPid(pid, slug);
-        return rk === String(recordKind);
-      }
-      return true;
-    });
-  }
-
-  async function createDataRow(data, { pluginSlug, recordKind, rowPluginId, recordTitle, settingsDoc } = {}) {
-    const ps = (pluginSlug || '').trim();
-    const rid = (rowPluginId || '').trim();
-    const kind = (recordKind || '').trim();
-    if (!ps || !rid || !kind) {
-      console.warn('[ThymerPluginSettings] createDataRow: pluginSlug, recordKind, and rowPluginId are required');
-      return null;
-    }
-    if (rid === ps && kind !== KIND_VAULT) {
-      console.warn('[ThymerPluginSettings] createDataRow: rowPluginId must differ from plugin slug unless record_kind is vault');
-    }
-    await ensurePluginSettingsCollection(data);
-    const coll = await findColl(data);
-    if (!coll) return null;
-    await upgradePluginSettingsSchema(data, coll);
-    const title = (recordTitle || rid).trim() || rid;
-    let guid = null;
-    try {
-      guid = coll.createRecord?.(title);
-    } catch (e) {
-      console.error('[ThymerPluginSettings] createDataRow createRecord', e);
-      return null;
-    }
-    if (!guid) return null;
-    let r = null;
-    for (let i = 0; i < 30; i++) {
-      await new Promise((res) => setTimeout(res, i < 8 ? 100 : 200));
-      try {
-        const again = await coll.getAllRecords();
-        r = again.find((x) => x.guid === guid) || again.find((x) => rowField(x, 'plugin_id') === rid);
-        if (r) break;
-      } catch (_) {}
-    }
-    if (!r) return null;
-    setRowField(r, 'plugin_id', rid);
-    setRowField(r, FIELD_PLUGIN, ps, coll);
-    setRowField(r, FIELD_KIND, kind);
-    const json =
-      settingsDoc !== undefined && settingsDoc !== null
-        ? typeof settingsDoc === 'string'
-          ? settingsDoc
-          : JSON.stringify(settingsDoc)
-        : '{}';
-    try {
-      const pj = r.prop?.('settings_json');
-      if (pj && typeof pj.set === 'function') pj.set(json);
-    } catch (_) {}
-    return r;
-  }
-
-  function showFirstRunDialog(ui, label, preferred, onPick) {
-    const id = 'thymerext-ps-first-' + Math.random().toString(36).slice(2);
-    const box = document.createElement('div');
-    box.id = id;
-    box.style.cssText =
-      'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
-    const card = document.createElement('div');
-    card.style.cssText =
-      'max-width:420px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:20px;box-shadow:0 8px 32px rgba(0,0,0,0.5);';
-    const title = document.createElement('div');
-    title.textContent = label + ' — where to store settings?';
-    title.style.cssText = 'font-weight:700;font-size:15px;margin-bottom:10px;';
-    const hint = document.createElement('div');
-    hint.textContent = 'Change later via Command Palette → “Storage location…”';
-    hint.style.cssText = 'font-size:12px;color:var(--text-muted,#888);margin-bottom:16px;line-height:1.45;';
-    const mk = (t, sub, prim) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.style.cssText =
-        'display:block;width:100%;text-align:left;padding:12px 14px;margin-bottom:10px;border-radius:8px;cursor:pointer;font-size:14px;border:1px solid var(--border-default,#3f3f46);background:' +
-        (prim ? 'rgba(167,139,250,0.25)' : 'transparent') +
-        ';color:inherit;';
-      const x = document.createElement('div');
-      x.textContent = t;
-      x.style.fontWeight = '600';
-      b.appendChild(x);
-      if (sub) {
-        const s = document.createElement('div');
-        s.textContent = sub;
-        s.style.cssText = 'font-size:11px;opacity:0.75;margin-top:4px;line-height:1.35;';
-        b.appendChild(s);
-      }
-      return b;
-    };
-    const bLoc = mk('This device only', 'Browser localStorage only.', preferred === 'local');
-    const bSyn = mk(
-      'Sync across devices',
-      'Store in the workspace “' + COL_NAME + '” collection (same account on any browser).',
-      preferred === 'synced'
-    );
-    const fin = (m) => {
-      try {
-        box.remove();
-      } catch (_) {}
-      onPick(m);
-    };
-    bLoc.addEventListener('click', () => fin('local'));
-    bSyn.addEventListener('click', () => fin('synced'));
-    card.appendChild(title);
-    card.appendChild(hint);
-    card.appendChild(bLoc);
-    card.appendChild(bSyn);
-    box.appendChild(card);
-    document.body.appendChild(box);
-  }
-
-  g.ThymerPluginSettings = {
-    COL_NAME,
-    COL_NAME_LEGACY,
-    FIELD_PLUGIN,
-    FIELD_RECORD_KIND: FIELD_KIND,
-    RECORD_KIND_VAULT: KIND_VAULT,
-    enqueue,
-    rowField,
-    findVaultRecord,
-    listRows,
-    createDataRow,
-    upgradeCollectionSchema: (data) => upgradePluginSettingsSchema(data),
-    registerPluginSlug,
-    preferDeferredHeavyWork,
-    yieldToHostBeforePathB,
-    ensureMobileLoadGraceStarted,
-    inMobileLoadGrace,
-    bumpMobileLoadGrace,
-    installMobileResumeGraceListener,
-
-    async init(opts) {
-      ensureMobileLoadGraceStarted();
-      installMobileResumeGraceListener();
-      installMobileInteractionGraceListener();
-      await yieldToHostBeforePathB();
-      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
-
-      let mode = null;
-      try {
-        mode = localStorage.getItem(modeKey);
-      } catch (_) {}
-
-      const remote = await readDoc(data, pluginId);
-      if (!mode && remote && (remote.storageMode === 'synced' || remote.storageMode === 'local')) {
-        mode = remote.storageMode;
-        try {
-          localStorage.setItem(modeKey, mode);
-        } catch (_) {}
-      }
-
-      if (!mode) {
-        const coll = await findColl(data);
-        const preferred = coll ? 'synced' : 'local';
-        await new Promise((r) => {
-          requestAnimationFrame(() => requestAnimationFrame(() => r()));
-        });
-        await new Promise((outerResolve) => {
-          enqueue(async () => {
-            const picked = await new Promise((r) => {
-              showFirstRunDialog(ui, label, preferred, r);
-            });
-            try {
-              localStorage.setItem(modeKey, picked);
-            } catch (_) {}
-            outerResolve(picked);
-          });
-        });
-        try {
-          mode = localStorage.getItem(modeKey);
-        } catch (_) {}
-      }
-
-      plugin._pluginSettingsSyncMode = mode === 'synced' ? 'synced' : 'local';
-      plugin._pluginSettingsPluginId = pluginId;
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      let initFlushNeeded = false;
-
-      if (plugin._pluginSettingsSyncMode === 'synced' && remote && remote.payload && typeof remote.payload === 'object') {
-        const applyResult = applyRemoteMirrorPayload(pluginId, keys, remote);
-        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, applyResult);
-      } else if (plugin._pluginSettingsSyncMode === 'synced') {
-        initFlushNeeded = shouldFlushMirrorOnInit(keys, remote, null);
-      }
-
-      if (plugin._pluginSettingsSyncMode === 'synced' && initFlushNeeded) {
-        try {
-          markLocalMirrorKeys(pluginId, keys);
-          await g.ThymerPluginSettings.flushNow(data, pluginId, keys);
-        } catch (_) {}
-      }
-    },
-
-    scheduleFlush(plugin, mirrorKeys) {
-      if (plugin._pluginSettingsSyncMode !== 'synced') return;
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      markLocalMirrorKeys(plugin._pluginSettingsPluginId, keys);
-      if (plugin._pluginSettingsFlushTimer) clearTimeout(plugin._pluginSettingsFlushTimer);
-      plugin._pluginSettingsFlushTimer = setTimeout(() => {
-        plugin._pluginSettingsFlushTimer = null;
-        const pdata = plugin.data;
-        const pid = plugin._pluginSettingsPluginId;
-        if (!pid || !pdata) return;
-        g.ThymerPluginSettings.flushNow(pdata, pid, keys).catch((e) => console.error('[ThymerPluginSettings] flush', e));
-      }, 500);
-    },
-
-    async flushNow(data, pluginId, mirrorKeys) {
-      await ensurePluginSettingsCollection(data);
-      await upgradePluginSettingsSchema(data);
-      const keys = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      const payload = {};
-      for (const k of keys) {
-        try {
-          const v = localStorage.getItem(k);
-          if (v !== null) payload[k] = v;
-        } catch (_) {}
-      }
-      const doc = {
-        v: 1,
-        storageMode: 'synced',
-        updatedAt: new Date().toISOString(),
-        payload,
-      };
-      await writeDoc(data, pluginId, doc);
-    },
-
-    async openStorageDialog(opts) {
-      const { plugin, pluginId, modeKey, mirrorKeys, label, data, ui } = opts;
-      const cur = plugin._pluginSettingsSyncMode === 'synced' ? 'synced' : 'local';
-      const pick = await new Promise((resolve) => {
-        const close = (v) => {
-          try {
-            box.remove();
-          } catch (_) {}
-          resolve(v);
-        };
-        const box = document.createElement('div');
-        box.style.cssText =
-          'position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;padding:16px;';
-        box.addEventListener('click', (e) => {
-          if (e.target === box) close(null);
-        });
-        const card = document.createElement('div');
-        card.style.cssText =
-          'max-width:400px;width:100%;background:var(--panel-bg-color,#1d1915);border:1px solid var(--border-default,#3f3f46);border-radius:12px;padding:18px;';
-        card.addEventListener('click', (e) => e.stopPropagation());
-        const t = document.createElement('div');
-        t.textContent = label + ' — storage';
-        t.style.cssText = 'font-weight:700;margin-bottom:12px;';
-        const b1 = document.createElement('button');
-        b1.type = 'button';
-        b1.textContent = 'This device only';
-        const b2 = document.createElement('button');
-        b2.type = 'button';
-        b2.textContent = 'Sync across devices';
-        [b1, b2].forEach((b) => {
-          b.style.cssText =
-            'display:block;width:100%;padding:10px 12px;margin-bottom:8px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;text-align:left;';
-        });
-        b1.addEventListener('click', () => close('local'));
-        b2.addEventListener('click', () => close('synced'));
-        const bx = document.createElement('button');
-        bx.type = 'button';
-        bx.textContent = 'Cancel';
-        bx.style.cssText =
-          'margin-top:8px;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border-default,#3f3f46);background:transparent;color:inherit;';
-        bx.addEventListener('click', () => close(null));
-        card.appendChild(t);
-        card.appendChild(b1);
-        card.appendChild(b2);
-        card.appendChild(bx);
-        box.appendChild(card);
-        document.body.appendChild(box);
-      });
-      if (!pick || pick === cur) return;
-      try {
-        localStorage.setItem(modeKey, pick);
-      } catch (_) {}
-      plugin._pluginSettingsSyncMode = pick === 'synced' ? 'synced' : 'local';
-      const keyList = typeof mirrorKeys === 'function' ? mirrorKeys() : mirrorKeys;
-      if (pick === 'synced') {
-        markLocalMirrorKeys(pluginId, keyList);
-        await g.ThymerPluginSettings.flushNow(data, pluginId, keyList);
-      }
-      ui.addToaster?.({
-        title: label,
-        message: pick === 'synced' ? 'Settings will sync across devices.' : 'Settings stay on this device only.',
-        dismissible: true,
-        autoDestroyTime: 3500,
-      });
-    },
-  };
-
-  g.thymerExtEnsureMobileLoadGrace = ensureMobileLoadGraceStarted;
-  g.thymerExtInMobileLoadGrace = inMobileLoadGrace;
-  g.thymerExtPreferDeferredHeavyWork = preferDeferredHeavyWork;
-  g.thymerExtShouldDeferPanelFooterWork = shouldDeferPanelFooterWork;
-  g.thymerExtBumpMobileLoadGrace = bumpMobileLoadGrace;
-  g.thymerExtPauseHeavyWorkQueue = pauseHeavyWorkQueue;
-  g.thymerExtInstallMobileResumeGrace = installMobileResumeGraceListener;
-  g.thymerExtInstallMobileInteractionGrace = installMobileInteractionGraceListener;
-  g.thymerExtEnqueueHeavyWork = enqueueHeavyWork;
-})(typeof globalThis !== 'undefined' ? globalThis : window);
-// @generated END thymer-plugin-settings
-
+// ==Plugin==
+// @id: dawn-habits
+// @name: Habits
+// @description: JHS Habits lego — collapsed cold; idle Habit Logs index; no nav scans
+// @icon: ti-flame
+// ==/Plugin==
 
 /**
- * HabitTracker — Global plugin (journal sidebar)
- * @version 1.1.0
+ * Dawn Habits — standalone JHS tab plugin.
  *
- * UI icons: Tabler Icons (https://tabler.io/icons) via webfont classes `ti ti-{name}`.
+ * Deploy:
+ *   cat plugin.js habits-engine.js habit-manage.mixin.js habit-quick-access.mixin.js
  *
- * Data model — dedicated **"Habit Logs"** collection (config + log rows) plus **Plugin Backend** vault mirror (`ThymerPluginSettings`):
- *   - **Vault** row (`plugin_id` = `habit-tracker`, `record_kind` = `vault`): synced localStorage mirror for panel UI keys only.
- *   - **Config** row in **Habit Logs** (`record_kind` = `config`, `plugin_id` = `habit-tracker:config`): categories/habits JSON in `settings_json`.
- *   - **Log** rows (`record_kind` = `log`, `plugin_id` = `habit-tracker:log:YYYY-MM-DD`): per-day completions JSON in `settings_json`.
- *
- * One-time migration: legacy **HabitTracker** collection and old Plugin Backend habit rows are copied into **Habit Logs** when present (see `HT_PS_MIGRATE_KEY` in localStorage).
- *
- * Config / log JSON shapes unchanged from the old collection plugin.
- *
- * Streaks are calculated on-the-fly by scanning log rows.
+ * CONTRACT:
+ * - registerTab('habits') on Journal Header Shell.
+ * - onDay collapsed = cache paint. Expanded day-flip + expand hydrates the visible day. Index idle until `full`.
+ * - Cross-plugin: globalThis.__dawnHabitsHost.markDone(name, dayKey).
+ * - Not the lab Behavioral blob (no meals / workout / flows).
  */
-
-// ═══ Habit Tracker (ThymerHabitTracker port — plugin_id habit-tracker; config+log live in dedicated "Habit Logs" collection) ═══
-// Dedicated habits collection: the ONLY persistence target for habit config + log rows.
-// (Vault rows for plugin UI prefs continue to live in Plugin Backend, written by ThymerPluginSettings.)
-// As of 2026-05-08, the legacy "Plugin Backend habit storage" mode is gone — see notes in
-// _htEnsureHabitsStorageReady below. Old localStorage flag retained for one-shot cleanup only.
-const HT_DEDICATED_COLL_NAME = 'Habit Logs';
-const HT_LEGACY_STORAGE_MODE_KEY = 'jhs_ht_habits_storage_v1';
-const HT_DEDICATED_COLL_GUID_KEY = 'jhs_ht_habits_coll_guid_v1';
-const HT_DEDICATED_ENSURE_LOCK = 'thymerext-jhs-habits-coll-ensure';
-/** Must match serialized create queue in embedded ThymerPluginSettings (`queueDataCreateOnSharedWindow`). */
-const HT_SERIAL_DATA_CREATE_P = '__thymerExtSerializedDataCreateP_v1';
-
-const HT_DEDICATED_COLL_BASE = JSON.parse(
-  '{"ver":1,"name":"Habit Logs","icon":"ti-checkbox","color":null,"home":false,"page_field_ids":["plugin","record_kind","plugin_id","created_at","updated_at","settings_json"],"item_name":"Setting, Config, or Log","description":"Habit Tracker: habit definitions and daily completion logs (separate from Plugin Backend for performance).","show_sidebar_items":true,"show_cmdpal_items":false,"fields":[{"icon":"ti-apps","id":"plugin","label":"Plugin","type":"choice","read_only":false,"active":true,"many":false,"choices":[{"id":"habit-tracker","label":"Habit Tracker","color":"0","active":true}]},{"icon":"ti-category","id":"record_kind","label":"Record kind","type":"text","read_only":false,"active":true,"many":false},{"icon":"ti-id","id":"plugin_id","label":"Plugin ID","type":"text","read_only":false,"active":true,"many":false},{"icon":"ti-clock-plus","id":"created_at","label":"Created","many":false,"read_only":true,"active":true,"type":"datetime"},{"icon":"ti-clock-edit","id":"updated_at","label":"Modified","many":false,"read_only":true,"active":true,"type":"datetime"},{"icon":"ti-code","id":"settings_json","label":"Settings JSON","type":"text","read_only":false,"active":true,"many":false},{"icon":"ti-abc","id":"title","label":"Title","many":false,"read_only":false,"active":true,"type":"text"},{"icon":"ti-photo","id":"banner","label":"Banner","many":false,"read_only":false,"active":true,"type":"banner"},{"icon":"ti-align-left","id":"icon","label":"Icon","many":false,"read_only":false,"active":true,"type":"text"}],"sidebar_record_sort_dir":"desc","sidebar_record_sort_field_id":"updated_at","managed":{"fields":false,"views":false,"sidebar":false},"custom":{},"views":[{"id":"V0YBPGDDZ0MHRSQ","shown":true,"icon":"ti-table","label":"All","description":"","field_ids":["title","plugin","record_kind","plugin_id","created_at","updated_at"],"type":"table","read_only":false,"group_by_field_id":null,"sort_dir":"desc","sort_field_id":"updated_at","opts":{}},{"id":"VPGAWVGVKZD57C9","shown":true,"icon":"ti-layout-kanban","label":"By Plugin...","description":"","field_ids":["title","record_kind","created_at","updated_at"],"type":"board","read_only":false,"group_by_field_id":"plugin","sort_dir":"desc","sort_field_id":"updated_at","opts":{}}]}'
-);
-
-function htDedicatedHabitsCollectionShape() {
-  try {
-    return typeof structuredClone === 'function'
-      ? structuredClone(HT_DEDICATED_COLL_BASE)
-      : JSON.parse(JSON.stringify(HT_DEDICATED_COLL_BASE));
-  } catch (_) {
-    return JSON.parse(JSON.stringify(HT_DEDICATED_COLL_BASE));
-  }
-}
-
-/**
- * Same host as embedded `ThymerPluginSettings` `getSharedDeduplicationWindow` / `queueDataCreateOnSharedWindow`.
- * Plugin iframes must attach `__thymerExtSerializedDataCreateP_v1` here or `createCollection()` can resolve null.
- */
-function htGetSharedDeduplicationWindow() {
-  const gRef = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : globalThis;
-  try {
-    if (typeof window === 'undefined') return gRef;
-    const t = window.top;
-    if (t) {
-      void t.document;
-      return t;
-    }
-  } catch (_) {
-    /* cross-origin top */
-  }
-  try {
-    let w = typeof window !== 'undefined' ? window : null;
-    let best = w || gRef;
-    while (w) {
-      try {
-        void w.document;
-        best = w;
-      } catch (_) {
-        break;
-      }
-      if (w === w.top) break;
-      w = w.parent;
-    }
-    return best;
-  } catch (_) {
-    return typeof window !== 'undefined' ? window : gRef;
-  }
-}
-
-// ── YNAB journal widget (shared localStorage / SK with YNAB collection plugin) ─
-// ─────────────────────────────────────────────────────────────────────────────
-// CONSTANTS
-// ─────────────────────────────────────────────────────────────────────────────
-
-const YNAB_COLLECTION_NAME = 'YNAB';
-const CACHE_TTL_MS  = 15 * 60 * 1000;
-const CHART_JS_URL  = 'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js';
-
-// Colors
-// Widget bg matches Backreferences / Today's Notes card exactly (rgba(30,30,36,0.60))
-// Green is now a deeper forest: #1e5c35
-const C = {
-  green:     '#1e5c35',
-  greenRgb:  '30, 92, 53',
-  prevLine:  'rgba(140, 130, 110, 0.40)',
-  avgLine:   'rgba(110, 100, 88, 0.90)',
-  axisText:  '#6e6458',
-  statLabel: '#8a7e6a',
-  text:      '#e8e0d0',
-  textMuted: '#8a7e6a',
-  // Exact match to Backreferences card bg (Today's Notes plugin confirmed values)
-  cardBg:    'rgba(30, 30, 36, 0.60)',
-  cardBorder:'rgba(255, 255, 255, 0.10)',
-  hoverBg:   '#2a241f',
-};
-
-const SK = {
-  TOKEN:           'ynab_pat',
-  BUDGET_ID:       'ynab_budget_id',
-  BUDGET_NAME:     'ynab_budget_name',
-  CACHE_TXN:       'ynab_txn_cache_v4',
-  CACHE_CATS:      'ynab_cats_v4',
-  CACHE_CATS_TS:   'ynab_cats_ts_v4',
-  CACHE_TS:        'ynab_txn_cache_ts',
-  EXCLUDED_GROUPS: 'ynab_excluded_groups',
-  WIDGET_PERIOD:   'ynab_widget_period',
-  WIDGET_CHART:    'ynab_widget_chart',
-  WIDGET_COMPARE:  'ynab_widget_compare',
-  WIDGET_AVG:      'ynab_widget_avg',
-  WIDGET_COLLAPSE: 'ynab_widget_collapse',
-  DASH_FROM:       'ynab_dash_from',
-  DASH_TO:         'ynab_dash_to',
-  EXCL_PAYEES:     'ynab_excl_payees',
-  INCL_PAYEES:     'ynab_incl_payees_v4',   // null = not yet configured (use defaults)
-};
-
-// Default excluded expense category groups
-// Default excluded payee keywords for income filter
-const DEFAULT_EXCLUDED = [
-  'Inflow: Ready to Assign',
-  'Internal Master Category',
-  'Credit Card Payments',
-];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// UTILS
-// ─────────────────────────────────────────────────────────────────────────────
-
-const ls      = k    => { try { return localStorage.getItem(k); } catch { return null; } };
-function ynabShouldFlushKey(key) {
-  // High-churn cache keys should never trigger Plugin Backend sync flushes.
-  return !(
-    key === SK.CACHE_TXN ||
-    key === SK.CACHE_TS ||
-    key === SK.CACHE_CATS ||
-    key === SK.CACHE_CATS_TS
-  );
-}
-function ynabPluginSettingsFlush() {
-  try {
-    const p = globalThis.__ynabPluginSettingsPlugin;
-    if (p) globalThis.ThymerPluginSettings?.scheduleFlush?.(p, () => Object.values(SK));
-  } catch (_) {}
-}
-const lsSet   = (k,v)=> {
-  try { localStorage.setItem(k, String(v)); } catch {}
-  if (ynabShouldFlushKey(k)) ynabPluginSettingsFlush();
-};
-const lsJson  = (k,d)=> { try { const v = ls(k); return v ? JSON.parse(v) : d; } catch { return d; } };
-const lsJsonSet=(k,v)=> {
-  try { localStorage.setItem(k, JSON.stringify(v)); } catch {}
-  if (ynabShouldFlushKey(k)) ynabPluginSettingsFlush();
-};
-const sleep   = ms   => new Promise(r => setTimeout(r, ms));
-
-function fmt(n) {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n);
-}
-
-function journalDateFromGuid(guid) {
-  if (!guid || guid.length < 8) return null;
-  const s = guid.slice(-8);
-  if (!/^\d{8}$/.test(s)) return null;
-  const year  = parseInt(s.slice(0, 4), 10);
-  const month = parseInt(s.slice(4, 6), 10);
-  const day   = parseInt(s.slice(6, 8), 10);
-  if (year < 2000 || year > 2099 || month < 1 || month > 12 || day < 1 || day > 31) return null;
-  return { year, month, day, yyyymmdd: s };
-}
-
-/** Same shape as journalDateFromGuid; falls back to journal details when GUID suffix is not YYYYMMDD. */
-function journalDateFromRecord(record) {
-  if (!record) return null;
-  const fromGuid = journalDateFromGuid(record.guid);
-  if (fromGuid) return fromGuid;
-  try {
-    const jd = record.getJournalDetails?.();
-    const d = jd?.date;
-    if (d instanceof Date && !isNaN(d.getTime())) {
-      const year = d.getFullYear();
-      const month = d.getMonth() + 1;
-      const day = d.getDate();
-      const yyyymmdd = `${year}${String(month).padStart(2, '0')}${String(day).padStart(2, '0')}`;
-      return { year, month, day, yyyymmdd };
-    }
-  } catch {}
-  return null;
-}
-
-// Returns YYYY-MM-DD string
-function dateStr(d) { return d.toISOString().slice(0, 10); }
-
-// Date range presets — all return { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' }
-function presets() {
-  const now   = new Date();
-  const y     = now.getFullYear();
-  const m     = now.getMonth();
-
-  const firstOfMonth = new Date(y, m, 1);
-  const lastOfMonth  = new Date(y, m + 1, 0);
-  const firstOfLastMonth = new Date(y, m - 1, 1);
-  const lastOfLastMonth  = new Date(y, m, 0);
-  const firstOfYear  = new Date(y, 0, 1);
-  const firstOfLastYear  = new Date(y - 1, 0, 1);
-  const lastOfLastYear   = new Date(y - 1, 11, 31);
-
-  return [
-    { label: 'This Month',  from: dateStr(firstOfMonth),    to: dateStr(lastOfMonth) },
-    { label: 'Last Month',  from: dateStr(firstOfLastMonth), to: dateStr(lastOfLastMonth) },
-    { label: 'YTD',         from: dateStr(firstOfYear),     to: dateStr(now) },
-    { label: 'Last Year',   from: dateStr(firstOfLastYear), to: dateStr(lastOfLastYear) },
-    { label: 'Last 90d',    from: dateStr(new Date(now - 90*864e5)), to: dateStr(now) },
-    { label: 'All Time',    from: '2000-01-01',             to: dateStr(now) },
-  ];
-}
-
-// Income filter — returns true if transaction should be counted as income.
-// Uses the explicit payee include list if configured, else falls back to
-// excluding payees that contain "transfer" or "starting".
-function isIncomeTransaction(t, allTxns) {
-  if (t.type !== 'income') return false;
-  const raw = ls(SK.INCL_PAYEES);
-  if (raw) {
-    const incl = new Set(JSON.parse(raw));
-    return incl.has(t.payee);
-  }
-  // Default: exclude transfer-like payees
-  return !['transfer','starting'].some(kw => t.payee.toLowerCase().includes(kw));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CHART.JS LOADER
-// ─────────────────────────────────────────────────────────────────────────────
-
-let _chartLoad = null;
-function loadChartJs() {
-  if (window.Chart) return Promise.resolve();
-  if (_chartLoad) return _chartLoad;
-  _chartLoad = new Promise((res, rej) => {
-    const s = document.createElement('script');
-    s.src = CHART_JS_URL; s.onload = res; s.onerror = rej;
-    document.head.appendChild(s);
-  });
-  return _chartLoad;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// YNAB API
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function ynabGet(path, token) {
-  const r = await fetch(`https://api.ynab.com/v1${path}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!r.ok) {
-    const e = await r.json().catch(() => ({}));
-    throw new Error(e?.error?.detail || `YNAB ${r.status}`);
-  }
-  return r.json();
-}
-
-async function apiFetchBudgets(token) {
-  return (await ynabGet('/budgets', token)).data.budgets;
-}
-
-async function apiFetchTransactions(token, budgetId) {
-  return (await ynabGet(`/budgets/${budgetId}/transactions`, token)).data.transactions;
-}
-
-async function apiFetchCategories(token, budgetId) {
-  const d = await ynabGet(`/budgets/${budgetId}/categories`, token);
-  return d.data.category_groups;
-}
-
-// Build a map of category_id → group_name from the categories endpoint
-async function buildCategoryGroupMap(token, budgetId) {
-  const ts = ls(SK.CACHE_CATS_TS);
-  if (ts && Date.now() - parseInt(ts, 10) < CACHE_TTL_MS) {
-    const cached = lsJson(SK.CACHE_CATS, null);
-    if (cached) return cached;
-  }
-  const groups = await apiFetchCategories(token, budgetId);
-  const map = {};
-  for (const group of groups) {
-    for (const cat of (group.categories || [])) {
-      map[cat.id] = group.name;
-    }
-  }
-  lsJsonSet(SK.CACHE_CATS, map);
-  lsSet(SK.CACHE_CATS_TS, Date.now());
-  return map;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TRANSACTION PROCESSING  — transfers are DROPPED here, never synced
-// ─────────────────────────────────────────────────────────────────────────────
-
-function processTxns(raw, groupMap = {}) {
-  const results = [];
-
-  for (const t of raw) {
-    if (t.deleted) continue;
-    if (t.transfer_account_id) continue; // skip top-level transfers
-
-    const isSplit = Array.isArray(t.subtransactions) && t.subtransactions.length > 0;
-
-    if (isSplit) {
-      // Expand each subtransaction into its own record.
-      // The parent has the payee, date, account, cleared — subs have amount + category.
-      for (const sub of t.subtransactions) {
-        if (sub.deleted) continue;
-        if (sub.transfer_account_id) continue; // skip transfer legs within splits
-
-        results.push({
-          id:             `${t.id}_${sub.id}`, // unique ID per sub-line
-          date:           t.date,
-          payee:          t.payee_name || '',
-          amount:         sub.amount / 1000,
-          category:       sub.category_name || 'Uncategorized',
-          category_group: (sub.category_id && groupMap[sub.category_id]) || 'Uncategorized',
-          memo:           sub.memo || t.memo || '',
-          account:        t.account_name || '',
-          cleared:        t.cleared,
-          type:           sub.amount > 0 ? 'income' : 'expense',
-          is_split:       true,
-        });
-      }
-    } else {
-      // Normal (non-split) transaction
-      results.push({
-        id:             t.id,
-        date:           t.date,
-        payee:          t.payee_name || '',
-        amount:         t.amount / 1000,
-        category:       t.category_name || 'Uncategorized',
-        category_group: (t.category_id && groupMap[t.category_id]) || 'Uncategorized',
-        memo:           t.memo || '',
-        account:        t.account_name || '',
-        cleared:        t.cleared,
-        type:           t.amount > 0 ? 'income' : 'expense',
-        is_split:       false,
-      });
-    }
-  }
-
-  return results;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CACHE
-// ─────────────────────────────────────────────────────────────────────────────
-
-function getCached() {
-  const ts = ls(SK.CACHE_TS);
-  if (!ts || Date.now() - parseInt(ts, 10) > CACHE_TTL_MS) return null;
-  return lsJson(SK.CACHE_TXN, null);
-}
-function setCache(txns) { lsJsonSet(SK.CACHE_TXN, txns); lsSet(SK.CACHE_TS, Date.now()); }
-function bustCache()    { lsSet(SK.CACHE_TS, '0'); }
-
-async function getTransactions(force = false) {
-  if (!force) { const c = getCached(); if (c) return c; }
-  const token = ls(SK.TOKEN), budgetId = ls(SK.BUDGET_ID);
-  if (!token || !budgetId) throw new Error('YNAB not configured');
-  // Fetch both in parallel — categories for the group lookup map
-  const [rawTxns, groupMap] = await Promise.all([
-    apiFetchTransactions(token, budgetId),
-    buildCategoryGroupMap(token, budgetId),
-  ]);
-  const txns = processTxns(rawTxns, groupMap);
-  setCache(txns);
-  return txns;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BUCKETING  (widget chart only)
-// ─────────────────────────────────────────────────────────────────────────────
-
-function bucketData(txns, refDate, period, compare, showAvg) {
-  // txns is expected to already be filtered to income-only transactions
-  const income = txns;
-  let tipDates = null;
-  let labels = [], cur = [], prev = null, curTotal = 0, prevTotal = null, avg = null;
-
-  if (period === 'daily') {
-    const N = 30;
-    tipDates = [];
-    for (let i = N - 1; i >= 0; i--) {
-      const d = new Date(refDate); d.setDate(d.getDate() - i);
-      const k = dateStr(d);
-      labels.push(k.slice(5).replace('-', '.'));
-      tipDates.push(k);
-      cur.push(income.filter(t => t.date === k).reduce((a, t) => a + t.amount, 0));
-    }
-    curTotal = income.filter(t => t.date === dateStr(refDate)).reduce((a, t) => a + t.amount, 0);
-    if (compare) {
-      prev = [];
-      for (let i = N - 1; i >= 0; i--) {
-        const d = new Date(refDate); d.setDate(d.getDate() - i - N);
-        prev.push(income.filter(t => t.date === dateStr(d)).reduce((a, t) => a + t.amount, 0));
-      }
-      const yd = new Date(refDate); yd.setDate(yd.getDate() - 1);
-      prevTotal = income.filter(t => t.date === dateStr(yd)).reduce((a, t) => a + t.amount, 0);
-    }
-    if (showAvg) avg = cur.reduce((a, b) => a + b, 0) / cur.length;
-
-  } else if (period === 'weekly') {
-    const N = 12;
-    const wkStart = d => { const dt = new Date(d); dt.setDate(dt.getDate() - dt.getDay()); dt.setHours(0,0,0,0); return dt; }; // Sunday start, matches Coda
-    const ws = wkStart(refDate);
-    tipDates = [];
-    for (let i = N - 1; i >= 0; i--) {
-      const s = new Date(ws); s.setDate(s.getDate() - i*7);
-      const e = new Date(s);  e.setDate(e.getDate() + 6);
-      const wkNum = (() => {
-        const tmp = new Date(s); tmp.setHours(0,0,0,0);
-        const jan1 = new Date(tmp.getFullYear(), 0, 1);
-        return Math.ceil(((tmp - jan1) / 86400000 + jan1.getDay() + 1) / 7);
-      })();
-      const wkMMDD = dateStr(s).slice(5).replace('-', '.');
-      labels.push(`w${String(wkNum).padStart(2,'0')} · ${wkMMDD}`);
-      tipDates.push(dateStr(s));
-      cur.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
-    }
-    const wse = new Date(ws); wse.setDate(wse.getDate()+6);
-    curTotal = income.filter(t => t.date >= dateStr(ws) && t.date <= dateStr(wse)).reduce((a,t)=>a+t.amount,0);
-    if (compare) {
-      // Overlay: each bar's comparison is the equivalent week 1 year ago
-      // prevTotal: simply the week immediately before the current one
-      const lastWS = new Date(ws); lastWS.setDate(lastWS.getDate() - 7);
-      const lastWE = new Date(lastWS); lastWE.setDate(lastWE.getDate() + 6);
-      prevTotal = income.filter(t => t.date >= dateStr(lastWS) && t.date <= dateStr(lastWE)).reduce((a,t)=>a+t.amount,0);
-      // Overlay line: shift each displayed week back by exactly 1 week
-      prev = [];
-      for (let i = N - 1; i >= 0; i--) {
-        const s = new Date(ws); s.setDate(s.getDate() - i*7 - 7);
-        const e = new Date(s);  e.setDate(e.getDate()+6);
-        prev.push(income.filter(t => t.date >= dateStr(s) && t.date <= dateStr(e)).reduce((a,t)=>a+t.amount,0));
-      }
-    }
-    if (showAvg) { const nz = cur.filter(v=>v>0); avg = nz.length ? nz.reduce((a,b)=>a+b,0)/nz.length : 0; }
-
-  } else { // monthly
-    const N = 12;
-    for (let i = N - 1; i >= 0; i--) {
-      const d  = new Date(refDate.getFullYear(), refDate.getMonth()-i, 1);
-      const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-      labels.push(d.toLocaleString('default',{month:'short',year:'2-digit'}));
-      cur.push(income.filter(t=>t.date.startsWith(key)).reduce((a,t)=>a+t.amount,0));
-    }
-    const ck = `${refDate.getFullYear()}-${String(refDate.getMonth()+1).padStart(2,'0')}`;
-    curTotal = income.filter(t=>t.date.startsWith(ck)).reduce((a,t)=>a+t.amount,0);
-    if (compare) {
-      const pd = new Date(refDate.getFullYear(), refDate.getMonth()-N, 1);
-      prev = [];
-      for (let i = 0; i < N; i++) {
-        const d = new Date(pd.getFullYear(), pd.getMonth()+i, 1);
-        const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
-        prev.push(income.filter(t=>t.date.startsWith(k)).reduce((a,t)=>a+t.amount,0));
-      }
-      prevTotal = prev[prev.length-1] ?? 0;
-    }
-    if (showAvg) { const nz = cur.filter(v=>v>0); avg = nz.length ? nz.reduce((a,b)=>a+b,0)/nz.length : 0; }
-  }
-
-  return { labels, cur, prev, curTotal, prevTotal, avg, tipDates };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CSS (YNAB journal widget for Header Suite)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const JHS_YNAB_WIDGET_CSS = `
-  /* YNAB journal income widget — scoped to Journal Header Suite (no outer card chrome) */
-  .jhs-shell .jhs-body .ynab-widget {
-    background: transparent !important;
-    border: none !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    border-radius: 0 !important;
-    box-shadow: none !important;
-  }
-  /* (inner widget chrome) */
-  .ynab-widget {
-    background-color: ${C.cardBg};
-    border: 1px solid ${C.cardBorder};
-    border-radius: 10px;
-    padding: 10px 16px 10px;
-    margin: 0;
-    width: 100%;
-    font-size: 13px;
-    color: ${C.text};
-  }
-  .ynab-widget-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 28px;
-  }
-  .ynab-w-toggle {
-    font-size: 13px;
-    color: ${C.statLabel};
-    cursor: pointer;
-    padding: 0 3px;
-    flex-shrink: 0;
-    background: none;
-    border: none;
-    line-height: 1;
-  }
-  .ynab-w-title {
-    font-weight: 600;
-    font-size: 13px;
-    flex-shrink: 0;
-  }
-  .ynab-w-controls {
-    display: flex;
-    gap: 5px;
-    flex-wrap: wrap;
-    margin-left: auto;
-  }
-  .ynab-tgroup {
-    display: flex;
-    gap: 2px;
-    background: rgba(255,255,255,0.05);
-    border-radius: 6px;
-    padding: 2px;
-  }
-  .ynab-tbtn {
-    background: transparent;
-    border: none;
-    color: ${C.statLabel};
-    font-size: 11px;
-    padding: 2px 7px;
-    border-radius: 4px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.12s;
-    line-height: 1.4;
-  }
-  .ynab-tbtn:hover { color: ${C.text}; background: rgba(255,255,255,0.07); }
-  .ynab-tbtn.active {
-    background: rgba(${C.greenRgb}, 0.25);
-    color: #3d8f58;
-    font-weight: 600;
-  }
-
-  .ynab-widget-body { margin-top: 10px; }
-
-  /* Filter chips in widget */
-  .ynab-w-filter-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    margin-bottom: 14px;
-    align-items: center;
-  }
-  .ynab-w-filter-label {
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    color: ${C.statLabel};
-    flex-shrink: 0;
-    margin-right: 2px;
-  }
-  .ynab-w-chip {
-    font-size: 10px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    border: 1px solid rgba(${C.greenRgb}, 0.35);
-    background: rgba(${C.greenRgb}, 0.14);
-    color: #3d8f58;
-    cursor: pointer;
-    transition: all 0.12s;
-    line-height: 1.5;
-  }
-  .ynab-w-chip:hover { background: rgba(${C.greenRgb}, 0.22); }
-  .ynab-w-chip.off {
-    background: rgba(255,255,255,0.04);
-    border-color: rgba(255,255,255,0.09);
-    color: ${C.statLabel};
-    text-decoration: line-through;
-  }
-
-  .ynab-stat-row {
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
-    margin-bottom: 10px;
-    align-items: baseline;
-  }
-  .ynab-stat-chip {
-    background: transparent;
-    border-radius: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    min-width: 0;
-  }
-  .ynab-stat-chip.pos .ynab-sv { color: #3d8f58; }
-  .ynab-stat-chip.neg .ynab-sv { color: #b84040; }
-  .ynab-sl {
-    font-size: 9px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: ${C.statLabel};
-    opacity: 0.92;
-  }
-  .ynab-sv {
-    font-size: 13px;
-    font-weight: 500;
-    color: ${C.text};
-    opacity: 0.88;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .ynab-canvas-wrap { position: relative; height: 140px; margin-bottom: 5px; }
-  .ynab-status { font-size: 10px; color: ${C.statLabel}; text-align: right; font-style: italic; }
-  .ynab-notice { font-size: 12px; color: ${C.statLabel}; padding: 6px 0; font-style: italic; }
-  .ynab-cfg-link { color: #3d8f58; text-decoration: none; }
-  .ynab-cfg-link:hover { text-decoration: underline; }
-
-  .ynab-gear-btn {
-    background: rgba(255,255,255,0.035); border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 5px; color: #8a7e6a; font-size: 11px; padding: 2px 8px;
-    cursor: pointer; transition: all 0.12s; white-space: nowrap; line-height: 1.5;
-  }
-  .ynab-gear-btn:hover { background: rgba(255,255,255,0.07); color: #d7cfbf; }
-  .ynab-filter-summary { font-size: 10px; color: rgba(110, 100, 88, 0.82); font-style: italic; padding: 2px 0; }
-
-  /* Header control row: minimalist, text-led active state */
-  .jhs-ynab-controls .ynab-tgroup {
-    background: transparent;
-    border-radius: 0;
-    padding: 0;
-    gap: 10px;
-  }
-  .jhs-ynab-controls .ynab-tgroup + .ynab-tgroup {
-    margin-left: 4px;
-    padding-left: 14px;
-    border-left: 1px solid rgba(255,255,255,0.075);
-  }
-  .jhs-ynab-controls .ynab-tbtn {
-    padding: 1px 0;
-    border-radius: 0;
-    background: transparent;
-    color: rgba(232, 224, 208, 0.5);
-    font-size: 11px;
-    letter-spacing: 0.015em;
-  }
-  .jhs-ynab-controls .ynab-tbtn:hover {
-    background: transparent;
-    color: rgba(232, 224, 208, 0.86);
-  }
-  .jhs-ynab-controls .ynab-tbtn.active {
-    background: transparent;
-    color: #3d8f58;
-    font-weight: 600;
-  }
-`;
-
-
-const JHS_KEY = 'jhs_config_v1';
-/** Full habit config (categories + habits) mirrored in localStorage on each save — survives plugin reload; export for off-site backup. */
-const HT_HABIT_CONFIG_BACKUP_KEY = 'jhs_habit_config_backup_v1';
-/** Same order of magnitude as Journal Footer Suite `TN_PANEL_DEBOUNCE_MS` — coalesces navigated+focused bursts. */
-const JHS_PANEL_DEBOUNCE_MS = 350;
-/** First paint after load: run after footer suite’s initial `100ms + debounce` wave so the journal shell is not competing with Today’s Notes / Highlights mount. */
-const JHS_INITIAL_MOUNT_DELAY_MS = 480;
-/** Per-collection / default visibility for the suite shell (Backreferences-style; default = visible everywhere). */
-const JHS_VISIBILITY_KEY = 'journal_header_suite_visibility_v1';
-const JHS_DEFAULTS = {
-  activeTab: 'ynab',
-  enabled: { ynab: true, habit: true, gallery: true },
-  collapsed: false,
-  /** When true, image grid mounts in a detached host below the suite shell (works on YNAB / Habits tabs). */
-  galleryDockExpanded: false,
-};
-
-const JHS_TABS = [
-  { id: 'ynab', label: 'YNAB', icon: 'ti-coin' },
-  { id: 'habit', label: 'Habits', icon: 'ti-flame' },
-  { id: 'gallery', label: 'Gallery', icon: 'ti-photo' },
-];
-
-/** Journal habit list + Manage Habits category cards: single-column when `'1'` (always stored in localStorage). */
-const HT_HABIT_LAYOUT_SINGLE_COLUMN_KEY = 'ht_settings_habit_board_single_column';
-
-/** Opt-in habits pipeline logs. In devtools: `localStorage.setItem('thymerext_debug_ht_habits','1'); location.reload()` — filter `[JHS/Habits]`. */
-function htHabitsDbg(payload) {
-  try {
-    const o = localStorage.getItem('thymerext_debug_ht_habits');
-    if (o !== '1' && o !== 'true' && o !== 'on') return;
-  } catch (_) {
-    return;
-  }
-  try {
-    const row = typeof payload === 'object' && payload !== null && !Array.isArray(payload) ? payload : { msg: payload };
-    console.info('[JHS/Habits]', row);
-  } catch (_) {}
-}
-
-/** Opt-in gallery dock pipeline logs. Devtools: `localStorage.setItem('thymerext_debug_jhs_gallery_dock','1'); location.reload()` — filter `[JHS/GalleryDock]`. */
-function jhsGalleryDockDbg(payload) {
-  try {
-    const o = localStorage.getItem('thymerext_debug_jhs_gallery_dock');
-    if (o !== '1' && o !== 'true' && o !== 'on') return;
-  } catch (_) {
-    return;
-  }
-  try {
-    const row = typeof payload === 'object' && payload !== null && !Array.isArray(payload) ? payload : { msg: payload };
-    console.info('[JHS/GalleryDock]', row);
-  } catch (_) {}
-}
-
-// ═══ Habit Tracker (ThymerHabitTracker port — plugin_id habit-tracker; config+log live in dedicated "Habit Logs" collection) ═══
-const HT_PS_SLUG = 'habit-tracker';
-const HT_PS_ROW_CONFIG = 'habit-tracker:config';
-const HT_PS_MIGRATE_KEY = 'ht_global_ps_migration_v1';
-const HT_LOG_ROWS_CACHE_TTL_MS = 4000;
-/** When auto-rebuilding habits from log `completions`, only ids last seen within this window, and cap count (stale ids / old plugins would otherwise create dozens of ghosts). */
-const HT_RECOVER_LOG_LOOKBACK_DAYS = 210;
-const HT_RECOVER_MAX_HABITS = 24;
-const HT_RECOVER_HABIT_ID_KEY_RE = /^[a-z0-9]{6,14}$/i;
-function htPsRowLog(dateStr) {
-  return `${HT_PS_SLUG}:log:${dateStr}`;
-}
-
-// ─── CSS ─────────────────────────────────────────────────────────────────────
-const HT_CSS = `
-  @import url('https://cdn.jsdelivr.net/npm/tabler-icons@latest/tabler-icons.css');
-
-  /* ── Sidebar panel wrapper ──
-     Frosted glass look matching Backreferences / Today's Notes.
-     Sits as an overlay on the right edge of the page content area.
-  ── */
-  .ht-sidebar {
-    /* inline card — sits in the page content flow like Backreferences */
-    display: block;
-    width: 100%;
-    margin: 0 0 16px 0;
-    background: rgba(30, 28, 36, 0.65);
-    backdrop-filter: blur(18px) saturate(1.4);
-    -webkit-backdrop-filter: blur(18px) saturate(1.4);
-    border: 1px solid rgba(255, 255, 255, 0.09);
-    border-radius: 12px;
-    overflow: hidden;
-    font-family: var(--font-family, sans-serif);
-    font-size: 13px;
-    color: #e8e0d0;
-  }
-  .ht-sidebar.ht-collapsed .ht-sidebar-body {
-    display: none;
-  }
-
-  /* ── Header ── */
-  .ht-sidebar-header {
-    display: flex;
-    align-items: center;
-    padding: 10px 14px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-    gap: 8px;
-    min-height: 40px;
-  }
-  .ht-toggle-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: #8a7e6a;
-    padding: 0 2px;
-    font-size: 15px;
-    font-weight: 600;
-    line-height: 1;
-    flex-shrink: 0;
-    transition: color 0.1s;
-    min-width: 16px;
-    text-align: center;
-  }
-  .ht-toggle-btn:hover { color: #e8e0d0; }
-  .ht-nav-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: #8a7e6a;
-    font-size: 16px;
-    line-height: 1;
-    padding: 0 3px;
-    border-radius: 4px;
-    flex-shrink: 0;
-    transition: color 0.1s;
-  }
-  .ht-nav-btn:hover { color: #e8e0d0; background: rgba(255,255,255,0.07); }
-  /* Date nav + header controls: readable on dark backgrounds (avoid near-invisible “next” on Today). */
-  .ht-sidebar-header > .ht-nav-btn {
-    color: rgba(232, 224, 208, 0.82);
-  }
-  .ht-sidebar-header > .ht-nav-btn:hover {
-    color: #e8e0d0;
-  }
-  .ht-sidebar-header .ht-nav-btn.ht-nav-btn-muted {
-    pointer-events: none;
-    opacity: 1;
-    color: rgba(232, 224, 208, 0.52);
-  }
-  .ht-nav-btn.active {
-    color: #c4b8ff;
-    background: rgba(124, 106, 247, 0.14);
-  }
-  .ht-ribbon-toggle.active {
-    color: #c4b8ff;
-    background: rgba(124, 106, 247, 0.14);
-  }
-  .ht-sidebar-title {
-    font-weight: 700;
-    font-size: 13px;
-    color: #e8e0d0;
-    white-space: nowrap;
-    flex: 1;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .ht-sidebar .ti,
-  .ht-stats-view .ti,
-  .ht-modal .ti,
-  .ht-importer-overlay .ti {
-    font-size: 1.1em;
-    vertical-align: -0.12em;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .ht-empty-icon .ti { font-size: 28px; opacity: 0.85; vertical-align: middle; }
-  .ht-stats-btn .ti,
-  .ht-nav-btn .ti { font-size: 17px; }
-  .ht-nav-btn.ht-cat-expand-toggle {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 22px;
-    min-height: 22px;
-    padding: 0 2px;
-    box-sizing: border-box;
-  }
-  .ht-nav-btn.ht-cat-expand-toggle .ti {
-    font-size: 18px;
-    opacity: 1;
-  }
-  .ht-toggle-btn .ti { font-size: 15px; }
-  .ht-category-caret .ti { font-size: 9px; color: #8a7e6a; }
-  .ht-category-status .ti { font-size: 13px; }
-  .ht-category-streak .ti { font-size: 11px; opacity: 0.88; }
-  .ht-habit-check .ti { font-size: 14px; color: rgba(130, 188, 156, 0.88); }
-  .ht-habit-ring-label .ti { font-size: 13px; display: block; margin-top: 1px; }
-  .ht-modal-close .ti { font-size: 16px; }
-  .ht-modal-title .ti { font-size: 17px; vertical-align: -0.18em; margin-right: 2px; }
-  .ht-btn .ti { font-size: 14px; margin-right: 0.25em; vertical-align: -0.18em; }
-  .ht-item-sub .ti { font-size: 10px; vertical-align: -0.12em; opacity: 0.95; }
-  .ht-modal-body .ti { vertical-align: middle; }
-  .ht-date-label {
-    font-size: 12px;
-    color: #8a7e6a;
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-
-  /* collapsed state — just hide the body, header stays visible */
-  .ht-sidebar.ht-collapsed .ht-sidebar-header {
-    border-bottom: none;
-  }
-
-  /* ── Body ── */
-  .ht-sidebar-body {
-    padding: 8px 0 12px;
-  }
-  .ht-sidebar-cats {
-    transition: opacity 0.1s ease;
-  }
-  .ht-sidebar-cats.ht-fading { opacity: 0; }
-  .ht-stats-content {
-    transition: opacity 0.12s ease;
-  }
-  .ht-stats-content.ht-fading { opacity: 0; }
-
-  /* ── Progress bar ── */
-  .ht-progress {
-    margin: 4px 14px 8px;
-    height: 2px;
-    background: rgba(255,255,255,0.08);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  .ht-progress-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.35s ease, background 0.35s ease;
-    /* Inline style sets gradient from htCategoryProgressFillStyle */
-    background: rgba(72, 150, 112, 0.55);
-  }
-
-  /* ── Day notes (under habit list) ── */
-  .ht-notes-wrap {
-    margin: 10px 14px 4px;
-    padding-top: 8px;
-    border-top: 1px solid rgba(255, 255, 255, 0.07);
-  }
-  .ht-notes-label {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: #8a7e6a;
-    margin-bottom: 6px;
-  }
-  .ht-notes-input {
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-    min-height: 2.8em;
-    max-height: 120px;
-    overflow-y: auto;
-    resize: vertical;
-    font-family: inherit;
-    font-size: 12px;
-    line-height: 1.35;
-    color: #e8e0d0;
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 6px;
-    padding: 6px 8px;
-    margin: 0;
-  }
-  .ht-notes-input::placeholder {
-    color: rgba(138, 126, 106, 0.75);
-  }
-  .ht-notes-input:focus {
-    outline: none;
-    border-color: rgba(124, 106, 247, 0.45);
-    background: rgba(0, 0, 0, 0.32);
-  }
-
-  /* ── Category block ── */
-  .ht-category {
-    margin: 0 0 16px 0;
-  }
-  .ht-category-header {
-    display: block;
-    padding: 5px 10px;
-    cursor: pointer;
-    border-radius: 5px;
-    margin: 0 4px;
-    user-select: none;
-    transition: background 0.1s;
-  }
-  .ht-category-header:hover { background: rgba(255,255,255,0.06); }
-  .ht-category-header-inner {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-start;
-    flex-wrap: wrap;
-    width: 100%;
-    gap: 6px;
-    min-height: 20px;
-  }
-  .ht-ch-lead-spacer {
-    display: none;
-  }
-  .ht-ch-cat-done-wrap {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    margin-right: 0;
-    padding-right: 1px;
-    min-width: 14px;
-    min-height: 16px;
-  }
-  .ht-ch-cat-marked {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    margin-left: 3px;
-    width: 6px;
-    height: 16px;
-    flex-shrink: 0;
-  }
-  .ht-cat-marked-dot {
-    display: inline-block;
-    width: 4px;
-    height: 4px;
-    border-radius: 999px;
-    background: rgba(196, 184, 255, 0.70);
-    box-shadow: 0 0 6px rgba(196, 184, 255, 0.22);
-    opacity: 0.95;
-  }
-  .ht-cat-inline-na,
-  .ht-cat-inline-fail {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-  }
-  /* Category N/A: short vertical bar (collapsed + expanded headers). */
-  .ht-cat-na-bar {
-    display: inline-block;
-    width: 2px;
-    height: 12px;
-    border-radius: 1px;
-    background: linear-gradient(
-      180deg,
-      rgba(218, 185, 110, 0.95),
-      rgba(168, 132, 58, 0.82)
-    );
-    box-shadow: 0 0 5px rgba(200, 165, 72, 0.2);
-    vertical-align: middle;
-  }
-  .ht-ch-cat-done-wrap .ht-cat-na-bar {
-    height: 12px;
-  }
-  .ht-cat-inline-check {
-    display: inline-flex;
-    align-items: center;
-    line-height: 1;
-    color: #5ad389;
-  }
-  .ht-cat-inline-check .ti {
-    font-size: 12px;
-    opacity: 0.92;
-  }
-  /* Category: every habit done today — double-check + sherbet shimmer (matches year-tier streak styling) */
-  .ht-cat-inline-check--all-done {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-    animation: ht-cat-all-done-sparkle 2.8s ease-in-out infinite;
-  }
-  .ht-cat-inline-check--all-done .ti {
-    font-size: 13px;
-    opacity: 1;
-    background: repeating-linear-gradient(
-      90deg,
-      #fff8ea 0px,
-      #ffe8c8 40px,
-      #ffc888 80px,
-      #ff9848 120px,
-      #f04838 160px,
-      #ff9848 200px,
-      #ffc888 240px,
-      #ffe8c8 280px,
-      #fff8ea 320px
-    );
-    background-size: 320px 100%;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    -webkit-text-fill-color: transparent;
-    animation: ht-streak-sherbet-flow 11s linear infinite;
-  }
-  @keyframes ht-cat-all-done-sparkle {
-    0%, 100% { filter: drop-shadow(0 0 1px rgba(255, 210, 140, 0.35)); }
-    50% { filter: drop-shadow(0 0 7px rgba(255, 185, 100, 0.65)); }
-  }
-  .ht-ch-cluster .ht-category-streak {
-    margin-left: 3px;
-    flex-shrink: 0;
-  }
-  .ht-ch-cluster {
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    justify-content: flex-start;
-    flex: 0 1 auto;
-    max-width: 100%;
-    min-width: 0;
-  }
-  .ht-ch-trailing {
-    display: none;
-  }
-  .ht-category-caret {
-    font-size: 8px;
-    color: #8a7e6a;
-    width: 10px;
-    flex-shrink: 0;
-    transition: transform 0.15s, opacity 0.15s;
-  }
-  @media (hover: hover) {
-    .ht-category-header .ht-category-caret {
-      opacity: 0;
-    }
-    .ht-category-header:hover .ht-category-caret,
-    .ht-category-header:focus-within .ht-category-caret {
-      opacity: 1;
-    }
-  }
-  @media (hover: none) {
-    .ht-category-caret {
-      opacity: 0.42;
-    }
-  }
-  .ht-category-caret.open { transform: rotate(90deg); }
-  .ht-category-emoji { font-size: 13px; line-height: 1; flex-shrink: 0; }
-  .ht-category-name {
-    font-weight: 600;
-    font-size: 12px;
-    color: #e8e0d0;
-    min-width: 0;
-    letter-spacing: 0.01em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .ht-category-header-tag .ht-category-name {
-    padding-left: 0;
-  }
-  .ht-tag-sec-glyph {
-    display: inline-flex;
-    align-items: center;
-    opacity: 0.78;
-    color: rgba(200, 190, 175, 0.95);
-  }
-  .ht-tag-sec-glyph .ti {
-    font-size: 13px;
-  }
-  .ht-cat-done { color: #4caf50; font-size: 11px; }
-  .ht-cat-pending { color: rgba(255,255,255,0.2); font-size: 11px; }
-  .ht-category-streak {
-    font-size: 10px;
-    white-space: nowrap;
-    display: inline-flex;
-    align-items: center;
-    gap: 3px;
-    letter-spacing: 0.02em;
-    font-weight: 600;
-  }
-  .ht-category-streak .ti {
-    color: currentColor;
-    opacity: 0.95;
-  }
-  .ht-category-streak .ht-streak-day-count {
-    font-weight: 700;
-  }
-  .ht-category-habits {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px 10px;
-    padding: 6px 10px 12px 14px;
-    align-items: start;
-  }
-  .ht-sidebar-body.ht-habit-layout-single-col .ht-category-habits {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .ht-category-habits.ht-hidden { display: none; }
-
-  /* Gallery-style expanded section header (ribbon mode) — title cluster left-aligned */
-  .ht-category-header--gallery {
-    padding: 7px 10px;
-  }
-  .ht-category-header--gallery .ht-category-name--gallery {
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-    color: rgba(138, 126, 106, 0.95);
-  }
-  .ht-category-header--gallery .ht-category-header-inner {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-start;
-    flex-wrap: wrap;
-    width: 100%;
-    gap: 6px;
-    min-height: 20px;
-  }
-  .ht-category-header--gallery .ht-ch-cluster {
-    justify-content: flex-start;
-    max-width: 100%;
-    min-width: 0;
-    flex-wrap: wrap;
-    row-gap: 6px;
-    column-gap: 6px;
-  }
-  .ht-category-streak--noflame {
-    gap: 0;
-  }
-
-  /* Header row + optional section ribbon (gallery-like collapsed sources) */
-  .ht-header-stack {
-    display: flex;
-    flex-direction: column;
-    width: 100%;
-    min-width: 0;
-    max-width: 100%;
-    align-items: stretch;
-    gap: 14px;
-  }
-  .ht-habit-section-ribbon {
-    display: grid;
-    width: 100%;
-    grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-    gap: 8px 10px;
-    align-items: center;
-    justify-items: stretch;
-    padding: 12px 2px 8px;
-    margin: 6px 0 0 0;
-    border-top: none;
-    min-height: 22px;
-    box-sizing: border-box;
-  }
-  .ht-habit-section-ribbon[hidden] { display: none !important; }
-  .ht-ribbon-sec {
-    display: block;
-    width: 100%;
-    max-width: 100%;
-    min-width: 0;
-    padding: 4px 2px;
-    border-radius: 0;
-    border: none;
-    border-bottom: 1px solid transparent;
-    background: transparent;
-    color: #c4b8a8;
-    font-size: 10px;
-    cursor: pointer;
-    line-height: 1.15;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
-    box-sizing: border-box;
-  }
-  /* Fixed col1+col2 keeps icons in a straight column; max-content col3 hugs streak to icon (no 1fr gap). */
-  .ht-ribbon-sec-inner {
-    display: grid;
-    grid-template-columns: 14px 30px max-content;
-    align-items: center;
-    justify-content: start;
-    justify-items: stretch;
-    column-gap: 2px;
-    width: 100%;
-    max-width: 100%;
-    box-sizing: border-box;
-  }
-  .ht-ribbon-sec-lead {
-    grid-column: 1;
-    width: 14px;
-    min-width: 14px;
-    max-width: 14px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: flex-end;
-    justify-self: stretch;
-    position: relative;
-  }
-  .ht-ribbon-marked-dot {
-    position: absolute;
-    right: -1px;
-    bottom: 1px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    pointer-events: none;
-  }
-  .ht-ribbon-marked-dot .ht-cat-marked-dot {
-    width: 3px;
-    height: 3px;
-    opacity: 0.82;
-    box-shadow: 0 0 4px rgba(196, 184, 255, 0.16);
-  }
-  .ht-ribbon-sec-inner .ht-ribbon-sec-glyph {
-    grid-column: 2;
-    width: 30px;
-    min-width: 30px;
-    max-width: 30px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    justify-self: center;
-    text-align: center;
-  }
-  .ht-ribbon-sec-lead .ht-cat-inline-check .ti {
-    font-size: 11px;
-  }
-  .ht-ribbon-sec-lead .ht-cat-inline-check--all-done .ti {
-    font-size: 11px;
-  }
-  .ht-ribbon-sec-lead .ht-cat-na-bar {
-    height: 10px;
-    width: 2px;
-  }
-  .ht-ribbon-sec-lead .ht-cat-inline-fail.ht-habit-mark-fail {
-    font-size: 13px;
-    font-weight: 700;
-  }
-  .ht-ribbon-sec-tail {
-    grid-column: 3;
-    display: inline-flex;
-    align-items: baseline;
-    justify-content: flex-start;
-    gap: 1px;
-    min-width: 0;
-    justify-self: start;
-    padding-left: 0;
-    margin-left: 0;
-  }
-  .ht-ribbon-sec:hover {
-    background: transparent;
-    color: #e8e0d0;
-    border-bottom-color: rgba(255, 183, 77, 0.35);
-  }
-  .ht-ribbon-sec-glyph {
-    font-size: 13px;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .ht-ribbon-sec-done {
-    flex-shrink: 0;
-  }
-  .ht-ribbon-sec-done.ht-cat-inline-check {
-    background: none;
-    border: none;
-    padding: 0;
-    box-shadow: none;
-  }
-  .ht-ribbon-sec .ht-ribbon-sec-done .ti {
-    font-size: 11px;
-  }
-  /* Keeps grid cell when section is expanded (icon/check/streak hidden but slot reserved). */
-  .ht-ribbon-slot.ht-ribbon-slot--expanded {
-    box-sizing: border-box;
-    width: 100%;
-    max-width: 100%;
-    min-width: 0;
-    min-height: 30px;
-    padding: 4px;
-    opacity: 0;
-    visibility: visible;
-    pointer-events: auto;
-    cursor: pointer;
-  }
-  .ht-ribbon-slot.ht-ribbon-slot--expanded:focus-visible {
-    outline: 1px solid rgba(124, 106, 247, 0.55);
-    outline-offset: 2px;
-    opacity: 0.08;
-  }
-
-  .ht-ribbon-sec-streak {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 1px;
-    font-size: 9px;
-    font-weight: 600;
-    white-space: nowrap;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
-  }
-  .ht-ribbon-sec-streak .ti {
-    font-size: 10px;
-    vertical-align: -0.05em;
-    opacity: 0.95;
-    color: currentColor;
-  }
-  .ht-ribbon-sec-streak .ht-streak-day-count {
-    font-size: 9px;
-    font-weight: 700;
-  }
-  .ht-ribbon-toggle .ti { font-size: 16px; }
-  .ht-nav-btn.ht-manage-toggle.active {
-    background: rgba(124, 106, 247, 0.22);
-    border-color: rgba(124, 106, 247, 0.45);
-  }
-  .ht-sidebar-body.ht-manage-mode .ht-progress { display: none !important; }
-  .ht-sidebar-body.ht-manage-mode .ht-habit {
-    cursor: default;
-  }
-  .ht-sidebar-body.ht-manage-mode .ht-habit:hover {
-    background: rgba(255,255,255,0.03);
-    border-color: rgba(255,255,255,0.04);
-  }
-  .ht-habit-manage-strip {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    margin-top: 6px;
-    padding: 6px 8px;
-    border-radius: 8px;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid rgba(255, 255, 255, 0.07);
-  }
-  .ht-habit-manage-strip .ht-input {
-    height: 24px;
-    font-size: 11px;
-    padding: 2px 6px;
-  }
-  .ht-habit-manage-name { flex: 2 1 140px; min-width: 0; }
-  .ht-habit-manage-cat { flex: 1 1 100px; min-width: 0; }
-  .ht-habit-manage-advanced {
-    flex: 1 0 100%;
-    margin-top: 4px;
-    font-size: 11px;
-    color: #a09888;
-  }
-  .ht-habit-manage-advanced summary {
-    cursor: pointer;
-    color: #8a7e6a;
-    user-select: none;
-  }
-  .ht-habit-manage-advanced-inner {
-    margin-top: 6px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    align-items: center;
-  }
-  .ht-manage-cats-bar {
-    width: 100%;
-    padding: 8px 10px;
-    margin-bottom: 8px;
-    border-radius: 10px;
-    background: rgba(124, 106, 247, 0.08);
-    border: 1px solid rgba(124, 106, 247, 0.2);
-  }
-  .ht-manage-cats-title {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    color: rgba(180, 168, 220, 0.95);
-    margin-bottom: 6px;
-  }
-  .ht-manage-cat-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 4px;
-    flex-wrap: wrap;
-  }
-  .ht-manage-cat-row .ht-input {
-    height: 24px;
-    font-size: 11px;
-    flex: 1 1 160px;
-    min-width: 0;
-  }
-  .ht-manage-tags-bar {
-    margin-top: 10px;
-  }
-  .ht-habit-manage-row-top {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    flex: 1 0 100%;
-  }
-  .ht-manage-tags-multiselect {
-    width: 100%;
-    min-height: 72px;
-    font-size: 11px;
-    padding: 4px 6px;
-    border-radius: 6px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(0, 0, 0, 0.25);
-    color: #e8e0d0;
-  }
-  .ht-manage-tags-add {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    align-items: center;
-    margin-top: 2px;
-  }
-  .ht-manage-tags-add .ht-input {
-    flex: 1 1 140px;
-    min-width: 0;
-  }
-  .ht-habit-manage-tags-details {
-    width: 100%;
-    flex: 1 0 100%;
-    margin-top: 4px;
-  }
-  .ht-habit-manage-tags-details > summary {
-    cursor: pointer;
-    color: #8a7e6a;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    user-select: none;
-  }
-  .ht-habit-manage-tags-inner {
-    padding-top: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .ht-ribbon-sec-streak .ht-streak-legend-inner {
-    font-size: 9px;
-  }
-  .ht-category-streak.ht-streak-legend .ht-streak-legend-inner {
-    font-size: 10px;
-  }
-
-  /* ── Habit card (TickTick-inspired grid); faint orbit aligns with name row ── */
-  .ht-habit {
-    display: flex;
-    flex-direction: column;
-    align-items: stretch;
-    gap: 6px;
-    padding: 8px 8px 9px;
-    margin: 0;
-    border-radius: 10px;
-    border: 1px solid transparent;
-    cursor: pointer;
-    transition: background 0.12s, border-color 0.12s;
-  }
-  .ht-habit:hover {
-    background: rgba(255,255,255,0.06);
-    border-color: rgba(255,255,255,0.06);
-  }
-  .ht-habit-top {
-    display: flex;
-    flex-direction: row;
-    align-items: flex-start;
-    gap: 8px;
-    min-width: 0;
-  }
-  .ht-habit-orbit {
-    flex-shrink: 0;
-    width: 34px;
-    height: 34px;
-    border-radius: 50%;
-    border: 1px solid rgba(255,255,255,0.07);
-    background: transparent;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-sizing: border-box;
-  }
-  .ht-habit.ht-done .ht-habit-orbit {
-    background: transparent;
-    border-color: rgba(255,255,255,0.12);
-  }
-  .ht-habit-name-col {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    padding-top: 0;
-  }
-  .ht-habit-cat-above {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 10px;
-    color: rgba(180, 172, 158, 0.52);
-    font-weight: 500;
-    letter-spacing: 0.02em;
-    max-width: 100%;
-  }
-  .ht-habit-cat-above-glyph {
-    opacity: 0.68;
-    font-size: 12px;
-    line-height: 1;
-    flex-shrink: 0;
-  }
-  .ht-habit-cat-above-txt {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
-  }
-  .ht-habit-main {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    padding: 0;
-  }
-  .ht-habit-line-name {
-    min-width: 0;
-    display: block;
-  }
-  .ht-habit-line-meta {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    min-height: 18px;
-    /* Skip leading emoji so streak/stats line up with the text after it */
-    padding-left: 1.2em;
-    margin-top: 0;
-    box-sizing: border-box;
-    width: 100%;
-  }
-  .ht-habit-streak-cluster {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    justify-content: center;
-  }
-  .ht-habit-streak-cluster-empty {
-    min-height: 0;
-  }
-  .ht-habit-streak-meter-wrap {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 5px;
-    max-width: 124px;
-    flex-shrink: 0;
-  }
-  .ht-habit-streak-meter-wrap .ht-habit-streak-meter {
-    flex: 1;
-    min-width: 0;
-    max-width: none;
-  }
-  .ht-year-tier {
-    font-size: 9px;
-    font-weight: 700;
-    flex-shrink: 0;
-    line-height: 1;
-    background: repeating-linear-gradient(
-      90deg,
-      #fff8ea 0px,
-      #ffe8c8 40px,
-      #ffc888 80px,
-      #ff9848 120px,
-      #f04838 160px,
-      #ff9848 200px,
-      #ffc888 240px,
-      #ffe8c8 280px,
-      #fff8ea 320px
-    );
-    background-size: 320px 100%;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    -webkit-text-fill-color: transparent;
-    animation: ht-streak-sherbet-flow 11s linear infinite;
-  }
-  .ht-year-boundary {
-    font-size: 10px;
-    color: rgba(255, 165, 112, 0.9);
-    flex-shrink: 0;
-    line-height: 1;
-  }
-  .ht-habit-streak-meter {
-    height: 2px;
-    max-width: 104px;
-    border-radius: 2px;
-    background: rgba(255, 255, 255, 0.04);
-    overflow: hidden;
-  }
-  .ht-habit-streak-meter-fill {
-    display: block;
-    height: 100%;
-    border-radius: 2px;
-    width: 0%;
-    background: rgba(150, 158, 178, 0.4);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
-    transition: width 0.45s cubic-bezier(0.22, 1, 0.36, 1);
-  }
-  .ht-habit-streak-meter-fill--legend {
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
-    background: repeating-linear-gradient(
-      90deg,
-      #fff8ea 0px,
-      #ffe8c8 40px,
-      #ffc888 80px,
-      #ff9848 120px,
-      #f04838 160px,
-      #ff9848 200px,
-      #ffc888 240px,
-      #ffe8c8 280px,
-      #fff8ea 320px
-    );
-    background-size: 320px 100%;
-    animation: ht-streak-sherbet-flow 11s linear infinite;
-  }
-  .ht-habit.ht-done .ht-habit-streak-meter-fill:not(.ht-habit-streak-meter-fill--legend) {
-    filter: brightness(0.88) saturate(0.92);
-    opacity: 0.82;
-  }
-  .ht-habit.ht-done .ht-habit-streak-meter-fill--legend {
-    opacity: 0.92;
-  }
-  .ht-streak-day-count {
-    color: inherit;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-  }
-  /* One full tile = 320px; shift by exactly one period so the loop has no seam/jump. */
-  @keyframes ht-streak-sherbet-flow {
-    0% { background-position: 0 0; }
-    100% { background-position: 320px 0; }
-  }
-  .ht-streak-legend-inner {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 1px;
-    font-weight: 700;
-    letter-spacing: 0.03em;
-    background: repeating-linear-gradient(
-      90deg,
-      #fff8ea 0px,
-      #ffe8c8 40px,
-      #ffc888 80px,
-      #ff9848 120px,
-      #f04838 160px,
-      #ff9848 200px,
-      #ffc888 240px,
-      #ffe8c8 280px,
-      #fff8ea 320px
-    );
-    background-size: 320px 100%;
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    -webkit-text-fill-color: transparent;
-    animation: ht-streak-sherbet-flow 11s linear infinite;
-  }
-  .ht-streak-legend-flame {
-    color: #ffb86c !important;
-    -webkit-text-fill-color: #ffb86c !important;
-    opacity: 0.92;
-    vertical-align: -0.12em;
-  }
-  .ht-category-streak .ht-streak-legend-flame,
-  .ht-ribbon-sec-streak .ht-streak-legend-flame {
-    font-size: 1em;
-  }
-  .ht-habit-streak-core {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 1px;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
-  .ht-habit-streak-core.ht-streak-legend {
-    gap: 3px;
-  }
-  .ht-habit-streak-core .ti {
-    color: currentColor;
-    vertical-align: -0.12em;
-    opacity: 0.96;
-  }
-  .ht-habit-stat-counts {
-    font-weight: 500;
-    color: rgba(180, 170, 155, 0.78);
-  }
-  .ht-streak-dotsep {
-    opacity: 0.35;
-    font-weight: 400;
-  }
-  .ht-roll-num {
-    font-size: 10px;
-    font-weight: 600;
-    color: rgba(200, 190, 175, 0.58);
-    letter-spacing: 0.02em;
-  }
-  .ht-roll-suffix {
-    font-size: 8px;
-    font-weight: 500;
-    opacity: 0.4;
-    margin-left: 1px;
-    letter-spacing: 0.05em;
-  }
-  .ht-roll-sep {
-    opacity: 0.26;
-    margin: 0 5px;
-    font-weight: 400;
-    font-size: 10px;
-  }
-  .ht-habit-mark {
-    font-size: 15px;
-    font-weight: 600;
-    line-height: 1;
-    font-family: ui-sans-serif, system-ui, sans-serif;
-    user-select: none;
-  }
-  .ht-habit-mark-na {
-    color: rgba(200, 165, 72, 0.72);
-    transform: rotate(-12deg);
-    display: inline-block;
-  }
-  .ht-habit-mark-fail {
-    color: rgba(142, 72, 72, 0.82);
-  }
-  .ht-habit-check-minimal {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 22px;
-    min-height: 22px;
-    border: none;
-    background: transparent;
-    border-radius: 4px;
-    transition: color 0.12s, opacity 0.12s;
-  }
-  .ht-habit-check-minimal .ht-check-glyph {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    line-height: 1;
-  }
-  .ht-habit-check-minimal .ht-check-glyph .ti {
-    font-size: 17px;
-  }
-  .ht-check-faint {
-    opacity: 0 !important;
-    transition: opacity 0.12s ease;
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .ht-habit:not(.ht-done):not(.ht-na):not(.ht-fail):hover .ht-check-faint {
-      opacity: 0.38 !important;
-    }
-  }
-  @media (hover: none) {
-    .ht-habit:not(.ht-done):not(.ht-na):not(.ht-fail) .ht-check-faint {
-      opacity: 0.22 !important;
-    }
-  }
-  .ht-habit.ht-done .ht-habit-check-minimal {
-    color: rgba(130, 188, 156, 0.92);
-  }
-  .ht-habit.ht-done .ht-habit-check-minimal .ti {
-    color: rgba(130, 188, 156, 0.92);
-  }
-  .ht-habit-check {
-    width: 18px;
-    height: 18px;
-    border: 1.5px solid rgba(255,255,255,0.22);
-    border-radius: 6px;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.15s;
-    font-size: 10px;
-    color: transparent;
-  }
-  .ht-habit.ht-done .ht-habit-check {
-    background: linear-gradient(160deg, #41d6a8, #2bbd8e);
-    border-color: rgba(46, 189, 142, 0.95);
-    color: #0d1f18;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
-  }
-  .ht-habit-name {
-    flex: 1;
-    color: #e8e0d0;
-    font-size: 13px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .ht-habit.ht-done .ht-habit-name {
-    color: #8a7e6a;
-    text-decoration: line-through;
-    text-decoration-color: rgba(138,126,106,0.5);
-  }
-  .ht-habit-streak {
-    font-size: 11px;
-    color: rgba(180, 170, 155, 0.78);
-    white-space: normal;
-    line-height: 1.3;
-  }
-  .ht-habit-streak .ht-habit-streak-core {
-    font-size: 12px;
-  }
-  .ht-habit-streak .ht-habit-streak-core .ht-streak-day-count {
-    font-size: 12px;
-  }
-  .ht-habit-streak.hot { color: rgba(255, 183, 77, 0.95); }
-
-  .ht-habit-offday { opacity: 0.72; }
-  .ht-habit-offday .ht-habit-name { color: #a09888; }
-  .ht-habit-na-mark {
-    font-size: 10px;
-    color: #6d665c;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-  }
-  .ht-habit.ht-fail .ht-habit-check {
-    border-color: rgba(244, 67, 54, 0.45);
-    color: #e57373;
-    background: rgba(244, 67, 54, 0.08);
-  }
-  .ht-habit.ht-na .ht-habit-check {
-    border-color: rgba(255, 255, 255, 0.12);
-    background: transparent;
-  }
-
-  .ht-habit-stats-link {
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    margin: 0;
-    padding: 0;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: #8a7e6a;
-    cursor: pointer;
-    opacity: 0.32;
-    pointer-events: auto;
-    transition: opacity 0.12s, color 0.12s, background 0.12s;
-  }
-  @media (hover: hover) and (pointer: fine) {
-    .ht-habit-stats-link {
-      opacity: 0;
-      pointer-events: none;
-    }
-    .ht-habit:hover .ht-habit-stats-link {
-      opacity: 0.55;
-      pointer-events: auto;
-    }
-  }
-  .ht-habit .ht-habit-stats-link:hover {
-    opacity: 1;
-    color: #e8e0d0;
-    background: rgba(255,255,255,0.08);
-  }
-
-  /* ── Empty state ── */
-  .ht-empty {
-    padding: 24px 14px;
-    text-align: center;
-    color: #8a7e6a;
-    font-size: 12px;
-    line-height: 1.7;
-  }
-  .ht-empty-icon { font-size: 22px; margin-bottom: 8px; opacity: 0.7; }
-  .ht-setup-btn {
-    margin-top: 10px;
-    padding: 5px 14px;
-    background: rgba(124,106,247,0.25);
-    color: #c4b8ff;
-    border: 1px solid rgba(124,106,247,0.4);
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 12px;
-    transition: background 0.15s;
-  }
-  .ht-setup-btn:hover { background: rgba(124,106,247,0.38); }
-
-  /* ── Settings modal — also frosted ── */
-  .ht-modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.55);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
-    z-index: 9999;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .ht-modal {
-    background: rgba(28, 26, 34, 0.92);
-    backdrop-filter: blur(24px) saturate(1.5);
-    -webkit-backdrop-filter: blur(24px) saturate(1.5);
-    border: 1px solid rgba(255,255,255,0.10);
-    border-radius: 12px;
-    width: 520px;
-    max-width: 96vw;
-    max-height: 82vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    box-shadow: 0 24px 64px rgba(0,0,0,0.6);
-    color: #e8e0d0;
-  }
-  .ht-modal-header {
-    display: flex;
-    align-items: center;
-    padding: 16px 20px;
-    border-bottom: 1px solid rgba(255,255,255,0.07);
-    flex-shrink: 0;
-  }
-  .ht-modal-title { font-weight: 700; font-size: 14px; flex: 1; color: #e8e0d0; }
-  .ht-modal-close {
-    background: none; border: none; cursor: pointer;
-    color: #8a7e6a; font-size: 16px; padding: 2px 6px; border-radius: 4px;
-  }
-  .ht-modal-close:hover { background: rgba(255,255,255,0.07); color: #e8e0d0; }
-  .ht-modal-body { overflow-y: auto; padding: 16px 20px; flex: 1; }
-  .ht-modal-footer {
-    padding: 12px 20px;
-    border-top: 1px solid rgba(255,255,255,0.07);
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    flex-shrink: 0;
-  }
-  .ht-btn {
-    padding: 6px 14px;
-    border-radius: 6px;
-    border: none;
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 500;
-    transition: opacity 0.15s, background 0.15s;
-  }
-  .ht-btn-primary { background: rgba(124,106,247,0.85); color: #fff; }
-  .ht-btn-primary:hover { background: rgba(124,106,247,1); }
-  .ht-btn-secondary {
-    background: rgba(255,255,255,0.07);
-    color: #e8e0d0;
-    border: 1px solid rgba(255,255,255,0.10);
-  }
-  .ht-btn-secondary:hover { background: rgba(255,255,255,0.12); }
-  .ht-btn-danger { background: rgba(218,54,51,0.12); color: #f07070; border: 1px solid rgba(218,54,51,0.25); }
-  .ht-btn-danger:hover { background: rgba(218,54,51,0.22); }
-  .ht-btn-sm { padding: 3px 8px; font-size: 11px; }
-
-  /* Settings form elements */
-  .ht-section-title {
-    font-weight: 600;
-    font-size: 11px;
-    color: #8a7e6a;
-    letter-spacing: 0.07em;
-    text-transform: uppercase;
-    margin: 16px 0 8px;
-  }
-  .ht-section-title:first-child { margin-top: 0; }
-  .ht-cat-item, .ht-habit-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    border-radius: 6px;
-    margin-bottom: 4px;
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.06);
-  }
-  .ht-item-emoji {
-    font-size: 15px;
-    width: 24px;
-    min-width: 24px;
-    text-align: center;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .ht-item-emoji .ti { font-size: 16px; }
-  .ht-item-left { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-  .ht-item-name { font-size: 13px; color: #e8e0d0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ht-item-sub { font-size: 11px; color: #8a7e6a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ht-item-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
-  .ht-add-row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-  .ht-icon-select {
-    flex: 0 0 auto;
-    min-width: 148px;
-    max-width: 200px;
-    padding: 5px 8px;
-    font-size: 12px;
-  }
-  .ht-cat-glyph-inline { display: inline-flex; align-items: center; vertical-align: middle; margin-right: 4px; }
-  .ht-cat-glyph-inline .ti { font-size: 1em; }
-  .ht-category-emoji .ti { font-size: 14px; }
-  .ht-emoji-inline { font-size: 1.1em; line-height: 1; }
-  .ht-icon-preview {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 26px;
-    flex-shrink: 0;
-    color: #c4a882;
-  }
-  .ht-icon-preview .ti { font-size: 18px; }
-  .ht-input {
-    flex: 1;
-    min-width: 0;
-    padding: 5px 10px;
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 6px;
-    color: #e8e0d0;
-    font-size: 13px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-  .ht-input:focus { border-color: rgba(124,106,247,0.7); }
-  .ht-input::placeholder { color: #8a7e6a; }
-  .ht-select {
-    padding: 5px 8px;
-    background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 6px;
-    color: #e8e0d0;
-    font-size: 13px;
-    outline: none;
-    cursor: pointer;
-  }
-  .ht-select option { background: #1c1a22; }
-  .ht-divider {
-    height: 1px;
-    background: rgba(255,255,255,0.07);
-    margin: 14px 0;
-  }
-
-  /* ── Numeric habit ring & controls ── */
-  .ht-habit-ring {
-    position: relative;
-    width: 26px;
-    height: 26px;
-    flex-shrink: 0;
-  }
-  .ht-habit-ring svg {
-    position: absolute;
-    top: 0; left: 0;
-    transform: rotate(-90deg);
-  }
-  .ht-habit-ring-bg { fill: none; stroke: rgba(255,255,255,0.12); stroke-width: 2.5; }
-  .ht-habit-ring-fill {
-    fill: none;
-    stroke: #4caf50;
-    stroke-width: 2.5;
-    stroke-linecap: round;
-    transition: stroke-dashoffset 0.3s ease;
-  }
-  .ht-habit-ring-label {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 8px;
-    font-weight: 700;
-    color: #e8e0d0;
-    line-height: 1;
-  }
-  .ht-habit.ht-done .ht-habit-ring-fill { stroke: rgba(124, 168, 142, 0.88); }
-  .ht-habit.ht-done .ht-habit-ring-label { color: rgba(124, 168, 142, 0.92); }
-
-  .ht-habit-num-row {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-shrink: 0;
-  }
-  .ht-num-btn {
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 4px;
-    color: #e8e0d0;
-    font-size: 13px;
-    width: 20px;
-    height: 20px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: background 0.1s;
-    padding: 0;
-    line-height: 1;
-  }
-  .ht-num-btn:hover { background: rgba(255,255,255,0.15); }
-  .ht-num-fail-btn {
-    font-size: 15px;
-    font-weight: 700;
-    color: rgba(255, 120, 120, 0.95);
-    border-color: rgba(255, 120, 120, 0.35);
-    width: 22px;
-    height: 22px;
-  }
-  .ht-num-fail-btn:hover { background: rgba(255, 120, 120, 0.12); }
-  .ht-num-na-btn .ht-cat-na-bar {
-    height: 11px;
-    width: 3px;
-  }
-  .ht-num-val {
-    font-size: 11px;
-    color: #e8e0d0;
-    min-width: 28px;
-    text-align: center;
-    cursor: pointer;
-  }
-  .ht-num-val.at-target { color: #4caf50; font-weight: 700; }
-  .ht-num-input {
-    width: 44px;
-    padding: 2px 4px;
-    background: rgba(255,255,255,0.1);
-    border: 1px solid rgba(124,106,247,0.6);
-    border-radius: 4px;
-    color: #e8e0d0;
-    font-size: 12px;
-    text-align: center;
-    outline: none;
-  }
-
-  /* ── Celebrate burst ── */
-  @keyframes ht-burst {
-    0%   { transform: scale(1);   opacity: 1; }
-    40%  { transform: scale(1.35); opacity: 0.9; }
-    100% { transform: scale(1);   opacity: 1; }
-  }
-  @keyframes ht-particle {
-    0%   { transform: translate(0,0) scale(1); opacity: 1; }
-    100% { transform: translate(var(--tx), var(--ty)) scale(0); opacity: 0; }
-  }
-  .ht-celebrating { animation: ht-burst 0.35s ease-out; }
-  .ht-particle {
-    position: absolute;
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
-    pointer-events: none;
-    animation: ht-particle 0.5s ease-out forwards;
-  }
-
-  /* ── Stats view ── */
-  .ht-stats-view { padding: 12px 14px 20px; }
-  .ht-stats-range {
-    display: flex; gap: 4px; margin-bottom: 14px;
-  }
-  .ht-range-btn {
-    padding: 3px 10px; border-radius: 20px; border: 1px solid rgba(255,255,255,0.12);
-    background: none; color: #8a7e6a; font-size: 11px; cursor: pointer; transition: all 0.15s;
-  }
-  .ht-range-btn.active, .ht-range-btn:hover {
-    background: rgba(124,106,247,0.2); border-color: rgba(124,106,247,0.5); color: #c4b8ff;
-  }
-  .ht-stats-select {
-    width: 100%; padding: 6px 10px; margin-bottom: 14px;
-    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 8px; color: #e8e0d0; font-size: 12px; outline: none; cursor: pointer;
-  }
-  .ht-stats-select option { background: #1c1a22; }
-  .ht-stat-cards {
-    display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 14px;
-  }
-  .ht-stat-card {
-    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 10px; padding: 10px 12px;
-  }
-  .ht-stat-label { font-size: 10px; color: #8a7e6a; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .ht-stat-value { font-size: 22px; font-weight: 700; color: #e8e0d0; line-height: 1; }
-  .ht-stat-unit { font-size: 11px; color: #8a7e6a; margin-top: 2px; }
-  .ht-stat-card.accent .ht-stat-value { color: #4caf50; }
-  .ht-stat-card.fire .ht-stat-value { color: #ff9800; }
-
-  .ht-stats-section { margin-bottom: 16px; }
-  .ht-stats-section-title {
-    font-size: 11px; font-weight: 600; color: #8a7e6a;
-    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
-  }
-
-  /* ── 7-day strip ── */
-  .ht-cal-strip { display: flex; gap: 4px; justify-content: space-between; }
-  .ht-cal-strip-col {
-    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
-  }
-  .ht-cal-strip-col.today .ht-cal-strip-dow { color: #c4b8ff; font-weight: 700; }
-  .ht-cal-strip-dow { font-size: 10px; color: #8a7e6a; }
-  .ht-cal-strip-circle {
-    width: 32px; height: 32px; border-radius: 50%;
-    background: rgba(255,255,255,0.07);
-    border: 1.5px solid rgba(255,255,255,0.1);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 600; color: #8a7e6a;
-    transition: all 0.15s; cursor: pointer;
-  }
-  .ht-cal-strip-circle:hover { transform: scale(1.1); background: rgba(255,255,255,0.12); }
-  .ht-cal-strip-circle.done:hover { background: rgba(76,175,80,0.4) !important; }
-  .ht-cal-strip-circle.done {
-    background: rgba(76,175,80,0.25); border-color: #4caf50; color: #4caf50;
-  }
-  .ht-cal-strip-circle.partial {
-    background: rgba(124,106,247,0.15); border-color: rgba(124,106,247,0.4); color: #c4b8ff;
-  }
-  .ht-cal-strip-circle.ht-cal-na {
-    background: rgba(255,255,255,0.04); border-style: dashed; color: #6d665c; font-size: 9px;
-  }
-  .ht-cal-strip-circle.ht-cal-fail {
-    background: rgba(244,67,54,0.12); border-color: rgba(244,67,54,0.45); color: #e57373;
-  }
-  .ht-cal-strip-date { font-size: 10px; color: #8a7e6a; }
-  .ht-cal-strip-col.today .ht-cal-strip-date { color: #c4b8ff; }
-
-  /* ── Monthly calendar grid ── */
-  .ht-cal-month-view { }
-  .ht-cal-month-nav {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 10px;
-  }
-  .ht-cal-nav-btn {
-    background: none; border: none; cursor: pointer; color: #8a7e6a;
-    font-size: 18px; padding: 0 6px; border-radius: 4px; line-height: 1;
-    transition: color 0.1s;
-  }
-  .ht-cal-nav-btn:hover { color: #e8e0d0; }
-  .ht-cal-month-title { font-size: 13px; font-weight: 600; color: #e8e0d0; }
-  .ht-cal-dow-row {
-    display: grid; grid-template-columns: repeat(7, 1fr);
-    margin-bottom: 4px;
-  }
-  .ht-cal-dow-header {
-    font-size: 10px; color: #8a7e6a; text-align: center; padding: 2px 0;
-  }
-  .ht-cal-grid {
-    display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px;
-  }
-  .ht-cal-day {
-    aspect-ratio: 1; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; border-radius: 50%;
-    background: rgba(255,255,255,0.05); cursor: pointer;
-    position: relative; transition: background 0.15s, transform 0.1s;
-    max-width: 42px; max-height: 42px; margin: 0 auto; width: 100%;
-  }
-  .ht-cal-day:hover:not(.empty):not(.out-of-range) {
-    transform: scale(1.08);
-    background: rgba(255,255,255,0.1);
-  }
-  .ht-cal-day.clickable-done:hover { background: rgba(76,175,80,0.35) !important; }
-  .ht-cal-day.out-of-range { background: rgba(255,255,255,0.02); opacity: 0.4; }
-  .ht-cal-day.empty { background: none; }
-  .ht-cal-day.done {
-    background: rgba(76,175,80,0.2); border: 1.5px solid rgba(76,175,80,0.5);
-  }
-  .ht-cal-day.partial {
-    background: rgba(124,106,247,0.12); border: 1.5px solid rgba(124,106,247,0.3);
-  }
-  .ht-cal-day.ht-cal-na {
-    background: rgba(255,255,255,0.03); border: 1px dashed rgba(255,255,255,0.12);
-  }
-  .ht-cal-day.ht-cal-na .ht-cal-day-dot { background: transparent; border: 1px dashed rgba(255,255,255,0.15); }
-  .ht-cal-day.ht-cal-fail {
-    background: rgba(244,67,54,0.12); border: 1.5px solid rgba(244,67,54,0.35);
-  }
-  .ht-cal-day.ht-cal-fail .ht-cal-day-dot { background: #e57373; }
-  .ht-cal-day.today {
-    border: 1.5px solid rgba(196,184,255,0.6) !important;
-  }
-  .ht-cal-day-num {
-    font-size: 11px; color: #e8e0d0; font-weight: 500; line-height: 1;
-  }
-  .ht-cal-day.out-of-range .ht-cal-day-num { color: #8a7e6a; }
-  .ht-cal-day.today .ht-cal-day-num { color: #c4b8ff; }
-  .ht-cal-day-dot {
-    width: 4px; height: 4px; border-radius: 50%;
-    margin-top: 3px; flex-shrink: 0;
-  }
-  .ht-cal-day.done .ht-cal-day-dot { background: #4caf50; }
-  .ht-cal-day.partial .ht-cal-day-dot { background: rgba(124,106,247,0.6); }
-  .ht-cal-day-dot:empty { display: none; }
-  /* Numeric value shown as small text below date */
-  .ht-cal-day-val {
-    font-size: 8px; color: #8a7e6a; line-height: 1; margin-top: 1px;
-  }
-  .ht-cal-day.done .ht-cal-day-val { color: #4caf50; }
-  .ht-cal-day.partial .ht-cal-day-val { color: rgba(124,106,247,0.8); }
-
-  /* Bar chart */
-  .ht-barchart-wrap { position: relative; overflow: visible; }
-  .ht-barchart { position: relative; height: 72px; display: flex; align-items: flex-end; gap: 2px; overflow: visible; margin-right: 30px; }
-  .ht-bar-wrap { flex: 1; display: flex; align-items: flex-end; height: 100%; }
-  .ht-bar {
-    width: 100%; border-radius: 2px 2px 0 0;
-    background: rgba(124,106,247,0.22); min-height: 2px;
-    transition: height 0.3s ease;
-  }
-  .ht-bar.done { background: rgba(76,175,80,0.38); }
-  .ht-bar-wrap { position: relative; }
-  .ht-bar-wrap:hover .ht-bar-tooltip {
-    opacity: 1; transform: translateX(-50%) translateY(0);
-  }
-  .ht-bar-tooltip {
-    position: absolute; bottom: calc(100% + 4px); left: 50%;
-    transform: translateX(-50%) translateY(4px);
-    background: rgba(28,26,34,0.95);
-    border: 1px solid rgba(255,255,255,0.15);
-    color: #e8e0d0; font-size: 10px; font-weight: 600;
-    padding: 2px 6px; border-radius: 4px;
-    white-space: nowrap; pointer-events: none;
-    opacity: 0; transition: opacity 0.15s, transform 0.15s;
-    z-index: 10;
-  }
-  .ht-barchart-labels { display: flex; gap: 2px; margin-top: 3px; }
-  .ht-bar-label-wrap { flex: 1; display: flex; justify-content: center; }
-  .ht-bar-label { font-size: 8px; color: #8a7e6a; line-height: 1; }
-  .ht-target-line {
-    position: absolute; left: 0; right: 0; height: 1px;
-    background: rgba(255,200,0,0.22); pointer-events: none;
-  }
-  .ht-target-label {
-    position: absolute; right: -28px; font-size: 8px; color: rgba(255,200,0,0.55);
-    line-height: 1; text-align: left;
-    transform: translateY(-1px);
-  }
-
-  /* Category rate */
-  .ht-cat-rate-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-  .ht-cat-rate-name { font-size: 12px; color: #e8e0d0; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ht-cat-rate-bar-wrap { width: 80px; height: 5px; background: rgba(255,255,255,0.04); border-radius: 3px; flex-shrink: 0; overflow: hidden; }
-  .ht-cat-rate-bar { height: 100%; border-radius: 3px; background: rgba(76,175,80,0.45); transition: width 0.3s; }
-  .ht-cat-rate-pct { font-size: 11px; color: #8a7e6a; width: 32px; text-align: right; flex-shrink: 0; }
-
-  /* Stats / back button in header */
-  .ht-search-wrap { flex:1; display:none; align-items:center; gap:4px; }
-  .ht-stats-btn {
-    background: none; border: none; cursor: pointer; color: #8a7e6a;
-    font-size: 14px; padding: 2px 6px; border-radius: 6px; flex-shrink: 0;
-    transition: all 0.15s; line-height: 1;
-  }
-  .ht-stats-btn:hover { color: #e8e0d0; background: rgba(255,255,255,0.07); }
-  .ht-stats-btn.active {
-    color: #e8e0d0; font-size: 16px; font-weight: 700;
-    background: rgba(255,255,255,0.07);
-  }
-
-  /* ── Drag handles ── */
-  .ht-drag-handle {
-    color: #8a7e6a;
-    font-size: 13px;
-    cursor: grab;
-    padding: 0 4px 0 2px;
-    flex-shrink: 0;
-    opacity: 0.5;
-    transition: opacity 0.1s;
-    user-select: none;
-    line-height: 1;
-  }
-  .ht-habit-cb { width:14px;height:14px;flex-shrink:0;cursor:pointer;accent-color:#7c6af7; }
-  .ht-habit-item.ht-selected { background:rgba(124,106,247,0.12) !important; border-color:rgba(124,106,247,0.3) !important; }
-  .ht-bulk-bar {
-    display:flex;align-items:center;gap:8px;padding:8px 12px;
-    background:rgba(124,106,247,0.15);border:1px solid rgba(124,106,247,0.3);
-    border-radius:8px;margin:4px 0;font-size:12px;color:#c4b8ff;
-    position:sticky;top:0;z-index:2;flex-wrap:wrap;
-  }
-  .ht-habit-item:hover .ht-drag-handle,
-  .ht-cat-item:hover .ht-drag-handle { opacity: 1; }
-  .ht-drag-handle:active { cursor: grabbing; }
-  .ht-habit-item.ht-dragging,
-  .ht-cat-item.ht-dragging {
-    opacity: 0.35;
-    background: rgba(255,255,255,0.08);
-  }
-  .ht-habit-item.ht-drag-over,
-  .ht-cat-item.ht-drag-over {
-    border-color: rgba(124,106,247,0.6);
-    background: rgba(124,106,247,0.08);
-  }
-
-  /* HabitTracker settings modal — drag reorder drop line */
-  .ht-settings-habit-list {
-    position: relative;
-    transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
-  }
-  .ht-settings-habit-list.ht-settings-list-hover {
-    background: rgba(124, 106, 247, 0.06);
-    border-color: rgba(124, 106, 247, 0.28) !important;
-  }
-  .ht-settings-habit-list.ht-settings-list-drop-empty {
-    box-shadow: inset 0 0 0 2px rgba(124, 106, 247, 0.55);
-    background: rgba(124, 106, 247, 0.1);
-  }
-  .ht-settings-habit-row.ht-settings-drop-before {
-    box-shadow: inset 0 3px 0 0 rgba(124, 106, 247, 0.92);
-  }
-  .ht-settings-habit-row.ht-settings-drop-after {
-    box-shadow: inset 0 -3px 0 0 rgba(124, 106, 247, 0.92);
-  }
-
-  /* Inline manage — habit strip drag */
-  .ht-habit-manage-drag-grip {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    opacity: 0.7;
-    cursor: grab;
-    touch-action: none;
-    flex-shrink: 0;
-    margin-right: 2px;
-    user-select: none;
-  }
-  .ht-habit-manage-drag-grip:active { cursor: grabbing; }
-  .ht-habit.ht-manage-habit-dragging {
-    opacity: 0.42;
-    outline: 1px dashed rgba(124, 106, 247, 0.45);
-    border-radius: 8px;
-  }
-  .ht-category-roll {
-    margin-left: 4px;
-    flex-shrink: 0;
-    font-size: 10px;
-  }
-  .ht-category-habits.ht-manage-dnd-target {
-    position: relative;
-    transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
-  }
-  .ht-category-habits.ht-manage-dnd-target.ht-manage-dnd-hover {
-    background: rgba(124, 106, 247, 0.06);
-  }
-  .ht-category-habits.ht-manage-dnd-target.ht-manage-dnd-empty {
-    box-shadow: inset 0 0 0 2px rgba(124, 106, 247, 0.45);
-    background: rgba(124, 106, 247, 0.08);
-    min-height: 36px;
-    border-radius: 8px;
-  }
-  .ht-habit.ht-manage-drop-before {
-    box-shadow: inset 0 3px 0 0 rgba(124, 106, 247, 0.92);
-  }
-  .ht-habit.ht-manage-drop-after {
-    box-shadow: inset 0 -3px 0 0 rgba(124, 106, 247, 0.92);
-  }
-
-  .ht-btn.ht-settings-mode-on {
-    border-color: rgba(124, 106, 247, 0.55);
-    background: rgba(124, 106, 247, 0.16);
-    color: #e8e4ff;
-  }
-
-  /* Habit Tracker: habit header lives in .jhs-habit-controls; body stays in .jhs-body */
-  .jhs-shell .jhs-body > .ht-sidebar {
-    margin: 0 0 8px 0;
-    border: none;
-    background: transparent;
-    box-shadow: none;
-    -webkit-backdrop-filter: none;
-    backdrop-filter: none;
-    border-radius: 0;
-    overflow: visible;
-  }
-  .jhs-shell .jhs-habit-controls {
-    display: none;
-    flex-direction: column;
-    align-items: stretch;
-    flex: 1 1 auto;
-    width: 100%;
-    min-width: 0;
-    max-width: 100%;
-    margin-left: 0;
-    padding-top: 4px;
-    align-self: stretch;
-    overflow-x: visible;
-    overflow-y: visible;
-    -webkit-overflow-scrolling: touch;
-  }
-  .jhs-shell .jhs-habit-controls .ht-habit-section-ribbon {
-    border-top: 1px solid rgba(255,255,255,0.07);
-    padding-top: 12px;
-    padding-bottom: 2px;
-    margin-top: 6px;
-    pointer-events: none;
-    width: 100%;
-    box-sizing: border-box;
-  }
-  .jhs-shell .jhs-habit-controls .ht-habit-section-ribbon .ht-ribbon-sec {
-    pointer-events: auto;
-  }
-  .jhs-shell .jhs-habit-controls.jhs-habit-controls-visible {
-    display: flex;
-  }
-  .jhs-shell .jhs-habit-controls .ht-header-stack {
-    flex: 1 1 auto;
-    width: 100%;
-    min-width: 0;
-    max-width: 100%;
-    align-items: stretch;
-    gap: 10px;
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host {
-    justify-content: flex-end;
-    align-items: center;
-    gap: 8px;
-    min-height: 22px;
-    border-bottom: none;
-    padding: 4px 0 6px 0;
-    background: transparent;
-    width: 100%;
-    box-sizing: border-box;
-    flex-shrink: 0;
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-date-label {
-    display: inline-flex;
-    align-items: center;
-    line-height: 22px;
-    height: 22px;
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-nav-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    box-sizing: border-box;
-    color: rgba(232, 224, 208, 0.92);
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-nav-btn .ti {
-    opacity: 1;
-    color: inherit;
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-nav-btn.ht-nav-btn-muted {
-    opacity: 1;
-    color: rgba(232, 224, 208, 0.48);
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-nav-btn.ht-cat-expand-toggle .ti {
-    font-size: 18px;
-    opacity: 1;
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-stats-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 22px;
-    height: 22px;
-    padding: 0;
-    box-sizing: border-box;
-    color: rgba(232, 224, 208, 0.92);
-  }
-  .jhs-shell .jhs-habit-controls .ht-sidebar-header.ht-jhs-header-host .ht-stats-btn .ti {
-    opacity: 1;
-    color: inherit;
-  }
-`;
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function htSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function htToday() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function htDaysBefore(dateStr, n) {
-  const d = new Date(dateStr + 'T12:00:00');
-  d.setDate(d.getDate() - n);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function htDaysAfter(dateStr, n) {
-  const d = new Date(dateStr + 'T12:00:00');
-  d.setDate(d.getDate() + n);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-/** Serialized completion markers (JSON-safe strings). */
-const HT_COMP_NA = '__na__';
-const HT_COMP_FAIL = '__x__';
-/** Long-press (× / numeric entry) and sidebar drag-paint timing. */
-const HT_LONG_PRESS_MS = 500;
-const HT_SIDEBAR_DRAG_CLICK_GAP_MS = 450;
-const HT_DRAG_MOVE_PX = 8;
-
-function htWeekdayFromDateStr(dateStr) {
-  return new Date(dateStr + 'T12:00:00').getDay();
-}
-
-/** Empty `weekdays` = all days; else Sun=0 … Sat=6. */
-function htHabitAppliesOnDate(habit, dateStr) {
-  const days = habit?.weekdays;
-  if (!Array.isArray(days) || days.length === 0) return true;
-  return days.includes(htWeekdayFromDateStr(dateStr));
-}
-
-function htCompletionNorm(raw, habit) {
-  const target = habit?.target || 0;
-  const hasTarget = target > 0;
-  if (raw === HT_COMP_NA) {
-    return { kind: 'na', done: false, fail: false, neutral: true, num: 0 };
-  }
-  if (raw === HT_COMP_FAIL) {
-    return { kind: 'fail', done: false, fail: true, neutral: false, num: 0 };
-  }
-  if (raw === undefined || raw === null) {
-    return { kind: 'empty', done: false, fail: false, neutral: false, num: 0 };
-  }
-  if (hasTarget) {
-    const n = typeof raw === 'number' ? raw : 0;
-    const done = n >= target;
-    return {
-      kind: done ? 'done' : (n > 0 ? 'partial' : 'empty'),
-      done,
-      fail: false,
-      neutral: false,
-      num: n,
-    };
-  }
-  if (raw === true) {
-    return { kind: 'done', done: true, fail: false, neutral: false, num: 1 };
-  }
-  return { kind: 'empty', done: false, fail: false, neutral: false, num: 0 };
-}
-
-/** Sidebar / summary: off-days show as neutral N/A when nothing logged. */
-function htHabitDaySurface(log, habit, dateStr) {
-  const raw = log?.completions?.[habit.id];
-  const norm = htCompletionNorm(raw, habit);
-  if (!htHabitAppliesOnDate(habit, dateStr)) {
-    if (norm.kind === 'empty') {
-      return { ...norm, kind: 'na', neutral: true, offDay: true, displayNa: true };
-    }
-    return { ...norm, offDay: true };
-  }
-  return { ...norm, offDay: false, displayNa: norm.kind === 'na' };
-}
-
-function htHabitRowShowsNa(surf, norm) {
-  return norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty');
-}
-
-/**
- * Category header / ribbon lead for one day:
- * - `all_done` — every applying habit completed for the day (double-check + sherbet)
- * - `partial` — at least one done but not all
- * - `na` / `fail` / `none` as before
- */
-function htCategoryDayAggregateStatus(log, applyingHabits, dateStr) {
-  if (!applyingHabits.length) return 'na';
-  const rows = applyingHabits.map((h) => {
-    const surf = htHabitDaySurface(log, h, dateStr);
-    const norm = htCompletionNorm(log.completions[h.id], h);
-    return {
-      done: norm.done,
-      na: htHabitRowShowsNa(surf, norm),
-      fail: norm.kind === 'fail',
-    };
-  });
-  if (rows.every((r) => r.na)) return 'na';
-  if (rows.length && rows.every((r) => r.done)) return 'all_done';
-  if (rows.some((r) => r.done)) return 'partial';
-  const nonNa = rows.filter((r) => !r.na);
-  if (nonNa.length && nonNa.every((r) => r.fail)) return 'fail';
-  return 'none';
-}
-
-/** True when every applying habit is “tended to” (done, N/A, or fail) — no empties. */
-function htCategoryAllMarkedForDay(log, applyingHabits, dateStr) {
-  if (!applyingHabits.length) return true;
-  for (const h of applyingHabits) {
-    const surf = htHabitDaySurface(log, h, dateStr);
-    const norm = htCompletionNorm(log?.completions?.[h.id], h);
-    const marked = !!(norm.done || htHabitRowShowsNa(surf, norm) || norm.kind === 'fail');
-    if (!marked) return false;
-  }
-  return true;
-}
-
-function htCategoryDayLeadInnerHtml(status) {
-  if (status === 'all_done') {
-    return `<span class="ht-cat-inline-check ht-cat-inline-check--all-done" title="All habits in this category done today" aria-hidden="true">${htIcon('checks')}</span>`;
-  }
-  if (status === 'partial') {
-    return `<span class="ht-cat-inline-check" aria-hidden="true">${htIcon('check')}</span>`;
-  }
-  if (status === 'na') {
-    return `<span class="ht-cat-inline-na ht-cat-na-bar" aria-hidden="true"></span>`;
-  }
-  if (status === 'fail') {
-    return `<span class="ht-cat-inline-fail ht-habit-mark ht-habit-mark-fail" aria-hidden="true">×</span>`;
-  }
-  return '';
-}
-
-/** Category ribbon: fixed-width lead cell (keeps icons aligned). */
-function htRibbonLeadCellHtml(status, marked = false) {
-  const inner = htCategoryDayLeadInnerHtml(status);
-  const dot = marked
-    ? `<span class="ht-ribbon-marked-dot" aria-hidden="true"><span class="ht-cat-marked-dot"></span></span>`
-    : '';
-  return `<span class="ht-ribbon-sec-lead">${inner}${dot}</span>`;
-}
-
-/** Category progress fill: color walks mint → sherbet as completion % increases (not a static rainbow on a short bar). */
-function htCategoryProgressFillStyle(pct) {
-  const t = Math.max(0, Math.min(1, (Number(pct) || 0) / 100));
-  const r = Math.round(68 + t * (255 - 68));
-  const g = Math.round(150 + t * (188 - 150));
-  const b = Math.round(112 + t * (132 - 112));
-  const r2 = Math.round(95 + t * (255 - 95));
-  const g2 = Math.round(188 + t * (210 - 188));
-  const b2 = Math.round(138 + t * (155 - 138));
-  const a = 0.62 + t * 0.33;
-  const a2 = 0.72 + t * 0.23;
-  return `linear-gradient(90deg, rgba(${r},${g},${b},${a.toFixed(2)}), rgba(${r2},${g2},${b2},${a2.toFixed(2)}))`;
-}
-
-function htRecoverKeyLooksLikeHabitId(k) {
-  return typeof k === 'string' && HT_RECOVER_HABIT_ID_KEY_RE.test(k.trim());
-}
-
-function htLogDateStrForRecover(d) {
-  const logDate = String(d?.date || '').trim();
-  return /^\d{4}-\d{2}-\d{2}$/.test(logDate) ? logDate : '';
-}
-
-function htNormalizeHabitConfig(cfg) {
-  const o = cfg && typeof cfg === 'object' ? cfg : {};
-  const out = o;
-  out.categories = Array.isArray(out.categories) ? out.categories : [];
-  out.habits = Array.isArray(out.habits) ? out.habits : [];
-  out.habitGroupMode = 'category';
-  out.hideOffDayHabits = !!out.hideOffDayHabits;
-  out.showDayNotes = out.showDayNotes !== false;
-  for (const h of out.habits) {
-    if (!Array.isArray(h.tags)) h.tags = [];
-    else h.tags = h.tags.map((t) => String(t || '').trim()).filter(Boolean);
-    if (h.weekdays != null && !Array.isArray(h.weekdays)) h.weekdays = [];
-    if (Array.isArray(h.weekdays)) {
-      h.weekdays = [...new Set(h.weekdays.map((x) => Number(x)).filter((n) => n >= 0 && n <= 6))];
-    }
-  }
-  if (!Array.isArray(out.tagOrder)) out.tagOrder = [];
-  else out.tagOrder = out.tagOrder.map((t) => String(t || '').trim()).filter(Boolean);
-  const tagSeen = new Set(out.tagOrder);
-  for (const h of out.habits) {
-    for (const t of h.tags) {
-      if (!tagSeen.has(t)) {
-        out.tagOrder.push(t);
-        tagSeen.add(t);
-      }
-    }
-  }
-  return out;
-}
-
-/**
- * Solid streak color: smooth ramp from soft cool-gray (low days) toward warm red (364d).
- * 365+ uses animated sherbet legend HTML. `hot` nudges along the curve slightly for 7d+.
- */
-function htStreakTierSolid(dayCount) {
-  const d = Math.max(0, Math.floor(Number(dayCount) || 0));
-  if (d <= 0) return 'rgba(150, 158, 178, 0.55)';
-  const t = Math.min(1, d / 364);
-  const u = Math.pow(t, 0.5);
-  const h = 168 - u * 158;
-  const s = 10 + u * 48;
-  const l = 59 - u * 11;
-  const a = 0.66 + u * 0.26;
-  const hi = Math.round(h);
-  const si = Math.round(s);
-  const li = Math.round(l);
-  const af = a.toFixed(2);
-  return `hsla(${hi}, ${si}%, ${li}%, ${af})`;
-}
-
-function htHabitStreakCoreHtml(streakDays, hot = false) {
-  const d = Math.max(0, Math.floor(Number(streakDays) || 0));
-  if (d >= 365) {
-    return `<span class="ht-habit-streak-core ht-streak-legend">${htIcon('flame', 'ht-streak-legend-flame')}<span class="ht-streak-legend-inner"><span class="ht-streak-day-count">${d}d</span></span></span>`;
-  }
-  const tierDays = d + (hot ? 1 : 0);
-  const c = htStreakTierSolid(Math.min(tierDays, 364));
-  return `<span class="ht-habit-streak-core" style="color:${c}">${htIcon('flame')}<span class="ht-streak-day-count">${d}d</span></span>`;
-}
-
-function htCategoryStreakBadgeHtml(streakDays, opts = {}) {
-  const omitFlame = !!opts.omitFlame;
-  const d = Math.max(0, Math.floor(Number(streakDays) || 0));
-  if (d >= 365) {
-    if (omitFlame) {
-      return `<span class="ht-category-streak ht-streak-legend ht-category-streak--noflame"><span class="ht-streak-legend-inner"><span class="ht-streak-day-count">${d}d</span></span></span>`;
-    }
-    return `<span class="ht-category-streak ht-streak-legend">${htIcon('flame', 'ht-streak-legend-flame')}<span class="ht-streak-legend-inner"><span class="ht-streak-day-count">${d}d</span></span></span>`;
-  }
-  const c = htStreakTierSolid(d);
-  if (omitFlame) {
-    return `<span class="ht-category-streak ht-category-streak--noflame" style="color:${c}"><span class="ht-streak-day-count">${d}d</span></span>`;
-  }
-  return `<span class="ht-category-streak" style="color:${c}">${htIcon('flame')}<span class="ht-streak-day-count">${d}d</span></span>`;
-}
-
-function htRibbonStreakHtml(streakDays) {
-  const d = Math.max(0, Math.floor(Number(streakDays) || 0));
-  if (d >= 365) {
-    return `<span class="ht-ribbon-sec-streak ht-streak-legend">${htIcon('flame', 'ht-streak-legend-flame')}<span class="ht-streak-legend-inner"><span class="ht-streak-day-count">${d}d</span></span></span>`;
-  }
-  const c = htStreakTierSolid(d);
-  return `<span class="ht-ribbon-sec-streak" style="color:${c}">${htIcon('flame')}<span class="ht-streak-day-count">${d}d</span></span>`;
-}
-
-/** Year-lap streak meter fill: same tier solids as flame; 365d+ uses animated orange-sherbet gradient. */
-function htYearMeterFillHtml(pct, streakDays) {
-  const p = Math.max(0, Math.min(100, Number(pct) || 0));
-  const d = Math.max(0, Math.floor(Number(streakDays) || 0));
-  if (d >= 365) {
-    return `<span class="ht-habit-streak-meter-fill ht-habit-streak-meter-fill--legend" style="width:${p}%"></span>`;
-  }
-  const tierDays = Math.min(d + (d >= 7 ? 1 : 0), 364);
-  const c = htStreakTierSolid(tierDays);
-  return `<span class="ht-habit-streak-meter-fill" style="width:${p}%;background:${c};"></span>`;
-}
-
-function htEsc(str) {
-  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-/** Tabler Icons (tabler.io) — webfont uses `ti ti-{name}` per https://docs.tabler.io/icons/webfont */
-function htIcon(name, extraClass = '') {
-  const n = String(name || '').trim();
-  if (!n || !/^[a-z][a-z0-9-]*$/.test(n)) return '';
-  const ex = extraClass ? ' ' + extraClass : '';
-  return `<i class="ti ti-${n}${ex}" aria-hidden="true"></i>`;
-}
-
-/** Curated icons for category picker (slug → menu label). */
-const HT_CATEGORY_ICONS = [
-  { slug: 'folder', label: 'Folder' },
-  { slug: 'category', label: 'Category' },
-  { slug: 'target', label: 'Target' },
-  { slug: 'checklist', label: 'Checklist' },
-  { slug: 'list-check', label: 'List Check' },
-  { slug: 'clock', label: 'Clock' },
-  { slug: 'calendar', label: 'Calendar' },
-  { slug: 'calendar-event', label: 'Calendar Event' },
-  { slug: 'flame', label: 'Flame' },
-  { slug: 'heart', label: 'Heart' },
-  { slug: 'star', label: 'Star' },
-  { slug: 'sparkles', label: 'Sparkles' },
-  { slug: 'bolt', label: 'Bolt' },
-  { slug: 'moon', label: 'Moon' },
-  { slug: 'sun', label: 'Sun' },
-  { slug: 'sunrise', label: 'Sunrise' },
-  { slug: 'sunset', label: 'Sunset' },
-  { slug: 'cloud', label: 'Cloud' },
-  { slug: 'cloud-rain', label: 'Rain Cloud' },
-  { slug: 'cloud-snow', label: 'Snow Cloud' },
-  { slug: 'umbrella', label: 'Umbrella' },
-  { slug: 'droplet', label: 'Droplet' },
-  { slug: 'coffee', label: 'Coffee' },
-  { slug: 'cup', label: 'Cup' },
-  { slug: 'mug', label: 'Mug' },
-  { slug: 'glass', label: 'Glass' },
-  { slug: 'book', label: 'Book' },
-  { slug: 'books', label: 'Books' },
-  { slug: 'notebook', label: 'Notebook' },
-  { slug: 'pencil', label: 'Pencil' },
-  { slug: 'pen', label: 'Pen' },
-  { slug: 'barbell', label: 'Barbell' },
-  { slug: 'run', label: 'Run' },
-  { slug: 'walk', label: 'Walk' },
-  { slug: 'swimming', label: 'Swim' },
-  { slug: 'music', label: 'Music' },
-  { slug: 'headphones', label: 'Headphones' },
-  { slug: 'microphone', label: 'Microphone' },
-  { slug: 'bike', label: 'Bike' },
-  { slug: 'pill', label: 'Pill' },
-  { slug: 'stethoscope', label: 'Stethoscope' },
-  { slug: 'heartbeat', label: 'Heartbeat' },
-  { slug: 'first-aid-kit', label: 'First Aid' },
-  { slug: 'brush', label: 'Brush' },
-  { slug: 'palette', label: 'Palette' },
-  { slug: 'camera', label: 'Camera' },
-  { slug: 'photo', label: 'Photo' },
-  { slug: 'movie', label: 'Movie' },
-  { slug: 'home', label: 'Home' },
-  { slug: 'building', label: 'Building' },
-  { slug: 'sofa', label: 'Sofa' },
-  { slug: 'tools', label: 'Tools' },
-  { slug: 'tool', label: 'Tool' },
-  { slug: 'hammer', label: 'Hammer' },
-  { slug: 'wrench', label: 'Wrench' },
-  { slug: 'briefcase', label: 'Briefcase' },
-  { slug: 'school', label: 'School' },
-  { slug: 'certificate', label: 'Certificate' },
-  { slug: 'bulb', label: 'Bulb' },
-  { slug: 'plane', label: 'Plane' },
-  { slug: 'car', label: 'Car' },
-  { slug: 'bus', label: 'Bus' },
-  { slug: 'train', label: 'Train' },
-  { slug: 'map', label: 'Map' },
-  { slug: 'map-pin', label: 'Map Pin' },
-  { slug: 'world', label: 'World' },
-  { slug: 'tree', label: 'Tree' },
-  { slug: 'leaf', label: 'Leaf' },
-  { slug: 'plant', label: 'Plant' },
-  { slug: 'flower', label: 'Flower' },
-  { slug: 'mountain', label: 'Mountain' },
-  { slug: 'beach', label: 'Beach' },
-  { slug: 'snowflake', label: 'Snowflake' },
-  { slug: 'apple', label: 'Apple' },
-  { slug: 'carrot', label: 'Carrot' },
-  { slug: 'lemon', label: 'Lemon' },
-  { slug: 'cherry', label: 'Cherry' },
-  { slug: 'chef-hat', label: 'Chef Hat' },
-  { slug: 'trophy', label: 'Trophy' },
-  { slug: 'medal', label: 'Medal' },
-  { slug: 'award', label: 'Award' },
-  { slug: 'puzzle', label: 'Puzzle' },
-  { slug: 'gift', label: 'Gift' },
-  { slug: 'flag', label: 'Flag' },
-  { slug: 'bookmark', label: 'Bookmark' },
-  { slug: 'compass', label: 'Compass' },
-  { slug: 'brain', label: 'Brain' },
-  { slug: 'atom', label: 'Atom' },
-  { slug: 'math', label: 'Math' },
-  { slug: 'language', label: 'Language' },
-  { slug: 'dog', label: 'Dog' },
-  { slug: 'cat', label: 'Cat' },
-  { slug: 'paw', label: 'Paw' },
-  { slug: 'fish', label: 'Fish' },
-  { slug: 'users', label: 'People' },
-  { slug: 'user', label: 'Person' },
-  { slug: 'user-heart', label: 'Care' },
-  { slug: 'messages', label: 'Messages' },
-  { slug: 'message-circle', label: 'Message' },
-  { slug: 'phone', label: 'Phone' },
-  { slug: 'chart-line', label: 'Chart' },
-  { slug: 'chart-bar', label: 'Bar Chart' },
-  { slug: 'chart-pie', label: 'Pie Chart' },
-  { slug: 'coins', label: 'Coins' },
-  { slug: 'currency-dollar', label: 'Dollar' },
-  { slug: 'wallet', label: 'Wallet' },
-  { slug: 'device-mobile', label: 'Phone' },
-  { slug: 'device-laptop', label: 'Laptop' },
-  { slug: 'device-tablet', label: 'Tablet' },
-  { slug: 'keyboard', label: 'Keyboard' },
-  { slug: 'mouse', label: 'Mouse' },
-  { slug: 'wifi', label: 'WiFi' },
-  { slug: 'battery', label: 'Battery' },
-  { slug: 'plug', label: 'Plug' },
-  { slug: 'lock', label: 'Lock' },
-  { slug: 'shield', label: 'Shield' },
-  { slug: 'key', label: 'Key' },
-  { slug: 'zzz', label: 'Sleep' },
-  { slug: 'infinity', label: 'Infinity' },
-  { slug: 'pray', label: 'Pray' },
-  { slug: 'mood-smile', label: 'Smile' },
-  { slug: 'mood-happy', label: 'Happy' },
-  { slug: 'mood-sad', label: 'Sad' },
-  { slug: 'peace', label: 'Peace' },
-];
-
-function htCategoryGlyphHtml(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return htIcon('folder');
-  if (/^[a-z][a-z0-9-]*$/.test(s) && s.length < 48) return htIcon(s);
-  return `<span class="ht-emoji-inline">${htEsc(s)}</span>`;
-}
-
-function htGenId() {
-  return Math.random().toString(36).slice(2, 10);
-}
 
 class Plugin extends AppPlugin {
+  onLoad() {
+    this._unreg = null;
+    this._unregTab = null;
+    this._habits = null;
 
-  async onLoad() {
-    this._panelStates = new Map();
-    this._eventIds = [];
-    this._htNavTimers = new Map();
-    this._htLogRowsCache = { ts: 0, rows: null };
-    this._htLogRowsFetchGen = 0;
-    this._htDedicatedCollEnsurePromise = null;
-    this._persistState = (this.getConfiguration?.()?.custom ?? this.config?.custom)?.persist_habit_panel_state !== false;
-    void this._htDeferredPathB();
-    this._collapsed = this._persistState ? (localStorage.getItem('ht_sidebar_collapsed') === 'true') : false;
-    this._catCollapsed = this._persistState ? JSON.parse(localStorage.getItem('ht_cat_collapsed') || '{}') : {};
-    this._config = { categories: [], habits: [] };
+    try {
+      this._habits = new DawnHabitsEngine(this);
+      this._habits.attach();
+    } catch (e) {
+      console.error('[Dawn/Habits] engine missing — deploy concatenated bundle', e);
+      return;
+    }
 
-    this.ui.injectCSS(HT_CSS);
+    this._waitForBoot((boot) => {
+      this._unreg = boot.register({
+        id: 'dawn-habits',
+        tier: 'idle',
+        runIdle: ({ isMobile }) => this._habits?._runIdleIndex?.(boot, isMobile),
+        idleDelayMs: (isMobile) => (isMobile ? 8000 : 450),
+      });
+      boot.enqueue?.(() => this._habits?._loadVaultConfig?.(), {
+        id: 'habits:vault-config',
+        tier: 'onDemand',
+      });
+    });
 
-    this._cmdSettings = this.ui.addCommandPaletteCommand({
-      label: 'HabitTracker: Manage Habits & Categories',
-      icon: 'ti-settings',
-      onSelected: () => this.openSettings(),
-    });
-    this._cmdRefresh = this.ui.addCommandPaletteCommand({
-      label: 'HabitTracker: Refresh Panel',
-      icon: 'ti-refresh',
-      onSelected: () => this.refreshAllPanels(),
-    });
-    this._cmdExport = this.ui.addCommandPaletteCommand({
-      label: 'HabitTracker: Export config JSON (readable backup)',
-      icon: 'ti-download',
-      onSelected: () => { void this._htExportHabitConfigJson(); },
-    });
-    this._cmdImport = this.ui.addCommandPaletteCommand({
-      label: 'HabitTracker: Import config JSON from backup…',
-      icon: 'ti-upload',
-      onSelected: () => this._htImportHabitConfigJson(),
-    });
-    this._cmdStorage = this.ui.addCommandPaletteCommand({
-      label: 'Habit Tracker: Storage location…',
-      icon: 'ti-database',
-      onSelected: () => {
-        if (!this._persistState) {
-          this.ui.addToaster?.({
-            title: 'Habit Tracker',
-            message: 'Panel state persistence is off (plugin.json custom.persist_habit_panel_state).',
-            dismissible: true,
-            autoDestroyTime: 5000,
-          });
-          return;
-        }
-        globalThis.ThymerPluginSettings?.openStorageDialog?.({
-          plugin: this,
-          pluginId: 'habit-tracker',
-          modeKey: 'thymerext_ps_mode_habit_tracker',
-          mirrorKeys: () => this._htPluginSettingsMirrorKeys(),
-          label: 'Habit Tracker',
-          data: this.data,
-          ui: this.ui,
+    this._waitFor(
+      (g) => !!(g.__dawnJhsShell && (g.__dawnJhsShell.registerTab || g.__dawnJhsShell.registerAddon)),
+      () => {
+        const shell = globalThis.__dawnJhsShell;
+        const reg = shell.registerTab || shell.registerAddon;
+        const habits = this._habits;
+        if (!habits) return;
+        this._unregTab = reg.call(shell, {
+          id: 'habits',
+          label: 'Habits',
+          icon: 'ti-flame',
+          mode: 'inline',
+          order: 20,
+          mount: (el, ctx) => habits._mount(el, ctx),
+          onDay: (dayLabel, meta) => habits._onDay(dayLabel, meta),
+          onExpand: (expanded) => habits._onExpand(expanded),
+          onSettings: () => habits._toggleManage?.(),
         });
-      },
-    });
-
-    try {
-      await this._htEnsureHabitsStorageReady();
-    } catch (e) {
-      console.error('[Habit Tracker] habit storage ensure', e);
-    }
-    try {
-      await this._migrateLegacyHabitTrackerToPluginSettings();
-    } catch (e) {
-      console.error('[Habit Tracker] habit migration', e);
-    }
-    await this._loadConfig();
-
-    this._eventIds.push(this.events.on('panel.navigated', (ev) => this._deferPanelChanged(ev.panel)));
-    this._eventIds.push(this.events.on('panel.focused', (ev) => this._onPanelChanged(ev.panel)));
-    this._eventIds.push(this.events.on('panel.closed', (ev) => this._onPanelClosed(ev.panel)));
-
-    const panel = this.ui.getActivePanel();
-    if (panel) this._onPanelChanged(panel);
-    setTimeout(() => {
-      const p = this.ui.getActivePanel();
-      if (p) this._onPanelChanged(p);
-    }, 300);
-  }
-
-  async _htDeferredPathB() {
-    try {
-      await (globalThis.ThymerPluginSettings?.yieldToHostBeforePathB?.() ?? Promise.resolve());
-      try {
-        await globalThis.ThymerPluginSettings?.registerPluginSlug?.(this.data, { slug: HT_PS_SLUG, label: 'Habit Tracker' });
-      } catch (_) {}
-      if (this._persistState) {
-        await (globalThis.ThymerPluginSettings?.init?.({
-          plugin: this,
-          pluginId: 'habit-tracker',
-          modeKey: 'thymerext_ps_mode_habit_tracker',
-          mirrorKeys: () => this._htPluginSettingsMirrorKeys(),
-          label: 'Habit Tracker',
-          data: this.data,
-          ui: this.ui,
-        }) ?? (console.warn('[HabitTracker] ThymerPluginSettings runtime missing (redeploy full plugin .js from repo).'), Promise.resolve()));
       }
-    } catch (e) {
-      try {
-        console.warn('[HabitTracker] deferred Path B init', e);
-      } catch (_) {}
-    }
+    );
   }
 
   onUnload() {
-    for (const id of this._eventIds || []) {
-      try { this.events.off(id); } catch (e) {}
-    }
-    this._eventIds = [];
-    for (const t of (this._htNavTimers || new Map()).values()) {
-      try { clearTimeout(t); } catch (e) {}
-    }
-    this._htNavTimers?.clear();
-    this._cmdSettings?.remove?.();
-    this._cmdRefresh?.remove?.();
-    this._cmdExport?.remove?.();
-    this._cmdImport?.remove?.();
-    this._cmdStorage?.remove?.();
-    for (const [, state] of (this._panelStates || new Map())) {
-      this._disposeState(state);
-    }
-    this._panelStates?.clear?.();
-  }
-
-  _htInvalidateLogRowsCache() {
-    this._htLogRowsCache = { ts: 0, rows: null };
-    this._htLogRowsFetchGen = (this._htLogRowsFetchGen || 0) + 1;
-    // Do not clear _htLogRowsInFlight: an in-flight list may still complete; the
-    // generation check in _getAllLogRows retries if a save invalidated mid-fetch.
-  }
-
-  _htPluginSettingsMirrorKeys() {
-    return [
-      'ht_sidebar_collapsed',
-      'ht_cat_collapsed',
-      'ht_tag_collapsed',
-      'ht_stats_range',
-      'ht_habit_group_mode',
-      'ht_habit_tag_filter',
-      HT_HABIT_LAYOUT_SINGLE_COLUMN_KEY,
-    ];
-  }
-
-  _htPluginSettingsFlush() {
-    if (!this._persistState) return;
-    globalThis.ThymerPluginSettings?.scheduleFlush?.(this, () => this._htPluginSettingsMirrorKeys());
-  }
-
-  /** Single-column habit grid (journal + settings cards); not gated on `_persistState`. */
-  _htReadHabitLayoutSingleColumn() {
     try {
-      return localStorage.getItem(HT_HABIT_LAYOUT_SINGLE_COLUMN_KEY) === '1';
-    } catch (_) {
-      return false;
-    }
-  }
-
-  _htWriteHabitLayoutSingleColumn(enabled) {
-    try {
-      if (enabled) localStorage.setItem(HT_HABIT_LAYOUT_SINGLE_COLUMN_KEY, '1');
-      else localStorage.removeItem(HT_HABIT_LAYOUT_SINGLE_COLUMN_KEY);
+      this._unregTab?.();
     } catch (_) {}
-    if (this._persistState) this._htPluginSettingsFlush();
-  }
-
-  // ── Lifecycle ────────────────────────────────────────────────────────────
-
-
-  // ── Habit storage (dedicated "Habit Logs" collection only) ──────────────
-
-  _tps() {
-    return globalThis.ThymerPluginSettings;
-  }
-
-  _readJsonStore(r) {
-    if (!r) return '';
-    const asText = (x) => {
-      if (x == null) return '';
-      if (typeof x === 'string') return x;
-      if (typeof x === 'object') {
-        try {
-          return JSON.stringify(x);
-        } catch (_) {
-          return '';
-        }
-      }
-      return String(x);
-    };
-    const tps = this._tps();
-    if (tps?.rowField) {
-      const j = tps.rowField(r, 'settings_json');
-      const s = asText(j).trim();
-      if (s) return s;
-    }
-    return asText(
-      r.text?.('settings_json') ||
-        r.prop?.('settings_json')?.text?.() ||
-        r.prop?.('settings_json')?.get?.() ||
-        r.text?.('data') ||
-        r.prop?.('data')?.text?.() ||
-        r.prop?.('data')?.get?.() ||
-        ''
-    );
-  }
-
-  _writeJsonStore(rec, obj) {
-    if (!rec) return;
-    const json = typeof obj === 'string' ? obj : JSON.stringify(obj);
     try {
-      rec.prop('settings_json')?.set?.(json);
-    } catch (e) {
-      try {
-        rec.prop('data')?.set?.(json);
-      } catch (e2) {}
-    }
-  }
-
-  async _psListByKind(recordKind) {
-    return this._htDedicatedListByKind(recordKind);
-  }
-
-  _htWsSlug() {
+      this._habits?.detach?.();
+    } catch (_) {}
     try {
-      const u = this.data?.getActiveUsers?.();
-      return (u && u[0] && u[0].workspaceGuid) || 'unknown_ws';
-    } catch (_) {
-      return 'unknown_ws';
-    }
-  }
-
-  _jhsHabitsLegacyStorageModeLsKey() {
-    return `${HT_LEGACY_STORAGE_MODE_KEY}_${this._htWsSlug()}`;
-  }
-
-  _jhsHabitsDedicatedCollGuidLsKey() {
-    return `${HT_DEDICATED_COLL_GUID_KEY}_${this._htWsSlug()}`;
-  }
-
-  // The dedicated "Habit Logs" collection is the ONLY persistence target. Kept as a
-  // method (rather than a constant) so older call sites read consistently, and so the
-  // single source of truth is right here if the policy ever needs to change.
-  _htUsesDedicatedHabitsStore() {
-    return true;
-  }
-
-  _htGetDedicatedCollGuidFromLs() {
-    try {
-      const g = localStorage.getItem(this._htHabitsDedicatedCollGuidLsKey());
-      return g && String(g).trim() ? String(g).trim() : '';
-    } catch (_) {
-      return '';
-    }
-  }
-
-  _htSetDedicatedCollGuidToLs(guid) {
-    try {
-      if (guid) localStorage.setItem(this._htHabitsDedicatedCollGuidLsKey(), String(guid));
+      this._unreg?.();
     } catch (_) {}
   }
 
-  _jhsLocksBestWindow() {
-    try {
-      const t = window.top;
-      if (t) {
-        void t.document;
-        return t;
-      }
-    } catch (_) {}
-    return typeof window !== 'undefined' ? window : globalThis;
-  }
-
-  /** Same host object / promise chain as Plugin Backend `queueDataCreateOnSharedWindow` (Thymer plugin iframes). */
-  _jhsQueueDataCreate(factory) {
-    const host = htGetSharedDeduplicationWindow();
-    try {
-      if (!host[HT_SERIAL_DATA_CREATE_P] || typeof host[HT_SERIAL_DATA_CREATE_P].then !== 'function') {
-        host[HT_SERIAL_DATA_CREATE_P] = Promise.resolve();
-      }
-      return (host[HT_SERIAL_DATA_CREATE_P] = host[HT_SERIAL_DATA_CREATE_P].catch(() => {}).then(factory));
-    } catch (e) {
-      console.warn('[Habit Tracker] queueDataCreate fallback', e);
-      return factory();
-    }
-  }
-
-  /** Normalize sync vs Promise return from `data.createCollection()`. */
-  async _jhsInvokeCreateCollectionOnce() {
-    const data = this.data;
-    if (!data || typeof data.createCollection !== 'function') return null;
-    try {
-      const raw = data.createCollection();
-      const coll = raw != null && typeof raw.then === 'function' ? await raw : raw;
-      if (coll && typeof coll.getConfiguration === 'function' && typeof coll.saveConfiguration === 'function') {
-        return coll;
-      }
-      console.warn('[Habit Tracker] createCollection returned non-collection', {
-        type: typeof coll,
-        hasGetCfg: !!(coll && typeof coll.getConfiguration === 'function'),
-        hasSaveCfg: !!(coll && typeof coll.saveConfiguration === 'function'),
-      });
-    } catch (e) {
-      console.warn('[Habit Tracker] createCollection threw', e);
-    }
-    return null;
-  }
-
-  /**
-   * Single-mode bootstrap (2026-05-08): habit config + log rows live ONLY in the
-   * dedicated "Habit Logs" collection. There is no Plugin Backend fallback.
-   *
-   * Why: the previous dual-mode design had three separate ways to silently revert
-   * to Plugin Backend (transient `getAllCollections()` failure on slow boot, an
-   * empty `localStorage` flag triggering auto-detect against orphan PB rows, and
-   * `_jhsWsSlug()` returning 'unknown_ws' before active users were populated, which
-   * namespaced the flag under a different key than later reads). Any one of those
-   * caused the habit panel to start writing duplicate rows back into PB, which
-   * then ballooned into a record-mutation storm.
-   *
-   * If the dedicated collection cannot be ensured here, callers will see empty
-   * lists and `_htHabitsCanPersistDataRows()`-style writes will be no-ops on a
-   * missing collection — never a silent regression onto PB.
-   */
-  async _htEnsureHabitsStorageReady() {
-    try {
-      const legacy = localStorage.getItem(this._htHabitsLegacyStorageModeLsKey());
-      if (legacy === 'pb' || legacy === 'dedicated') {
-        try {
-          localStorage.removeItem(this._htHabitsLegacyStorageModeLsKey());
-        } catch (_) {}
-      }
-    } catch (_) {}
-    const coll = await this._htEnsureDedicatedHabitsCollection();
-    if (!coll) {
-      console.warn(
-        '[Habit Tracker] Dedicated habits collection "' +
-          HT_DEDICATED_COLL_NAME +
-          '" could not be opened or created. Habit reads/writes will be inert until it is available — the plugin will NOT fall back to Plugin Backend.'
-      );
-    }
-  }
-
-  /**
-   * Legacy migration kept as a deliberate no-op: this used to copy rows from a
-   * pre-2024 "HabitTracker" collection into Plugin Backend. Both the source
-   * collection and the destination mode are gone now. Left in place so we can
-   * one-shot-reset the migrate flag without disturbing other call sites.
-   */
-  async _migrateLegacyHabitTrackerToPluginSettings() {
-    try {
-      if (localStorage.getItem(HT_PS_MIGRATE_KEY) !== '1') {
-        localStorage.setItem(HT_PS_MIGRATE_KEY, '1');
-      }
-    } catch (_) {}
-  }
-
-  async _htDedicatedMergeSchema(coll) {
-    if (!coll?.getConfiguration || !coll.saveConfiguration) return;
-    const desired = htDedicatedHabitsCollectionShape();
-    let base = {};
-    try {
-      base = coll.getConfiguration() || {};
-    } catch (_) {
-      base = {};
-    }
-    const curFields = Array.isArray(base.fields) ? [...base.fields] : [];
-    const curIds = new Set(curFields.map((f) => (f && f.id ? String(f.id) : '')).filter(Boolean));
-    let changed = false;
-    for (const f of desired.fields || []) {
-      if (f && f.id && !curIds.has(String(f.id))) {
-        try {
-          curFields.push(JSON.parse(JSON.stringify(f)));
-        } catch (_) {
-          curFields.push({ ...f });
-        }
-        curIds.add(String(f.id));
-        changed = true;
-      }
-    }
-    if (!changed) return;
-    const merged = {
-      ...base,
-      fields: curFields,
-      managed: { fields: false, views: false, sidebar: false },
-    };
-    try {
-      await coll.saveConfiguration(merged);
-    } catch (e) {
-      console.warn('[Habit Tracker] dedicated schema merge', e);
-    }
-  }
-
-  _jhsDedicatedCollectionSidebarName(coll) {
-    try {
-      return String(coll?.getName?.() || '').trim();
-    } catch (_) {
-      return '';
-    }
-  }
-
-  _jhsDedicatedCollectionConfigName(coll) {
-    try {
-      const cfg = coll?.getConfiguration?.();
-      return String(cfg?.name || '').trim();
-    } catch (_) {
-      return '';
-    }
-  }
-
-  /**
-   * Locate the dedicated habits store: `getName()` may stay "New Collection" while `configuration.name` is "Habit Logs".
-   */
-  _jhsFindDedicatedHabitsCollectionInList(all) {
-    if (!Array.isArray(all)) return null;
-    for (const c of all) {
-      if (this._htDedicatedCollectionSidebarName(c) === HT_DEDICATED_COLL_NAME) return c;
-    }
-    for (const c of all) {
-      if (this._htDedicatedCollectionConfigName(c) === HT_DEDICATED_COLL_NAME) return c;
-    }
-    return null;
-  }
-
-  /** Serialize ensure + create so concurrent callers cannot race-create multiple collections. */
-  async _htEnsureDedicatedHabitsCollection() {
-    if (!this.data || typeof this.data.getAllCollections !== 'function') return null;
-    if (this._htDedicatedCollEnsurePromise) {
-      return await this._htDedicatedCollEnsurePromise;
-    }
-    const p = (async () => {
+  _waitFor(pred, cb) {
+    let n = 0;
+    const tick = () => {
       try {
-        return await this._htEnsureDedicatedHabitsCollectionCore();
-      } finally {
-        this._htDedicatedCollEnsurePromise = null;
-      }
-    })();
-    this._htDedicatedCollEnsurePromise = p;
-    return await p;
-  }
-
-  async _htEnsureDedicatedHabitsCollectionCore() {
-    const guidStored = this._htGetDedicatedCollGuidFromLs();
-    if (guidStored) {
-      try {
-        if (typeof this.data.getCollection === 'function') {
-          const c = await this.data.getCollection(guidStored);
-          if (c) {
-            await this._htDedicatedMergeSchema(c);
-            return c;
-          }
-        }
-      } catch (_) {}
-      try {
-        localStorage.removeItem(this._htHabitsDedicatedCollGuidLsKey());
-      } catch (_) {}
-    }
-    const run = async () => {
-      let all = [];
-      try {
-        all = await this.data.getAllCollections();
-      } catch (_) {
-        return null;
-      }
-      const existing = this._htFindDedicatedHabitsCollectionInList(all);
-      if (existing) {
-        const g = this._htGetCollectionGuid(existing);
-        if (g) this._htSetDedicatedCollGuidToLs(g);
-        await this._htDedicatedMergeSchema(existing);
-        return existing;
-      }
-      if (typeof this.data.createCollection !== 'function') {
-        console.error('[Habit Tracker] data.createCollection is not a function');
-        return null;
-      }
-      let coll = await this._htQueueDataCreate(() => this._htInvokeCreateCollectionOnce());
-      if (!coll || typeof coll.saveConfiguration !== 'function') {
-        console.warn(
-          '[Habit Tracker] queued createCollection unusable; retrying once without serial queue.',
-          { sameAsThisWindow: htGetSharedDeduplicationWindow() === (typeof window !== 'undefined' ? window : null) }
-        );
-        await htSleep(400);
-        coll = await this._htInvokeCreateCollectionOnce();
-      }
-      if (!coll || typeof coll.saveConfiguration !== 'function') {
-        console.error('[Habit Tracker] createCollection returned unusable collection after retry', coll);
-        return null;
-      }
-      const shape = htDedicatedHabitsCollectionShape();
-      let base = {};
-      try {
-        base = coll.getConfiguration() || {};
-      } catch (_) {
-        base = {};
-      }
-      if (base && typeof base.ver === 'number') shape.ver = base.ver;
-      const payload = { ...shape, managed: { fields: false, views: false, sidebar: false } };
-      let ok = await coll.saveConfiguration(payload);
-      if (ok === false) {
-        await htSleep(180);
-        ok = await coll.saveConfiguration(payload);
-      }
-      if (ok === false) {
-        console.error('[Habit Tracker] saveConfiguration returned false for dedicated habits collection', {
-          name: HT_DEDICATED_COLL_NAME,
-        });
-        return null;
-      }
-      let out = coll;
-      try {
-        await htSleep(80);
-        const all2 = await this.data.getAllCollections();
-        const rediscovered = this._htFindDedicatedHabitsCollectionInList(all2);
-        if (rediscovered) out = rediscovered;
-        const g = this._htGetCollectionGuid(out);
-        if (g) this._htSetDedicatedCollGuidToLs(g);
-      } catch (e) {
-        console.warn('[Habit Tracker] post-create rediscover / guid', e);
-      }
-      await this._htDedicatedMergeSchema(out);
-      return out;
-    };
-    try {
-      const w = htGetSharedDeduplicationWindow();
-      if (w.navigator?.locks?.request) {
-        return await w.navigator.locks.request(HT_DEDICATED_ENSURE_LOCK, () => run());
-      }
-    } catch (_) {}
-    return await run();
-  }
-
-  async _htResolveDedicatedHabitsCollection() {
-    return this._htEnsureDedicatedHabitsCollection();
-  }
-
-  async _htDedicatedListByKind(recordKind) {
-    const coll = await this._htResolveDedicatedHabitsCollection();
-    if (!coll) return [];
-    const tps = this._tps();
-    if (!tps?.rowField) return [];
-    let records = [];
-    try {
-      records = await coll.getAllRecords();
-    } catch (e) {
-      console.error('[HabitTracker] dedicated getAllRecords', e);
-      return [];
-    }
-    return (records || []).filter((r) => {
-      let rowSlug = tps.rowField(r, 'plugin');
-      if (!rowSlug) {
-        const pid = tps.rowField(r, 'plugin_id');
-        const s = String(pid || '');
-        const i = s.indexOf(':');
-        rowSlug = i > 0 ? s.slice(0, i) : s;
-      }
-      if (rowSlug !== HT_PS_SLUG) return false;
-      if (recordKind != null && String(recordKind) !== '') {
-        const rk = (tps.rowField(r, 'record_kind') || '').trim();
-        return rk === String(recordKind);
-      }
-      return true;
-    });
-  }
-
-  _htPluginChoiceLabelForSlug(coll, slug) {
-    const s = String(slug || '').trim();
-    try {
-      const fields = coll.getConfiguration?.()?.fields || [];
-      const f = fields.find((x) => x && x.id === 'plugin');
-      if (!f || f.type !== 'choice' || !Array.isArray(f.choices)) return s;
-      const opt = f.choices.find((c) => c && String(c.id || '').trim() === s);
-      if (opt && opt.label != null && String(opt.label).trim()) return String(opt.label).trim();
-    } catch (_) {}
-    return s;
-  }
-
-  _htApplyHabitRowMeta(coll, record, { pluginSlug, recordKind, rowPluginId }) {
-    if (!record) return;
-    try {
-      record.prop('plugin_id')?.set?.(rowPluginId);
-    } catch (_) {}
-    try {
-      record.prop('record_kind')?.set?.(recordKind);
-    } catch (_) {}
-    const p = record.prop?.('plugin');
-    const labelTry = this._htPluginChoiceLabelForSlug(coll, pluginSlug);
-    if (p && typeof p.setChoice === 'function') {
-      if (p.setChoice(labelTry)) return;
-      if (labelTry !== pluginSlug && p.setChoice(pluginSlug)) return;
-      try {
-        p.set?.(pluginSlug);
-      } catch (_) {}
-      return;
-    }
-    try {
-      p?.set?.(pluginSlug);
-    } catch (_) {}
-  }
-
-  _htHabitsCanPersistDataRows() {
-    return !!this.data;
-  }
-
-  async _htDedicatedCreateDataRow({ recordKind, rowPluginId, recordTitle, settingsDoc } = {}) {
-    const coll = await this._htResolveDedicatedHabitsCollection();
-    if (!coll) return null;
-    const rid = (rowPluginId || '').trim();
-    const kind = (recordKind || '').trim();
-    if (!rid || !kind) return null;
-    await this._htDedicatedMergeSchema(coll);
-    const title = (recordTitle || rid).trim() || rid;
-    let guid = null;
-    try {
-      guid = coll.createRecord?.(title);
-    } catch (e) {
-      console.error('[HabitTracker] dedicated createRecord', e);
-      return null;
-    }
-    if (!guid) return null;
-    let r = null;
-    for (let i = 0; i < 30; i++) {
-      await htSleep(i < 8 ? 100 : 200);
-      try {
-        const again = await coll.getAllRecords();
-        r = again.find((x) => x.guid === guid) || again.find((x) => this._tps()?.rowField(x, 'plugin_id') === rid);
-        if (r) break;
-      } catch (_) {}
-    }
-    if (!r) return null;
-    this._htApplyHabitRowMeta(coll, r, { pluginSlug: HT_PS_SLUG, recordKind: kind, rowPluginId: rid });
-    const json =
-      settingsDoc !== undefined && settingsDoc !== null
-        ? typeof settingsDoc === 'string'
-          ? settingsDoc
-          : JSON.stringify(settingsDoc)
-        : '{}';
-    try {
-      r.prop('settings_json')?.set?.(json);
-    } catch (e) {
-      console.warn('[HabitTracker] dedicated settings_json', e);
-    }
-    return r;
-  }
-
-  async _htCreateHabitDataRow(partial) {
-    return this._htDedicatedCreateDataRow(partial);
-  }
-
-  /**
-   * When multiple `config` rows exist (duplicates / partial saves), pick the record whose JSON
-   * has the most real habit data — `rows[0]` order from Thymer is not stable.
-   */
-  _htPickBestConfigRow(rows) {
-    if (!Array.isArray(rows) || rows.length === 0) return null;
-    let best = null;
-    let bestScore = -1;
-    for (const r of rows) {
-      const raw = this._readJsonStore(r);
-      if (!raw || !String(raw).trim()) continue;
-      let score = 0;
-      try {
-        const doc = JSON.parse(raw);
-        const cats = Array.isArray(doc.categories) ? doc.categories.length : 0;
-        const habits = Array.isArray(doc.habits) ? doc.habits.length : 0;
-        score = cats * 2000 + habits * 10 + String(raw).length;
-      } catch (_) {
-        score = String(raw).length;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        best = r;
-      }
-    }
-    return best || rows[0] || null;
-  }
-
-  /**
-   * Habits UI reads **config** (categories + habit definitions). Log rows only store daily completions.
-   * If config is empty but logs still have `completions` keys (e.g. after plugin reinstall / row order
-   * glitches), rebuild a minimal config and persist so the panel works again.
-   */
-  async _htRecoverHabitConfigFromLogsIfNeeded() {
-    let cfg = this._config;
-    if (!cfg) return;
-    cfg = htNormalizeHabitConfig(cfg);
-
-    const restoredName = (h) => /^Restored habit\s*\(/i.test(String(h?.name || ''));
-    const bloatedAutoRecover =
-      cfg.categories.length === 1 &&
-      /^recovered$/i.test(String(cfg.categories[0]?.name || '').trim()) &&
-      cfg.habits.length > HT_RECOVER_MAX_HABITS &&
-      cfg.habits.every(restoredName);
-    if (bloatedAutoRecover) {
-      htHabitsDbg({
-        step: '_htRecoverHabitConfigFromLogsIfNeeded',
-        outcome: 'reset_bloated_recovered',
-        priorHabits: cfg.habits.length,
-      });
-      this._config = { categories: [], habits: [] };
-      cfg = this._config;
-    }
-
-    if (cfg.categories.length > 0) return;
-
-    if (cfg.habits.length > 0) {
-      const catId = htGenId();
-      cfg.categories = [{ id: catId, name: 'General', emoji: 'folder', order: 0 }];
-      const catIds = new Set(cfg.categories.map((c) => c.id));
-      for (let i = 0; i < cfg.habits.length; i++) {
-        const h = cfg.habits[i];
-        if (!h || catIds.has(h.categoryId)) continue;
-        h.categoryId = catId;
-      }
-      this._config = htNormalizeHabitConfig(cfg);
-      try {
-        await this._saveConfig();
-      } catch (_) {}
-      htHabitsDbg({
-        step: '_htRecoverHabitConfigFromLogsIfNeeded',
-        outcome: 'repaired_orphan_habits',
-        categoryCount: this._config.categories.length,
-        habitCount: this._config.habits.length,
-      });
-      console.warn(
-        '[Journal Header Suite / Habits] Config had habits but no categories; added a "General" category. Open settings to rename.'
-      );
-      return;
-    }
-
-    let logRows;
-    try {
-      logRows = await this._getAllLogRows(true);
-    } catch (_) {
-      return;
-    }
-    const lastSeen = new Map();
-    for (const r of logRows || []) {
-      const raw = this._readJsonStore(r);
-      if (!raw || !String(raw).trim()) continue;
-      try {
-        const d = JSON.parse(raw);
-        const logDate = htLogDateStrForRecover(d);
-        if (!logDate) continue;
-        const comp = d.completions || {};
-        for (const k of Object.keys(comp)) {
-          if (!htRecoverKeyLooksLikeHabitId(k)) continue;
-          const v = comp[k];
-          if (v === undefined || v === null) continue;
-          const prev = lastSeen.get(k);
-          if (!prev || logDate > prev) lastSeen.set(k, logDate);
-        }
-      } catch (_) {}
-    }
-    if (lastSeen.size === 0) return;
-
-    const cutoff = htDaysBefore(htToday(), HT_RECOVER_LOG_LOOKBACK_DAYS);
-    let ids = [...lastSeen.entries()]
-      .filter(([, dateStr]) => dateStr >= cutoff)
-      .sort((a, b) => b[1].localeCompare(a[1]))
-      .map(([id]) => id);
-    if (ids.length === 0) {
-      ids = [...lastSeen.entries()]
-        .sort((a, b) => b[1].localeCompare(a[1]))
-        .map(([id]) => id)
-        .slice(0, HT_RECOVER_MAX_HABITS);
-    }
-    const totalFound = ids.length;
-    if (ids.length > HT_RECOVER_MAX_HABITS) ids = ids.slice(0, HT_RECOVER_MAX_HABITS);
-
-    const catId = htGenId();
-    const habits = [];
-    let order = 0;
-    for (const id of ids) {
-      habits.push({
-        id,
-        name: `Restored habit (${id})`,
-        categoryId: catId,
-        order: order++,
-        tags: [],
-        weekdays: [],
-      });
-    }
-    this._config = htNormalizeHabitConfig({
-      ...cfg,
-      categories: [{ id: catId, name: 'Recovered', emoji: 'sparkles', order: 0 }],
-      habits,
-    });
-    try {
-      await this._saveConfig();
-    } catch (e) {
-      console.error('[HabitTracker] recover config from logs save failed', e);
-      return;
-    }
-    htHabitsDbg({
-      step: '_htRecoverHabitConfigFromLogsIfNeeded',
-      outcome: 'rebuilt_from_logs',
-      habitIds: habits.length,
-      distinctInLogs: lastSeen.size,
-      lookbackDays: HT_RECOVER_LOG_LOOKBACK_DAYS,
-      maxCap: HT_RECOVER_MAX_HABITS,
-    });
-    let wmsg = `[Journal Header Suite / Habits] Recovered ${habits.length} placeholder habit(s) from logs (${lastSeen.size} id(s) seen in completions).`;
-    if (totalFound > HT_RECOVER_MAX_HABITS) {
-      wmsg += ` Kept the ${HT_RECOVER_MAX_HABITS} most recently active by log date.`;
-    }
-    if (bloatedAutoRecover) wmsg += ' Replaced an oversized auto-recover list.';
-    wmsg +=
-      ' Keys must look like habit ids (short alphanumeric); stale ids outside ~' +
-      HT_RECOVER_LOG_LOOKBACK_DAYS +
-      'd are skipped. Open **Habits → settings** to rename.';
-    console.warn(wmsg);
-  }
-
-  async _loadConfig() {
-    this._config = { categories: [], habits: [] };
-    try {
-      const rows = await this._psListByKind('config');
-      const row = this._htPickBestConfigRow(rows);
-      if (!row) {
-        htHabitsDbg({ step: '_loadConfig', outcome: 'no_config_row', configRowCount: rows.length });
-      } else {
-        const raw = this._readJsonStore(row);
-        if (raw && String(raw).trim()) this._config = JSON.parse(raw);
-        htHabitsDbg({
-          step: '_loadConfig',
-          outcome: 'loaded',
-          configRowCount: rows.length,
-          rawLen: raw ? String(raw).length : 0,
-          categoryCount: this._config?.categories?.length ?? 0,
-          habitCount: this._config?.habits?.length ?? 0,
-        });
-      }
-    } catch (e) {
-      console.error('[HabitTracker] Error loading config:', e);
-      this._config = { categories: [], habits: [] };
-      htHabitsDbg({ step: '_loadConfig', outcome: 'error', err: String((e && e.message) || e) });
-    }
-    this._config = htNormalizeHabitConfig(this._config);
-    if (this._persistState) {
-      try {
-        localStorage.setItem('ht_habit_group_mode', this._config.habitGroupMode || 'category');
-      } catch (_) {}
-    }
-    let restoredFromLocal = false;
-    try {
-      restoredFromLocal = this._htTryRestoreHabitConfigFromLocalBackup();
-    } catch (e) {
-      console.error('[HabitTracker] local backup restore', e);
-    }
-    if (restoredFromLocal) {
-      try {
-        await this._saveConfig();
-      } catch (e) {
-        console.error('[HabitTracker] save after local backup restore', e);
-      }
-    }
-    try {
-      await this._htRecoverHabitConfigFromLogsIfNeeded();
-    } catch (e) {
-      console.error('[HabitTracker] recover habit config from logs', e);
-    }
-    if (this._htHabitConfigHasRealLabels(this._config)) {
-      try {
-        this._htPersistHabitConfigLocalBackup();
-      } catch (_) {}
-    }
-  }
-
-  /** True if habit names look like auto-recovered placeholders only (no human labels to preserve). */
-  _htHabitNamesLookPlaceholderOnly(cfg) {
-    const h = cfg?.habits;
-    if (!Array.isArray(h) || h.length === 0) return false;
-    return h.every((x) => /^Restored habit\s*\(/i.test(String(x?.name || '').trim()));
-  }
-
-  /** True when we have at least one category and one habit with a non-placeholder name. */
-  _htHabitConfigHasRealLabels(cfg) {
-    const c = htNormalizeHabitConfig(cfg || {});
-    if (!c.categories?.length || !c.habits?.length) return false;
-    return c.habits.some((h) => h && !/^Restored habit\s*\(/i.test(String(h.name || '').trim()));
-  }
-
-  /** Mirror full habit config to localStorage whenever Plugin Backend save succeeds (readable JSON). */
-  _htPersistHabitConfigLocalBackup() {
-    if (!this._persistState) return;
-    try {
-      const cfg = htNormalizeHabitConfig(this._config);
-      if (!cfg.categories?.length && !cfg.habits?.length) return;
-      if (!this._htHabitConfigHasRealLabels(cfg)) return;
-      const payload = { ver: 1, savedAt: new Date().toISOString(), config: cfg };
-      localStorage.setItem(HT_HABIT_CONFIG_BACKUP_KEY, JSON.stringify(payload));
-    } catch (e) {
-      if (e && e.name === 'QuotaExceededError') {
-        console.warn('[Journal Header Suite / Habits] local backup skipped (quota)', e.message);
-      }
-    }
-  }
-
-  /**
-   * If Plugin Backend config is empty or only "Restored habit (id)" placeholders, restore from
-   * {@link HT_HABIT_CONFIG_BACKUP_KEY} when that snapshot still has real labels.
-   */
-  _htTryRestoreHabitConfigFromLocalBackup() {
-    if (!this._persistState) return false;
-    const cur = htNormalizeHabitConfig(this._config);
-    const looksBad =
-      cur.categories.length === 0 ||
-      (cur.habits.length > 0 && this._htHabitNamesLookPlaceholderOnly(cur));
-    if (!looksBad) return false;
-    try {
-      const raw = localStorage.getItem(HT_HABIT_CONFIG_BACKUP_KEY);
-      if (!raw || !String(raw).trim()) return false;
-      const wrap = JSON.parse(raw);
-      const doc = wrap.config != null ? wrap.config : wrap;
-      const bn = htNormalizeHabitConfig(doc);
-      if (!bn.categories?.length || !bn.habits?.length) return false;
-      if (this._htHabitNamesLookPlaceholderOnly(bn)) return false;
-      this._config = bn;
-      htHabitsDbg({
-        step: '_htTryRestoreHabitConfigFromLocalBackup',
-        outcome: 'restored',
-        savedAt: wrap.savedAt || null,
-        categories: bn.categories.length,
-        habits: bn.habits.length,
-      });
-      console.info(
-        '[Journal Header Suite / Habits] Restored habit names/categories from local browser backup',
-        wrap.savedAt ? `(saved ${wrap.savedAt})` : '',
-        '— saving to habits storage.'
-      );
-      return true;
-    } catch (e) {
-      htHabitsDbg({ step: '_htTryRestoreHabitConfigFromLocalBackup', outcome: 'fail', err: String(e) });
-      return false;
-    }
-  }
-
-  async _htExportHabitConfigJson() {
-    try {
-      if (this._habitBootstrapEnabled) {
-        this._ensureHabitBootstrapStarted();
-        if (this._habitBootstrapPromise) await this._habitBootstrapPromise;
-      } else {
-        try {
-          await this._loadConfig();
-        } catch (_) {}
-      }
-      const cfg = htNormalizeHabitConfig(this._config || { categories: [], habits: [] });
-      if (!cfg.categories?.length && !cfg.habits?.length) {
-        this.ui.addToaster?.({
-          title: 'Habits export',
-          message:
-            'No config loaded yet. Enable the Habits tab in Journal Header Suite settings, open a journal day, then try again — or copy JSON from the habits “config” row in the "Habit Logs" collection.',
-          dismissible: true,
-          autoDestroyTime: 8000,
-        });
-        return;
-      }
-      const payload = {
-        ver: 1,
-        exportedAt: new Date().toISOString(),
-        note: 'Journal Header Suite habit config — keep this file safe; import via command palette if synced habits config is lost.',
-        config: cfg,
-      };
-      const text = JSON.stringify(payload, null, 2);
-      try {
-        const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `jhs-habits-backup-${htToday()}.json`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-      } catch (_) {
-        try {
-          navigator.clipboard.writeText(text);
-        } catch (e2) {
-          console.info('[JHS/Habits] export JSON:\n', text);
-        }
-      }
-      try {
-        this._htPersistHabitConfigLocalBackup();
-      } catch (_) {}
-      this.ui.addToaster?.({
-        title: 'Habits backup',
-        message: `Exported ${cfg.categories.length} categories, ${cfg.habits.length} habits. File downloaded (or clipboard / console if blocked).`,
-        dismissible: true,
-        autoDestroyTime: 6000,
-      });
-    } catch (e) {
-      console.error('[HabitTracker] export', e);
-      this.ui.addToaster?.({
-        title: 'Habits export failed',
-        message: String((e && e.message) || e),
-        dismissible: true,
-        autoDestroyTime: 6000,
-      });
-    }
-  }
-
-  async _htImportHabitConfigJson() {
-    let pasted = '';
-    try {
-      if (typeof window.showOpenFilePicker === 'function') {
-        const [handle] = await window.showOpenFilePicker({
-          multiple: false,
-          types: [
-            {
-              description: 'JSON',
-              accept: { 'application/json': ['.json'], 'text/plain': ['.txt'] },
-            },
-          ],
-        });
-        const file = await handle.getFile();
-        pasted = await file.text();
-      }
-    } catch (e) {
-      if (e && e.name === 'AbortError') return;
-      console.warn('[HabitTracker] import file picker', e);
-    }
-    if (!String(pasted || '').trim()) {
-      try {
-        pasted = await navigator.clipboard.readText();
-      } catch (_) {}
-    }
-    if (!String(pasted || '').trim()) {
-      this.ui.addToaster?.({
-        title: 'Habits import',
-        message:
-          'Pick a JSON file from an export, or copy the JSON to the clipboard and run this command again. (Browser-style prompt dialogs are not available here.)',
-        dismissible: true,
-        autoDestroyTime: 9000,
-      });
-      return;
-    }
-    try {
-      const wrap = JSON.parse(pasted.trim());
-      const doc = wrap.config != null ? wrap.config : wrap;
-      const next = htNormalizeHabitConfig(doc);
-      if (!next.categories?.length || !next.habits?.length) {
-        this.ui.addToaster?.({
-          title: 'Habits import',
-          message: 'JSON must include non-empty categories and habits.',
-          dismissible: true,
-          autoDestroyTime: 6000,
-        });
-        return;
-      }
-      this._config = next;
-      await this._saveConfig();
-      await this.refreshAllPanels?.();
-      this.ui.addToaster?.({
-        title: 'Habits import',
-        message: 'Saved to habits storage and refreshed panels.',
-        dismissible: true,
-        autoDestroyTime: 5000,
-      });
-    } catch (e) {
-      console.error('[HabitTracker] import', e);
-      this.ui.addToaster?.({
-        title: 'Habits import failed',
-        message: String((e && e.message) || e),
-        dismissible: true,
-        autoDestroyTime: 6000,
-      });
-    }
-  }
-
-  async _saveConfig() {
-    try {
-      const rows = await this._psListByKind('config');
-      if (rows.length) {
-        const target = this._htPickBestConfigRow(rows) || rows[0];
-        this._writeJsonStore(target, this._config);
-      } else {
-        if (!this._htHabitsCanPersistDataRows()) return;
-        await this._htCreateHabitDataRow({
-          recordKind: 'config',
-          rowPluginId: HT_PS_ROW_CONFIG,
-          recordTitle: 'config',
-          settingsDoc: this._config,
-        });
-      }
-      this._htPersistHabitConfigLocalBackup();
-    } catch (e) {
-      console.error('[HabitTracker] Error saving config:', e);
-    }
-  }
-
-  /** Recompute `order` for habits within each category (mutates `cfg`). */
-  _htNormalizeHabitOrders(cfg = this._config) {
-    if (!cfg?.habits || !cfg?.categories) return;
-    const draft = cfg;
-    const byCat = new Map();
-    for (const c of draft.categories) byCat.set(c.id, []);
-    for (const h of draft.habits.filter((x) => !x.archived)) {
-      if (!byCat.has(h.categoryId)) byCat.set(h.categoryId, []);
-      byCat.get(h.categoryId).push(h);
-    }
-    for (const [, arr] of byCat) {
-      arr.sort((a, b) => (a.order || 0) - (b.order || 0));
-      arr.forEach((hab, i) => {
-        hab.order = i;
-      });
-    }
-  }
-
-  _htSchedulePersistHabitConfig() {
-    try {
-      if (this._htPersistTimer) clearTimeout(this._htPersistTimer);
-    } catch (_) {}
-    this._htPersistTimer = setTimeout(() => {
-      this._htPersistTimer = null;
-      void this._htFlushPersistHabitConfig();
-    }, 420);
-  }
-
-  async _htFlushPersistHabitConfig() {
-    try {
-      this._config = htNormalizeHabitConfig(this._config);
-      await this._saveConfig();
-      // Full re-render destroys manage-strip inputs and resets scroll — skip habit
-      // sidebars that are in quick-edit until user toggles manage off or a structural
-      // change calls _htRefreshManageModeHabitSidebars().
-      await this.refreshAllPanels({ skipManageModeHabitSidebar: true });
-    } catch (e) {
-      console.error('[HabitTracker] persist habit config', e);
-    }
-  }
-
-  /** Re-render habit sidebars that are in inline manage (quick-edit) mode only. */
-  async _htRefreshManageModeHabitSidebars() {
-    for (const [, st] of this._panelStates || new Map()) {
-      if (!st?.bodyEl?.isConnected) continue;
-      if (st.bodyEl.dataset?.mode === 'stats') continue;
-      if (!st.htManageMode) continue;
-      await this._renderSidebar(st);
-    }
-  }
-
-  _htMoveCategoryOrderInline(catId, delta) {
-    const cfg = this._config;
-    if (!cfg?.categories) return;
-    const sorted = [...cfg.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
-    const i = sorted.findIndex((c) => c.id === catId);
-    const j = i + delta;
-    if (i < 0 || j < 0 || j >= sorted.length) return;
-    const t = sorted[i];
-    sorted[i] = sorted[j];
-    sorted[j] = t;
-    sorted.forEach((c, k) => {
-      c.order = k;
-    });
-    this._htSchedulePersistHabitConfig();
-    void this._htRefreshManageModeHabitSidebars();
-  }
-
-  _htReorderHabitInCategory(habitId, delta) {
-    const cfg = this._config;
-    const moving = cfg?.habits?.find((h) => h.id === habitId && !h.archived);
-    if (!moving) return;
-    const list = cfg.habits
-      .filter((h) => !h.archived && h.categoryId === moving.categoryId)
-      .sort((a, b) => (a.order || 0) - (b.order || 0));
-    const i = list.findIndex((h) => h.id === habitId);
-    const j = i + delta;
-    if (i < 0 || j < 0 || j >= list.length) return;
-    const t = list[i];
-    list[i] = list[j];
-    list[j] = t;
-    list.forEach((h, k) => {
-      h.order = k;
-    });
-    this._htSchedulePersistHabitConfig();
-    void this._htRefreshManageModeHabitSidebars();
-  }
-
-  /**
-   * Move a habit to `toCatId` and insert before index `beforeIdx` (0 = top). Matches settings-modal DnD semantics.
-   */
-  _htMoveHabitToCategoryAtIndex(habitId, toCatId, beforeIdx) {
-    const cfg = this._config;
-    const draft = cfg;
-    if (!draft?.habits || !toCatId) return;
-    const moving = draft.habits.find((h) => h.id === habitId && !h.archived);
-    if (!moving) return;
-    const normalizeOrders = () => {
-      const byCat = new Map();
-      for (const c of draft.categories || []) byCat.set(c.id, []);
-      for (const h of draft.habits.filter((x) => !x.archived)) {
-        if (!byCat.has(h.categoryId)) byCat.set(h.categoryId, []);
-        byCat.get(h.categoryId).push(h);
-      }
-      for (const [, arr] of byCat) {
-        arr.sort((a, b) => (a.order || 0) - (b.order || 0));
-        arr.forEach((h, i) => {
-          h.order = i;
-        });
-      }
-    };
-    moving.categoryId = toCatId;
-    normalizeOrders();
-    const list = draft.habits
-      .filter((h) => !h.archived && h.categoryId === toCatId)
-      .sort((a, b) => (a.order || 0) - (b.order || 0));
-    const from = list.findIndex((h) => h.id === moving.id);
-    if (from >= 0) list.splice(from, 1);
-    const idx = Math.max(0, Math.min(beforeIdx, list.length));
-    list.splice(idx, 0, moving);
-    list.forEach((h, i) => {
-      h.order = i;
-    });
-  }
-
-  /** Toggle per-panel inline habit editing (tags, weekdays, reorder) when habits live in the suite shell. */
-  _jhsSuiteToggleHabitQuickEdit(jhsShellState) {
-    const pid = jhsShellState?.panelId;
-    if (!pid) return;
-    const st = this._panelStates.get(pid);
-    if (!st?.bodyEl) return;
-    st.htManageMode = !st.htManageMode;
-    const btn = st._htHabitShell?.manageBtn;
-    if (btn) {
-      btn.classList.toggle('active', !!st.htManageMode);
-      btn.title = st.htManageMode ? 'Done editing habits' : 'Edit habits here';
-    }
-    void this._renderSidebar(st);
-  }
-
-  /**
-   * Category glyph picker (shared by inline manage, modal settings, and per-card editors).
-   * @returns {{ el: HTMLElement, setValue: (v: string) => void, getSlug: () => string, normalizeIconSlug: (raw: string) => string }}
-   */
-  _htBuildCategoryIconPicker(initialSlug, onChange) {
-    const iconBySlug = new Set(HT_CATEGORY_ICONS.map((x) => x.slug));
-    const iconChoices = Array.from(
-      new Map(HT_CATEGORY_ICONS.map((opt) => [opt.slug, opt])).values()
-    );
-    const normalizeIconSlug = (raw) => {
-      const s = String(raw || '').trim();
-      return s && iconBySlug.has(s) ? s : 'folder';
-    };
-    let current = normalizeIconSlug(initialSlug);
-    const wrap = document.createElement('div');
-    wrap.style.cssText = 'position:relative;display:inline-flex;';
-    const trigger = document.createElement('button');
-    trigger.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-    trigger.type = 'button';
-    trigger.title = 'Pick category icon';
-    trigger.style.cssText =
-      'display:inline-flex;align-items:center;gap:4px;min-width:44px;justify-content:center;';
-
-    const menu = document.createElement('div');
-    menu.style.cssText =
-      'position:absolute;z-index:30;top:calc(100% + 6px);left:0;width:260px;max-height:260px;overflow:auto;display:none;padding:6px;border:1px solid rgba(255,255,255,0.2);border-radius:8px;background:rgba(24,22,30,0.96);box-shadow:0 8px 24px rgba(0,0,0,0.35);';
-    const search = document.createElement('input');
-    search.className = 'ht-input';
-    search.placeholder = 'Search icons...';
-    search.style.cssText = 'width:100%;height:28px;padding:4px 8px;margin-bottom:6px;font-size:12px;';
-    const grid = document.createElement('div');
-    grid.style.cssText = 'display:grid;grid-template-columns:repeat(6,1fr);gap:4px;';
-    const syncTrigger = () => {
-      trigger.innerHTML = `${htCategoryGlyphHtml(current)} <span style="margin-left:4px;opacity:.75;">${htIcon('chevron-down')}</span>`;
-    };
-    const renderOptions = () => {
-      const q = String(search.value || '').trim().toLowerCase();
-      grid.innerHTML = '';
-      const filtered = !q
-        ? iconChoices
-        : iconChoices.filter(
-            (opt) =>
-              opt.label.toLowerCase().includes(q) || opt.slug.toLowerCase().includes(q)
-          );
-      for (const opt of filtered) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-        button.title = `${opt.label} (${opt.slug})`;
-        button.style.cssText = 'padding:5px 0;min-width:0;';
-        button.innerHTML = htCategoryGlyphHtml(opt.slug);
-        button.addEventListener('click', (e) => {
-          e.stopPropagation();
-          current = opt.slug;
-          syncTrigger();
-          menu.style.display = 'none';
-          try {
-            onChange?.(current);
-          } catch (_) {}
-        });
-        grid.appendChild(button);
-      }
-      if (!filtered.length) {
-        const none = document.createElement('div');
-        none.style.cssText = 'grid-column:1 / -1;font-size:11px;color:#8a7e6a;padding:6px;';
-        none.textContent = 'No icon matches.';
-        grid.appendChild(none);
-      }
-    };
-    search.addEventListener('click', (e) => e.stopPropagation());
-    search.addEventListener('input', renderOptions);
-    menu.appendChild(search);
-    menu.appendChild(grid);
-    renderOptions();
-    trigger.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const willOpen = menu.style.display === 'none';
-      menu.style.display = willOpen ? 'block' : 'none';
-      if (willOpen) {
-        search.value = '';
-        renderOptions();
-        setTimeout(() => search.focus(), 0);
-      }
-    });
-    document.addEventListener('click', () => {
-      menu.style.display = 'none';
-    });
-    wrap.appendChild(trigger);
-    wrap.appendChild(menu);
-    syncTrigger();
-    return {
-      el: wrap,
-      setValue: (v) => {
-        current = normalizeIconSlug(v);
-        syncTrigger();
-      },
-      normalizeIconSlug,
-      getSlug: () => current,
-    };
-  }
-
-  _buildManageCategoriesBar(state) {
-    const cfg = this._config;
-    const wrap = document.createElement('div');
-    wrap.className = 'ht-manage-cats-bar';
-    const top = document.createElement('div');
-    top.style.cssText = 'display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;';
-    const title = document.createElement('div');
-    title.className = 'ht-manage-cats-title';
-    title.style.marginBottom = '0';
-    title.textContent = 'Categories';
-    const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:10px;color:#8a7e6a;flex:1;min-width:160px;';
-    hint.textContent =
-      '↑↓ changes order everywhere (journal sections and the collapsed icon strip).';
-    top.appendChild(title);
-    top.appendChild(hint);
-    wrap.appendChild(top);
-
-    const cats = [...(cfg.categories || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
-    cats.forEach((cat, ci) => {
-      const row = document.createElement('div');
-      row.className = 'ht-manage-cat-row';
-      const up = document.createElement('button');
-      up.type = 'button';
-      up.className = 'ht-nav-btn';
-      up.style.fontSize = '11px';
-      up.innerHTML = htIcon('chevron-up');
-      up.disabled = ci <= 0;
-      up.title = 'Move category up';
-      up.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htMoveCategoryOrderInline(cat.id, -1);
-      });
-      const down = document.createElement('button');
-      down.type = 'button';
-      down.className = 'ht-nav-btn';
-      down.style.fontSize = '11px';
-      down.innerHTML = htIcon('chevron-down');
-      down.disabled = ci >= cats.length - 1;
-      down.title = 'Move category down';
-      down.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htMoveCategoryOrderInline(cat.id, 1);
-      });
-      const nameIn = document.createElement('input');
-      nameIn.className = 'ht-input';
-      nameIn.value = cat.name || '';
-      nameIn.placeholder = 'Category name';
-      nameIn.addEventListener('click', (e) => e.stopPropagation());
-      nameIn.addEventListener('change', () => {
-        const nm = String(nameIn.value || '').trim();
-        if (nm) cat.name = nm;
-        this._htSchedulePersistHabitConfig();
-      });
-      row.appendChild(up);
-      row.appendChild(down);
-      row.appendChild(nameIn);
-      wrap.appendChild(row);
-    });
-    wrap.addEventListener('click', (e) => e.stopPropagation());
-    return wrap;
-  }
-
-  _htRenameTagGlobally(fromRaw, toRaw) {
-    const from = String(fromRaw || '').trim();
-    const to = String(toRaw || '').trim();
-    if (!from || !to) return;
-    if (from === to) return;
-    const cfg = this._config;
-    if (!Array.isArray(cfg.tagOrder)) cfg.tagOrder = [];
-    const ord = [...cfg.tagOrder];
-    const fromIdx = ord.indexOf(from);
-    if (fromIdx < 0) return;
-    if (ord.includes(to)) {
-      cfg.tagOrder = ord.filter((t) => t !== from);
-      for (const h of cfg.habits || []) {
-        if (!Array.isArray(h.tags)) h.tags = [];
-        h.tags = [...new Set(h.tags.map((t) => (t === from ? to : t)))];
-      }
-    } else {
-      ord[fromIdx] = to;
-      cfg.tagOrder = ord;
-      for (const h of cfg.habits || []) {
-        if (!Array.isArray(h.tags)) h.tags = [];
-        h.tags = h.tags.map((t) => (t === from ? to : t));
-      }
-    }
-    htNormalizeHabitConfig(cfg);
-    this._htSchedulePersistHabitConfig();
-    void this._htRefreshManageModeHabitSidebars();
-  }
-
-  _htMoveTagOrderInline(tag, delta) {
-    const cfg = this._config;
-    const arr = [...(cfg.tagOrder || [])];
-    const i = arr.indexOf(String(tag || ''));
-    const j = i + delta;
-    if (i < 0 || j < 0 || j >= arr.length) return;
-    const t = arr[i];
-    arr[i] = arr[j];
-    arr[j] = t;
-    cfg.tagOrder = arr;
-    this._htSchedulePersistHabitConfig();
-    void this._htRefreshManageModeHabitSidebars();
-  }
-
-  _htRemoveTagGlobally(tag) {
-    const key = String(tag || '').trim();
-    if (!key || key === '__untagged__') return;
-    const cfg = this._config;
-    for (const h of cfg.habits || []) {
-      if (!Array.isArray(h.tags)) h.tags = [];
-      h.tags = h.tags.filter((x) => x !== key);
-    }
-    cfg.tagOrder = (cfg.tagOrder || []).filter((t) => t !== key);
-    this._htSchedulePersistHabitConfig();
-    void this._htRefreshManageModeHabitSidebars();
-  }
-
-  _buildManageTagsBar(_state) {
-    const cfg = htNormalizeHabitConfig(this._config);
-    const wrap = document.createElement('div');
-    wrap.className = 'ht-manage-cats-bar ht-manage-tags-bar';
-    const top = document.createElement('div');
-    top.style.cssText = 'display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:6px;';
-    const title = document.createElement('div');
-    title.className = 'ht-manage-cats-title';
-    title.style.marginBottom = '0';
-    title.textContent = 'Tags';
-    const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:10px;color:#8a7e6a;flex:1;min-width:140px;';
-    hint.textContent = 'Reorder affects tag filter / picker order. × removes tag from every habit.';
-    top.appendChild(title);
-    top.appendChild(hint);
-    wrap.appendChild(top);
-
-    const tags = [...(cfg.tagOrder || [])];
-    tags.forEach((tag, ti) => {
-      const row = document.createElement('div');
-      row.className = 'ht-manage-cat-row';
-      const up = document.createElement('button');
-      up.type = 'button';
-      up.className = 'ht-nav-btn';
-      up.style.fontSize = '11px';
-      up.innerHTML = htIcon('chevron-up');
-      up.disabled = ti <= 0;
-      up.title = 'Move tag up';
-      up.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htMoveTagOrderInline(tag, -1);
-      });
-      const down = document.createElement('button');
-      down.type = 'button';
-      down.className = 'ht-nav-btn';
-      down.style.fontSize = '11px';
-      down.innerHTML = htIcon('chevron-down');
-      down.disabled = ti >= tags.length - 1;
-      down.title = 'Move tag down';
-      down.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htMoveTagOrderInline(tag, 1);
-      });
-      const label = document.createElement('input');
-      label.className = 'ht-input';
-      label.style.cssText = 'flex:1;min-width:0;height:24px;font-size:11px;';
-      label.value = tag;
-      label.dataset.tagOrig = tag;
-      label.placeholder = 'Tag name';
-      label.addEventListener('click', (e) => e.stopPropagation());
-      label.addEventListener('blur', () => {
-        const from = String(label.dataset.tagOrig || '').trim();
-        if (!String(label.value || '').trim()) label.value = from;
-      });
-      label.addEventListener('change', () => {
-        const to = String(label.value || '').trim();
-        const from = String(label.dataset.tagOrig || '').trim();
-        if (!to) {
-          label.value = from;
+        if (pred(globalThis)) {
+          cb();
           return;
         }
-        if (to === from) return;
-        this._htRenameTagGlobally(from, to);
-        label.dataset.tagOrig = to;
-      });
-      const del = document.createElement('button');
-      del.type = 'button';
-      del.className = 'ht-nav-btn';
-      del.style.fontSize = '11px';
-      del.innerHTML = htIcon('x');
-      del.title = 'Remove tag from all habits';
-      del.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htRemoveTagGlobally(tag);
-      });
-      row.appendChild(up);
-      row.appendChild(down);
-      row.appendChild(label);
-      row.appendChild(del);
-      wrap.appendChild(row);
-    });
-    wrap.addEventListener('click', (e) => e.stopPropagation());
-    return wrap;
+      } catch (_) {}
+      n += 1;
+      if (n > 240) return;
+      setTimeout(tick, 40);
+    };
+    tick();
   }
 
-  _buildHabitManageStrip(state, habit) {
-    const cfg = this._config;
-    const strip = document.createElement('div');
-    strip.className = 'ht-habit-manage-strip';
-    const stop = (e) => e.stopPropagation();
-    strip.addEventListener('click', (e) => {
-      if (e.target.closest?.('.ht-habit-manage-drag-grip')) return;
-      stop(e);
-    });
-    strip.addEventListener('mousedown', (e) => {
-      if (e.target.closest?.('.ht-habit-manage-drag-grip')) return;
-      stop(e);
-    });
-
-    const list = (cfg.habits || [])
-      .filter((h) => !h.archived && h.categoryId === habit.categoryId)
-      .sort((a, b) => (a.order || 0) - (b.order || 0));
-    const idx = list.findIndex((h) => h.id === habit.id);
-
-    const grip = document.createElement('span');
-    grip.className = 'ht-habit-manage-drag-grip';
-    grip.innerHTML = htIcon('grip-vertical');
-    grip.title = 'Drag to reorder or move to another category';
-
-    const up = document.createElement('button');
-    up.type = 'button';
-    up.className = 'ht-nav-btn';
-    up.style.fontSize = '11px';
-    up.innerHTML = htIcon('chevron-up');
-    up.title = 'Move habit up in this category';
-    up.disabled = idx <= 0;
-    up.addEventListener('click', (e) => {
-      e.preventDefault();
-      stop(e);
-      this._htReorderHabitInCategory(habit.id, -1);
-    });
-    const down = document.createElement('button');
-    down.type = 'button';
-    down.className = 'ht-nav-btn';
-    down.style.fontSize = '11px';
-    down.innerHTML = htIcon('chevron-down');
-    down.title = 'Move habit down in this category';
-    down.disabled = idx < 0 || idx >= list.length - 1;
-    down.addEventListener('click', (e) => {
-      e.preventDefault();
-      stop(e);
-      this._htReorderHabitInCategory(habit.id, 1);
-    });
-
-    const nameIn = document.createElement('input');
-    nameIn.className = 'ht-input ht-habit-manage-name';
-    nameIn.value = habit.name || '';
-    nameIn.placeholder = 'Habit name';
-    nameIn.addEventListener('input', () => {
-      habit.name = String(nameIn.value || '');
-      this._htSchedulePersistHabitConfig();
-    });
-
-    const catSel = document.createElement('select');
-    catSel.className = 'ht-select ht-habit-manage-cat';
-    for (const c of [...(cfg.categories || [])].sort((a, b) => (a.order || 0) - (b.order || 0))) {
-      const o = document.createElement('option');
-      o.value = c.id;
-      o.textContent = c.name || c.id;
-      if (c.id === habit.categoryId) o.selected = true;
-      catSel.appendChild(o);
-    }
-    catSel.addEventListener('change', () => {
-      habit.categoryId = catSel.value || habit.categoryId;
-      this._htNormalizeHabitOrders();
-      this._htSchedulePersistHabitConfig();
-      void this._htRefreshManageModeHabitSidebars();
-    });
-
-    const repopulateTagSelect = (sel) => {
-      const ord = [...(cfg.tagOrder || [])];
-      const selVals = new Set((habit.tags || []).map(String));
-      sel.replaceChildren();
-      for (const t of ord) {
-        const o = document.createElement('option');
-        o.value = t;
-        o.textContent = t;
-        if (selVals.has(t)) o.selected = true;
-        sel.appendChild(o);
+  _waitForBoot(cb) {
+    let n = 0;
+    const tick = () => {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      if (boot?.register) {
+        cb(boot);
+        return;
       }
+      n += 1;
+      if (n > 240) return;
+      setTimeout(tick, 25);
     };
+    tick();
+  }
+}
+/**
+ * Dawn Habits engine — instantiated by Dawn Habits (`new DawnHabitsEngine(app).attach()`).
+ * Concatenated into the Habits deploy bundle. Lab Behavioral still vendor-copies this file.
+ */
 
-    const rowTop = document.createElement('div');
-    rowTop.className = 'ht-habit-manage-row-top';
-    rowTop.appendChild(grip);
-    rowTop.appendChild(up);
-    rowTop.appendChild(down);
-    rowTop.appendChild(nameIn);
-    rowTop.appendChild(catSel);
+const HABITS_LS_INDEX = 'dawn_habits_index_v8';
+const HABITS_LS_UI = 'dawn_habits_ui_v1';
+const HABITS_LS_NOTES = 'dawn_habits_notes_v1';
+/** { categories: [{id,name}], habits: [{name,categoryId}] } — LS cache of Habit Logs config. */
+const HABITS_LS_CONFIG = 'dawn:habit_config_v1';
+/** { [dayKey]: { [habitName]: 'fail'|'na' } } — overlay marks; done lives on log completions. */
+const HABITS_LS_MARKS = 'dawn:habit_marks_v1';
+/** { [dayKey]: { [habitName]: number } } — numeric habit counts (LS; Path B prefs). */
+const HABITS_LS_VALUES = 'dawn:habit_values_v1';
+const HABITS_LS_DONE = 'dawn:habit_done_v1';
+const HABITS_COLL_NAME = 'Habit Logs';
+/** Lab New Dawn Habit Logs. */
+const HABITS_COLL_GUID = '15HZT1DSST873P3B7PF1YZYAPZ';
+/** darienx production Habit Logs. */
+const HABITS_COLL_GUID_PROD = '1ASFE5F1R9VEJW3NZKN5CSC568';
+/** darienx `habit-tracker:config` record — load this first, do not wait for 917-log idle scan. */
+const HABITS_CONFIG_GUID_PROD = '1J7N3755NTBQ0320KQK5GCYFY2';
+const HABITS_NOTES_PROP = 'Notes';
+/** Prod JHS sentinels in log `settings_json.completions`. */
+const HABITS_COMP_NA = '__na__';
+const HABITS_COMP_FAIL = '__x__';
+const HABITS_INDEX_TTL_MS = 5 * 60 * 1000;
+const HABITS_DEFAULT_CAT = { id: 'default', name: 'Habits' };
+const HABITS_LONG_PRESS_MS = 500;
+const HABITS_RECOVERY_DECAY_MS = 90 * 24 * 60 * 60 * 1000;
+const HABITS_RECOVERY_MILESTONES = [7, 30, 90, 365];
+const HABITS_DEEP_FOCUS_MIN = 3;
 
-    const tagsDetails = document.createElement('details');
-    tagsDetails.className = 'ht-habit-manage-tags-details';
-    tagsDetails.open = true;
-    const tagsSum = document.createElement('summary');
-    tagsSum.textContent = 'Tags';
-    const tagsInner = document.createElement('div');
-    tagsInner.className = 'ht-habit-manage-tags-inner';
-    const tagsLab = document.createElement('label');
-    tagsLab.textContent = 'Ctrl/Cmd-click for multiple';
-    tagsLab.style.cssText = 'font-size:10px;color:#8a7e6a;';
-    const tagsSel = document.createElement('select');
-    tagsSel.multiple = true;
-    tagsSel.className = 'ht-manage-tags-multiselect';
-    tagsSel.size = 4;
-    repopulateTagSelect(tagsSel);
-    tagsSel.addEventListener('change', () => {
-      habit.tags = Array.from(tagsSel.selectedOptions).map((o) => o.value);
-      htNormalizeHabitConfig(cfg);
-      this._htSchedulePersistHabitConfig();
-      void this._htRefreshManageModeHabitSidebars();
-    });
-    tagsInner.appendChild(tagsLab);
-    tagsInner.appendChild(tagsSel);
-    const addWrap = document.createElement('div');
-    addWrap.className = 'ht-manage-tags-add';
-    const newTagIn = document.createElement('input');
-    newTagIn.className = 'ht-input';
-    newTagIn.placeholder = 'New tag…';
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-    addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      stop(e);
-      const raw = String(newTagIn.value || '').trim();
-      if (!raw) return;
-      if (!habit.tags.includes(raw)) habit.tags.push(raw);
-      if (!(cfg.tagOrder || []).includes(raw)) cfg.tagOrder.push(raw);
-      newTagIn.value = '';
-      htNormalizeHabitConfig(cfg);
-      repopulateTagSelect(tagsSel);
-      for (const o of tagsSel.options) {
-        if (o.value === raw) o.selected = true;
-      }
-      this._htSchedulePersistHabitConfig();
-      void this._htRefreshManageModeHabitSidebars();
-    });
-    addWrap.appendChild(newTagIn);
-    addWrap.appendChild(addBtn);
-    tagsInner.appendChild(addWrap);
-    tagsDetails.appendChild(tagsSum);
-    tagsDetails.appendChild(tagsInner);
-
-    strip.appendChild(rowTop);
-    strip.appendChild(tagsDetails);
-
-    const adv = document.createElement('details');
-    adv.className = 'ht-habit-manage-advanced';
-    adv.open = true;
-    const sum = document.createElement('summary');
-    sum.textContent = 'Schedule, target & streak seed';
-    adv.appendChild(sum);
-    const inner = document.createElement('div');
-    inner.className = 'ht-habit-manage-advanced-inner';
-
-    const targetLab = document.createElement('label');
-    targetLab.style.cssText = 'display:flex;flex-direction:column;gap:2px;font-size:10px;color:#8a7e6a;';
-    targetLab.textContent = 'Daily target (0 = checkbox)';
-    const targetIn = document.createElement('input');
-    targetIn.className = 'ht-input';
-    targetIn.type = 'number';
-    targetIn.min = '0';
-    targetIn.style.width = '72px';
-    targetIn.value = habit.target > 0 ? String(habit.target) : '';
-    targetIn.addEventListener('change', () => {
-      const tRaw = String(targetIn.value || '').trim();
-      const tVal = tRaw === '' ? 0 : parseInt(tRaw, 10);
-      habit.target = Number.isInteger(tVal) && tVal > 0 ? tVal : 0;
-      this._htSchedulePersistHabitConfig();
-    });
-    targetLab.appendChild(targetIn);
-
-    const unitLab = document.createElement('label');
-    unitLab.style.cssText = 'display:flex;flex-direction:column;gap:2px;font-size:10px;color:#8a7e6a;';
-    unitLab.textContent = 'Unit';
-    const unitIn = document.createElement('input');
-    unitIn.className = 'ht-input';
-    unitIn.style.minWidth = '80px';
-    unitIn.placeholder = 'mins, reps…';
-    unitIn.value = habit.unit || '';
-    unitIn.addEventListener('change', () => {
-      const u = String(unitIn.value || '').trim();
-      habit.unit = u || null;
-      this._htSchedulePersistHabitConfig();
-    });
-    unitLab.appendChild(unitIn);
-
-    const wdWrap = document.createElement('div');
-    wdWrap.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
-    const wdLbl = document.createElement('div');
-    wdLbl.style.cssText = 'font-size:10px;color:#8a7e6a;';
-    wdLbl.textContent = 'Weekdays (none = every day)';
-    wdWrap.appendChild(wdLbl);
-    const wdRow = document.createElement('div');
-    wdRow.style.cssText = 'display:flex;gap:3px;flex-wrap:wrap;';
-    const wdLabels = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
-    const wdSel = new Set(Array.isArray(habit.weekdays) ? habit.weekdays : []);
-    for (let i = 0; i < 7; i++) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'ht-nav-btn';
-      b.style.fontSize = '10px';
-      b.style.padding = '2px 5px';
-      b.dataset.wd = String(i);
-      b.textContent = wdLabels[i];
-      const paint = (on) => {
-        b.classList.toggle('active', on);
-      };
-      paint(wdSel.has(i));
-      b.addEventListener('click', (e) => {
-        e.preventDefault();
-        stop(e);
-        const on = !b.classList.contains('active');
-        paint(on);
-        if (on) wdSel.add(i);
-        else wdSel.delete(i);
-        habit.weekdays = [...wdSel].sort((a, b) => a - b);
-        this._htSchedulePersistHabitConfig();
-      });
-      wdRow.appendChild(b);
-    }
-    wdWrap.appendChild(wdRow);
-
-    const seedLab = document.createElement('label');
-    seedLab.style.cssText = 'display:flex;flex-direction:column;gap:2px;font-size:10px;color:#8a7e6a;';
-    seedLab.textContent = 'Streak seed date';
-    const seedIn = document.createElement('input');
-    seedIn.className = 'ht-input';
-    seedIn.type = 'date';
-    seedIn.value = habit.seedDate || '';
-    seedIn.addEventListener('change', () => {
-      const prev = habit.seedDate || null;
-      habit.seedDate = String(seedIn.value || '').trim() || null;
-      this._htSchedulePersistHabitConfig();
-      this._htOnHabitSeedDateMaybeBackfill(habit, prev);
-    });
-    seedLab.appendChild(seedIn);
-
-    inner.appendChild(targetLab);
-    inner.appendChild(unitLab);
-    inner.appendChild(wdWrap);
-    inner.appendChild(seedLab);
-    adv.appendChild(inner);
-    strip.appendChild(adv);
-
-    return strip;
+class DawnHabitsEngine {
+  constructor(app) {
+    this._app = app;
+    this.data = app.data;
+    this.ui = app.ui;
+    this.events = app.events;
   }
 
-  /**
-   * Reorder / move habits between categories in manage mode (pointer-driven — HTML5 DnD is unreliable in embedded/WebView hosts).
-   */
-  _htWireManageModeHabitDnD(state) {
-    if (!state?.bodyEl || !state.htManageMode) return;
-    const body = state.bodyEl;
-    const THRESH = 8;
+  attach() {
+    this._unregBoot = null;
+    this._unregAddon = null;
+    this._root = null;
+    this._statusEl = null;
+    this._listEl = null;
+    this._index = { byDay: {}, count: 0, builtAt: 0, ms: 0, full: false };
+    this._building = false;
+    this._hydrating = new Set();
+    this._logMiss = Object.create(null);
+    this._gen = 0;
+    this._dayKey = null;
+    this._viewMode = 'list';
+    this._statsRange = 7;
+    this._statsSelected = 'overall'; // 'overall' | 'habit:<name>'
+    this._statsCalMonth = null; // { y, m } for 30d grid
+    this._singleCol = false;
+    this._notesByDay = Object.create(null);
+    this._notesTimer = null;
+    this._config = {
+      categories: [{ ...HABITS_DEFAULT_CAT }],
+      habits: [],
+      guidedFlows: [],
+      recoveryInventory: [],
+      recoveryEarned: { milestones: {}, awards: {} },
+      categoryRecovered: {},
+    };
+    /** @type {Record<string, Record<string, 'fail'|'na'>>} */
+    this._marksByDay = Object.create(null);
+    /** @type {Record<string, Record<string, number>>} */
+    this._valuesByDay = Object.create(null);
+    this._activeCatId = HABITS_DEFAULT_CAT.id;
+    this._catCollapsed = {};
+    this._ribbonEl = null;
+    this._catNameEl = null;
 
-    const clearDropVisuals = () => {
-      body.querySelectorAll('.ht-habit.ht-manage-drop-before, .ht-habit.ht-manage-drop-after').forEach((el) => {
-        el.classList.remove('ht-manage-drop-before', 'ht-manage-drop-after');
+    this._configGuid = '';
+    this._vaultConfigRaw = null;
+    this._vaultConfigLoaded = false;
+    this._applyingVaultConfig = false;
+    this._configFlushTimer = null;
+    this._loadUiPrefs();
+    this._loadNotes();
+    this._loadConfig();
+    this._loadMarks();
+    this._loadValues();
+    this._loadDone();
+    this._manageMode = false;
+    this._loadIndexFromStorage();
+    this._injectCss();
+    this._initPathBPrefs();
+    void this._loadVaultConfig();
+
+    this._publishHabitsHost();
+
+    try {
+      this._refreshQuickAccess?.();
+    } catch (_) {}
+
+    try {
+      this._cmdRebuild = this.ui.addCommandPaletteCommand({
+        label: 'Dawn: Rebuild Habits Index',
+        icon: 'ti-checkbox',
+        onSelected: () => {
+          const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+          boot?.enqueue?.(() => this._runIdleIndex(boot, boot?.isMobile?.()), {
+            id: 'habits:rebuild',
+            tier: 'onDemand',
+          });
+        },
       });
-      body.querySelectorAll('.ht-category-habits.ht-manage-dnd-target').forEach((el) => {
-        el.classList.remove('ht-manage-dnd-hover', 'ht-manage-dnd-empty');
+    } catch (_) {}
+    try {
+      this._cmdCats = this.ui.addCommandPaletteCommand({
+        label: 'Dawn: Edit habits…',
+        icon: 'ti-settings',
+        onSelected: () => this._toggleManage(),
       });
-    };
+    } catch (_) {}
+  }
 
-    const insertBeforeFromClientY = (listEl, clientY, excludeEl = null) => {
-      const rows = [...listEl.querySelectorAll(':scope > .ht-habit')].filter((el) => el !== excludeEl);
-      for (let i = 0; i < rows.length; i++) {
-        const box = rows[i].getBoundingClientRect();
-        const mid = box.top + box.height / 2;
-        if (clientY < mid) return i;
+  detach() {
+    try {
+      this._clearQuickAccessAnchors?.();
+    } catch (_) {}
+    try {
+      this._unregBoot?.();
+    } catch (_) {}
+    try {
+      this._cmdRebuild?.remove?.();
+    } catch (_) {}
+    try {
+      this._cmdCats?.remove?.();
+    } catch (_) {}
+    try {
+      this._styleEl?.remove?.();
+    } catch (_) {}
+    this._root = null;
+    this._statusEl = null;
+    this._listEl = null;
+    try {
+      if (globalThis.__dawnHabitsHost?.plugin === this) {
+        globalThis.__dawnHabitsHost = undefined;
       }
-      return rows.length;
-    };
-
-    const paintDropIndicator = (listEl, clientY, excludeEl) => {
-      clearDropVisuals();
-      const beforeIdx = insertBeforeFromClientY(listEl, clientY, excludeEl);
-      const rows = [...listEl.querySelectorAll(':scope > .ht-habit')].filter((el) => el !== excludeEl);
-      listEl.classList.add('ht-manage-dnd-target', 'ht-manage-dnd-hover');
-      if (rows.length === 0) {
-        listEl.classList.add('ht-manage-dnd-empty');
-        return beforeIdx;
+      if (globalThis.__dawnHabitsAddon?.plugin === this) {
+        globalThis.__dawnHabitsAddon = undefined;
       }
-      if (beforeIdx < rows.length) rows[beforeIdx].classList.add('ht-manage-drop-before');
-      else rows[rows.length - 1].classList.add('ht-manage-drop-after');
-      return beforeIdx;
-    };
+      if (globalThis.__dawnHabits?.plugin === this) {
+        globalThis.__dawnHabits = undefined;
+      }
+    } catch (_) {}
+  }
 
-    for (const listEl of body.querySelectorAll('.ht-category-habits[data-cat-id]')) {
-      listEl.classList.add('ht-manage-dnd-target');
-    }
-
-    for (const grip of body.querySelectorAll('.ht-habit-manage-drag-grip')) {
-      grip.addEventListener('pointerdown', (e) => {
-        if (e.button !== 0) return;
-        const habitEl = grip.closest('.ht-habit');
-        const hid = habitEl?.dataset?.habitId;
-        if (!hid || !habitEl) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        const startX = e.clientX;
-        const startY = e.clientY;
-        let active = false;
-        const pointerId = e.pointerId;
-        let lastList = null;
-
-        const finish = () => {
-          try {
-            grip.releasePointerCapture(pointerId);
-          } catch (_) {}
-          window.removeEventListener('pointermove', onMove, true);
-          window.removeEventListener('pointerup', onUp, true);
-          window.removeEventListener('pointercancel', onUp, true);
-          habitEl.classList.remove('ht-manage-habit-dragging');
-          habitEl.style.pointerEvents = '';
-        };
-
-        const onMove = (ev) => {
-          if (ev.pointerId !== pointerId) return;
-          const dx = ev.clientX - startX;
-          const dy = ev.clientY - startY;
-          if (!active) {
-            if (dx * dx + dy * dy < THRESH * THRESH) return;
-            active = true;
-            habitEl.classList.add('ht-manage-habit-dragging');
-            habitEl.style.pointerEvents = 'none';
-            try {
-              grip.setPointerCapture(pointerId);
-            } catch (_) {}
-          }
-          ev.preventDefault();
-          const under = document.elementFromPoint(ev.clientX, ev.clientY);
-          const listEl = under?.closest?.('.ht-category-habits[data-cat-id]');
-          if (!listEl || !body.contains(listEl)) {
-            clearDropVisuals();
-            lastList = null;
-            return;
-          }
-          lastList = listEl;
-          const rows = [...listEl.querySelectorAll(':scope > .ht-habit')].filter((el) => el !== habitEl);
-          const rect = listEl.getBoundingClientRect();
-          const y =
-            rows.length === 0 ? ev.clientY : Math.min(Math.max(ev.clientY, rect.top + 2), rect.bottom - 2);
-          listEl._htPendingDropIdx = paintDropIndicator(listEl, y, habitEl);
-        };
-
-        const onUp = (ev) => {
-          if (ev.pointerId !== pointerId) return;
-          finish();
-          if (!active) return;
-
-          const under = document.elementFromPoint(ev.clientX, ev.clientY);
-          const listEl =
-            (lastList && body.contains(lastList) ? lastList : null) ||
-            under?.closest?.('.ht-category-habits[data-cat-id]');
-          clearDropVisuals();
-
-          if (listEl && body.contains(listEl)) {
-            const catId = String(listEl.dataset.catId || '').trim();
-            const rows = [...listEl.querySelectorAll(':scope > .ht-habit')].filter((el) => el !== habitEl);
-            const rect = listEl.getBoundingClientRect();
-            const y =
-              rows.length === 0 ? ev.clientY : Math.min(Math.max(ev.clientY, rect.top + 2), rect.bottom - 2);
-            const beforeIdx =
-              typeof listEl._htPendingDropIdx === 'number'
-                ? listEl._htPendingDropIdx
-                : insertBeforeFromClientY(listEl, y, habitEl);
-            listEl._htPendingDropIdx = undefined;
-            if (hid && catId) {
-              this._htMoveHabitToCategoryAtIndex(hid, catId, beforeIdx);
-              this._htSchedulePersistHabitConfig();
-              void this._htRefreshManageModeHabitSidebars();
+  _publishHabitsHost() {
+    try {
+      const api = {
+        plugin: this,
+        getDayKey: () => this._dayKey,
+        listHabits: () =>
+          (this._config.habits || []).map((h) => ({
+            id: h.id || h.name,
+            name: h.name,
+            categoryId: h.categoryId,
+          })),
+        listCategories: () =>
+          (this._config.categories || []).map((c) => ({
+            id: c.id,
+            name: c.name,
+            icon: c.icon || null,
+          })),
+        listCategoryRibbon: (dayKey) => {
+          const key = dayKey || this._dayKey;
+          const habitsAll = this._config.habits || [];
+          return (this._config.categories || []).map((c) => {
+            const habits = habitsAll.filter((h) => this._habitCategoryId?.(h.name) === c.id);
+            const status = this._categoryDayAggStatus?.(habits, key) || '';
+            const marked = this._categoryAllMarked?.(habits, key);
+            const streak = this._categoryEffectiveStreak?.(c.id, key) || 0;
+            return {
+              id: c.id,
+              name: c.name,
+              icon: c.icon || null,
+              status,
+              streak,
+              glyphHtml: this._categoryGlyphHtml?.(c) || '',
+              leadHtml: this._ribbonLeadCellHtml?.(status, marked) || '',
+              streakHtml: streak > 0 ? this._ribbonStreakHtml?.(streak) || '' : '',
+            };
+          });
+        },
+        dayMarks: (dayKey) => {
+          const key = dayKey || this._dayKey;
+          const out = {};
+          const names = new Set((this._config.habits || []).map((h) => h.name));
+          for (const e of this._dayEntries?.(key) || []) {
+            for (const h of e.habits || []) {
+              if (!h?.name) continue;
+              names.add(h.name);
+              const mark = this._habitMark(key, h.name);
+              out[h.name] = {
+                done: !!(h.done && !mark),
+                mark: mark || null,
+                categoryId: this._habitCategoryId?.(h.name) || h.categoryId || null,
+              };
             }
-          } else if (lastList && body.contains(lastList)) {
-            lastList._htPendingDropIdx = undefined;
           }
-        };
-
-        window.addEventListener('pointermove', onMove, true);
-        window.addEventListener('pointerup', onUp, true);
-        window.addEventListener('pointercancel', onUp, true);
-      });
-    }
-  }
-
-  async _loadLog(dateStr) {
-    const empty = () => ({ date: dateStr, completions: {}, categoryDone: {}, notes: '' });
-    try {
-      const rows = await this._getAllLogRows();
-      const rid = htPsRowLog(dateStr);
-      const tps = this._tps();
-      const logRows = rows.filter((r) => (tps?.rowField?.(r, 'plugin_id') || '') === rid);
-      if (logRows.length === 0) return empty();
-      const merged = empty();
-      for (const r of logRows) {
-        const raw = this._readJsonStore(r);
-        if (raw) {
-          try {
-            const d = JSON.parse(raw);
-            Object.assign(merged.completions, d.completions || {});
-            Object.assign(merged.categoryDone, d.categoryDone || {});
-            if (d.notes != null && String(d.notes) !== '') merged.notes = String(d.notes);
-          } catch (e) {}
-        }
-      }
-      return merged;
-    } catch (e) {}
-    return empty();
-  }
-
-  /**
-   * Merge log rows from Plugin Backend (`record_kind` log) keyed by `date` inside JSON.
-   */
-  _buildLogsByDateMapFromRows(rows) {
-    const logsByDate = new Map();
-    for (const r of rows) {
-      const raw = this._readJsonStore(r);
-      if (!raw) continue;
-      let data;
-      try {
-        data = JSON.parse(raw);
-      } catch (e) {
-        continue;
-      }
-      if (!data.date) continue;
-      const key = data.date;
-      if (!logsByDate.has(key)) {
-        logsByDate.set(key, { completions: {}, categoryDone: {}, notes: '' });
-      }
-      const ex = logsByDate.get(key);
-      Object.assign(ex.completions, data.completions || {});
-      Object.assign(ex.categoryDone, data.categoryDone || {});
-      if (data.notes != null && String(data.notes) !== '') ex.notes = String(data.notes);
-    }
-    return logsByDate;
-  }
-
-  async _getAllLogRows(force = false) {
-    const now = Date.now();
-    const hit = this._htLogRowsCache;
-    if (!force && Array.isArray(hit?.rows) && now - (hit.ts || 0) < HT_LOG_ROWS_CACHE_TTL_MS) {
-      return hit.rows;
-    }
-    if (this._htLogRowsInFlight) {
-      try {
-        return await this._htLogRowsInFlight;
-      } catch (_) {}
-    }
-    const req = (async () => {
-      const MAX_COALESCE = 14;
-      let safeRows;
-      for (let attempt = 0; attempt < MAX_COALESCE; attempt++) {
-        const genAtStart = this._htLogRowsFetchGen || 0;
-        const rows = await this._psListByKind('log');
-        if (genAtStart !== (this._htLogRowsFetchGen || 0)) {
-          await new Promise((r) => setTimeout(r, 0));
-          continue;
-        }
-        safeRows = Array.isArray(rows) ? rows : [];
-        this._htLogRowsCache = { ts: Date.now(), rows: safeRows };
-        return safeRows;
-      }
-      console.warn(
-        '[HabitTracker] _getAllLogRows: coalesce retry cap hit; committing last list to avoid unbounded waits'
-      );
-      const rows = await this._psListByKind('log');
-      safeRows = Array.isArray(rows) ? rows : [];
-      this._htLogRowsCache = { ts: Date.now(), rows: safeRows };
-      return safeRows;
-    })();
-    this._htLogRowsInFlight = req;
-    try {
-      return await req;
-    } finally {
-      if (this._htLogRowsInFlight === req) this._htLogRowsInFlight = null;
-    }
-  }
-
-  /** Full log map for streak rollups; bypasses TTL so patches after saves stay consistent. */
-  async _loadAllLogsByDate() {
-    const rows = await this._getAllLogRows(true);
-    return this._buildLogsByDateMapFromRows(rows);
-  }
-
-  _getLogForDateFromMap(logsByDate, dateStr) {
-    const empty = () => ({ date: dateStr, completions: {}, categoryDone: {}, notes: '' });
-    const e = logsByDate.get(dateStr);
-    if (!e) return empty();
-    return {
-      date: dateStr,
-      completions: { ...e.completions },
-      categoryDone: { ...e.categoryDone },
-      notes: e.notes || '',
-    };
-  }
-
-  _categoryStreakFromMap(catId, refDate, logsByDate, cat) {
-    let streak = 0;
-    let d = htDaysBefore(refDate || htToday(), 1);
-    for (let i = 0; i < 3650; i++) {
-      const log = logsByDate.get(d);
-      if (log && log.categoryDone && log.categoryDone[catId]) {
-        streak++;
-        d = htDaysBefore(d, 1);
-      } else if (cat?.seedDate && d >= cat.seedDate && !log) {
-        streak++;
-        d = htDaysBefore(d, 1);
-      } else {
-        break;
-      }
-    }
-    return streak;
-  }
-
-  _habitStreakFromMap(habitId, refDate, logsByDate, habit) {
-    let streak = 0;
-    let d = htDaysBefore(refDate || htToday(), 1);
-    for (let i = 0; i < 3650; i++) {
-      if (!htHabitAppliesOnDate(habit, d)) {
-        d = htDaysBefore(d, 1);
-        continue;
-      }
-      const log = logsByDate.get(d);
-      const raw = log?.completions?.[habitId];
-      const norm = htCompletionNorm(raw, habit);
-      if (norm.done) {
-        streak++;
-        d = htDaysBefore(d, 1);
-      } else if (norm.kind === 'na') {
-        d = htDaysBefore(d, 1);
-      } else if (habit?.seedDate && d >= habit.seedDate && !log) {
-        streak++;
-        d = htDaysBefore(d, 1);
-      } else {
-        break;
-      }
-    }
-    return streak;
-  }
-
-  /**
-   * @param {{ suppressLogCacheInvalidate?: boolean, logRowsSnapshot?: unknown[] }} [opts]
-   *        logRowsSnapshot: reuse one Plugin Backend list (batch backfill) to avoid N× getAllLogRows.
-   */
-  async _saveLog(dateStr, logData, opts = {}) {
-    if (!this._htHabitsCanPersistDataRows()) return;
-    const tps = this._tps();
-    const suppressInv = !!opts.suppressLogCacheInvalidate;
-    try {
-      if (logData.notes == null) logData.notes = '';
-      const rid = htPsRowLog(dateStr);
-      const rows =
-        Array.isArray(opts.logRowsSnapshot) ? opts.logRowsSnapshot : await this._getAllLogRows();
-      const existing = rows.filter((r) => (tps.rowField?.(r, 'plugin_id') || '') === rid);
-      for (const r of existing) {
-        const raw = this._readJsonStore(r);
-        if (raw && String(raw).trim()) {
-          const toStore = { ...logData, date: dateStr };
-          this._writeJsonStore(r, toStore);
-          if (!suppressInv) this._htInvalidateLogRowsCache();
-          return;
-        }
-      }
-      await this._htCreateHabitDataRow({
-        recordKind: 'log',
-        rowPluginId: rid,
-        recordTitle: dateStr,
-        settingsDoc: { ...logData, date: dateStr },
-      });
-      if (!suppressInv) this._htInvalidateLogRowsCache();
-    } catch (e) {
-      console.error('[HabitTracker] Error saving log:', e);
-    }
-  }
-
-  /**
-   * After setting `habit.seedDate`, write real completions for each applicable day from seed → today
-   * where the slot is still empty. Checkbox habits → `true`; count habits → `target` (minimum “done”).
-   * Uses one log-row list + in-memory map (not per-day _loadLog) so Plugin Backend is not scanned per day.
-   */
-  async _htBackfillHabitSeedCompletions(habit) {
-    if (!habit?.seedDate) return 0;
-    const seed = habit.seedDate;
-    const today = htToday();
-    if (seed > today) return 0;
-    if (!this._htHabitsCanPersistDataRows()) return 0;
-    const cfg = this._config;
-    let written = 0;
-    const chunk = 8;
-    const logRowsSnapshot = await this._getAllLogRows(true);
-    const logsByDate = this._buildLogsByDateMapFromRows(logRowsSnapshot);
-    try {
-      for (let d = seed; d <= today; d = htDaysAfter(d, 1)) {
-        if (!htHabitAppliesOnDate(habit, d)) continue;
-        let log = logsByDate.get(d);
-        if (!log) {
-          log = { completions: {}, categoryDone: {}, notes: '' };
-          logsByDate.set(d, log);
-        }
-        const norm = htCompletionNorm(log.completions[habit.id], habit);
-        if (norm.kind !== 'empty') continue;
-        const target = habit.target || 0;
-        if (target > 0) log.completions[habit.id] = target;
-        else log.completions[habit.id] = true;
-        this._htRecomputeCategoryDone(log, cfg, d);
-        const payload = {
-          date: d,
-          completions: log.completions,
-          categoryDone: log.categoryDone,
-          notes: log.notes || '',
-        };
-        await this._saveLog(d, payload, {
-          suppressLogCacheInvalidate: true,
-          logRowsSnapshot,
-        });
-        written++;
-        if (written % chunk === 0) await new Promise((r) => setTimeout(r, 0));
-      }
-    } finally {
-      this._htInvalidateLogRowsCache();
-    }
-    return written;
-  }
-
-  _htOnHabitSeedDateMaybeBackfill(habit, prevSeed) {
-    const next = habit?.seedDate || null;
-    if (!next || next === prevSeed) return;
-    void (async () => {
-      try {
-        await this._htBackfillHabitSeedCompletions(habit);
-      } catch (e) {
-        console.error('[HabitTracker] seed backfill:', e);
-      }
-      await this.refreshAllPanels({ skipManageModeHabitSidebar: true });
-    })();
-  }
-
-  // Calculate streak for a category: consecutive days (back from refDate) where categoryDone[catId] is true
-  // Respects seedDate: if logs run out but seedDate is set, adds those days to the streak
-  async _getCategoryStreak(catId, refDate) {
-    const cat = this._config?.categories?.find((c) => c.id === catId);
-    try {
-      const logRows = await this._getAllLogRows();
-      const logsByDate = this._buildLogsByDateMapFromRows(logRows);
-      return this._categoryStreakFromMap(catId, refDate, logsByDate, cat);
-    } catch (e) {
-      return 0;
-    }
-  }
-
-  // Calculate streak for a habit: consecutive days where completions[habitId] is true
-  // Respects seedDate on the habit for bringing over existing streaks
-  async _getHabitStreak(habitId, refDate) {
-    const habit = this._config?.habits?.find((h) => h.id === habitId);
-    try {
-      const logRows = await this._getAllLogRows();
-      const logsByDate = this._buildLogsByDateMapFromRows(logRows);
-      return this._habitStreakFromMap(habitId, refDate, logsByDate, habit);
-    } catch (e) {
-      return 0;
-    }
-  }
-
-
-  _deferPanelChanged(panel) {
-    const panelId = panel?.getId?.();
-    if (!panelId) return;
-    const prev = this._htNavTimers.get(panelId);
-    if (prev) clearTimeout(prev);
-    this._htNavTimers.set(panelId, setTimeout(() => {
-      this._htNavTimers.delete(panelId);
-      this._onPanelChanged(panel);
-    }, 150));
-  }
-
-  /** Remove sidebar when this panel is not a journal day page (avoids stale UI on other records). */
-  _cleanupHabitPanel(panelId) {
-    if (!panelId) return;
-    htHabitsDbg({ step: '_cleanupHabitPanel', panelId });
-    const nt = this._htNavTimers?.get(panelId);
-    if (nt) {
-      try { clearTimeout(nt); } catch (e) {}
-      this._htNavTimers.delete(panelId);
-    }
-    const state = this._panelStates.get(panelId);
-    if (state) {
-      this._disposeState(state);
-      this._panelStates.delete(panelId);
-    }
-  }
-
-  _onPanelChanged(panel) {
-    const panelId = panel?.getId?.();
-    if (!panelId) {
-      htHabitsDbg({ step: '_onPanelChanged', outcome: 'abort', reason: 'no_panelId' });
-      return;
-    }
-
-    const panelEl = panel?.getElement?.();
-    if (!panelEl) {
-      htHabitsDbg({ step: '_onPanelChanged', outcome: 'cleanup', panelId, reason: 'no_panelEl' });
-      this._cleanupHabitPanel(panelId);
-      return;
-    }
-
-    // Only mount on journal/daily note pages
-    const nav = panel?.getNavigation?.();
-    const navType = nav?.type || '';
-    if (navType === 'custom' || navType === 'custom_panel') {
-      htHabitsDbg({ step: '_onPanelChanged', outcome: 'cleanup', panelId, reason: 'nav_is_custom', navType });
-      this._cleanupHabitPanel(panelId);
-      return;
-    }
-
-    const record = panel?.getActiveRecord?.();
-    if (!record) {
-      const hasJhsShell = !!this._states.get(panelId);
-      htHabitsDbg({
-        step: '_onPanelChanged',
-        outcome: hasJhsShell ? 'defer' : 'cleanup',
-        panelId,
-        reason: 'no_active_record',
-        hasJhsShell,
-      });
-      if (hasJhsShell) this._deferPanelChanged(panel);
-      else this._cleanupHabitPanel(panelId);
-      return;
-    }
-
-    // Only show on journal records (daily notes) — must have journal details
-    const journalDetails = record.getJournalDetails?.();
-    if (!journalDetails) {
-      const journalLike = this._isJournalRecord(record, panelEl);
-      htHabitsDbg({
-        step: '_onPanelChanged',
-        outcome: journalLike ? 'defer' : 'cleanup',
-        panelId,
-        reason: 'no_journal_details',
-        journalLike,
-        recordGuid: String(record.guid || '').slice(0, 36),
-        recordName: String(record.getName?.() || '').slice(0, 80),
-      });
-      if (journalLike) this._deferPanelChanged(panel);
-      else this._cleanupHabitPanel(panelId);
-      return;
-    }
-
-    // Prefer journalDetails.date for robust date sync across all journal record GUID formats.
-    let journalDateStr = htToday();
-    const journalDateObj = journalDetails?.date;
-    if (journalDateObj instanceof Date && !Number.isNaN(journalDateObj.getTime())) {
-      const y = journalDateObj.getFullYear();
-      const m = String(journalDateObj.getMonth() + 1).padStart(2, '0');
-      const d = String(journalDateObj.getDate()).padStart(2, '0');
-      journalDateStr = `${y}-${m}-${d}`;
-    }
-    const recordGuid = record.guid || '';
-    const dateMatch = recordGuid.match(/(\d{4})(\d{2})(\d{2})$/);
-    if (journalDateStr === htToday() && dateMatch && dateMatch[1] && dateMatch[2] && dateMatch[3]) {
-      // Convert YYYYMMDD to YYYY-MM-DD format
-      journalDateStr = `${dateMatch[1]}-${dateMatch[2]}-${dateMatch[3]}`;
-    }
-
-    let state = this._panelStates.get(panelId);
-    if (!state) {
-      state = {
-        panelId,
-        panel,
-        sidebarEl: null,
-        bodyEl: null,
-        observer: null,
-        dateStr: journalDateStr,
-        isJournalPanel: true,  // Flag to track this is a journal-synced panel
-        renderTimer: null,
-        htManageMode: false,
+          for (const name of names) {
+            if (out[name]) continue;
+            const mark = this._habitMark(key, name);
+            const lsDone = !!this._lsDone?.(key, name);
+            out[name] = {
+              done: !mark && lsDone,
+              mark: mark || null,
+              categoryId: this._habitCategoryId?.(name) || null,
+            };
+          }
+          return out;
+        },
+        markDone: (nameOrId, dayKey) => this._markHabitDoneByName(nameOrId, dayKey),
+        toggle: async (nameOrId, dayKey) => {
+          const key = dayKey || this._dayKey;
+          const want = String(nameOrId || '').trim().toLowerCase();
+          if (!key || !want) return false;
+          await this._ensureDayLog?.(key);
+          let hit = null;
+          for (const e of this._dayEntries?.(key) || []) {
+            for (const h of e.habits || []) {
+              const n = String(h.name || '').trim().toLowerCase();
+              const id = String(h.id || '').trim().toLowerCase();
+              if (n === want || id === want) {
+                hit = { ...h, logGuid: e.guid };
+                break;
+              }
+            }
+            if (hit) break;
+          }
+          if (!hit) {
+            const cfg = (this._config.habits || []).find((h) => {
+              const n = String(h.name || '').trim().toLowerCase();
+              const id = String(h.id || '').trim().toLowerCase();
+              return n === want || id === want;
+            });
+            if (cfg) hit = { ...cfg, logGuid: this._primaryLogGuid(key), done: false };
+          }
+          if (!hit) return false;
+          await this._toggleHabit(hit, key);
+          return true;
+        },
+        mount: (el, ctx) => this._mount(el, ctx),
+        onDay: (dayLabel, meta) => this._onDay(dayLabel, meta),
+        onExpand: (expanded) => this._onExpand(expanded),
       };
-      this._panelStates.set(panelId, state);
-    } else {
-      // Update existing state to sync with journal date
-      state.dateStr = journalDateStr;
-      state.isJournalPanel = true;
-    }
-
-    const jhsShell = this._states.get(panelId);
-    if (jhsShell?.bodyEl) state.jhsHabitContainer = jhsShell.bodyEl;
-
-    htHabitsDbg({
-      step: '_onPanelChanged.mount',
-      panelId,
-      journalDateStr,
-      recordGuid: String(recordGuid).slice(0, 40),
-      hasJhsShell: !!jhsShell,
-      jhsBodyConnected: !!jhsShell?.bodyEl?.isConnected,
-      habitContainerIsJhsBody: state.jhsHabitContainer === jhsShell?.bodyEl,
-      statsMode: state.bodyEl?.dataset?.mode || null,
-    });
-    this._mountSidebar(panel, state);
-    if (state.bodyEl?.dataset?.mode !== 'stats') {
-      // Debounce render on journal page navigation to avoid lag
-      if (state.renderTimer) clearTimeout(state.renderTimer);
-      state.renderTimer = setTimeout(() => {
-        state.renderTimer = null;
-        htHabitsDbg({ step: '_onPanelChanged.schedule_renderSidebar', panelId, delayMs: 50 });
-        this._renderSidebar(state);
-      }, 50);
-    } else {
-      htHabitsDbg({ step: '_onPanelChanged.skip_renderSidebar', panelId, reason: 'stats_mode' });
-    }
-  }
-
-  _onPanelClosed(panel) {
-    const panelId = panel?.getId?.();
-    if (!panelId) return;
-    this._cleanupHabitPanel(panelId);
-  }
-
-  _disposeState(state) {
-    try {
-      state._htInlineDragCleanup?.();
+      globalThis.__dawnHabitsHost = api;
+      globalThis.__dawnHabitsAddon = api;
+      globalThis.__dawnHabits = api;
     } catch (_) {}
-    state._htInlineDragCleanup = null;
-    if (state.renderTimer) clearTimeout(state.renderTimer);
-    state.renderTimer = null;
-    state.observer?.disconnect?.();
-    state.observer = null;
-    try {
-      if (state.jhsExternalHeaderHost) state.jhsExternalHeaderHost.replaceChildren();
-    } catch (_) {}
-    state.jhsExternalHeaderHost = null;
-    try { state.sidebarEl?.remove?.(); } catch(e) {}
-    state.sidebarEl = null;
-    state.bodyEl = null;
   }
 
-  _mountSidebar(panel, state) {
-    const panelEl = panel?.getElement?.();
-    const container = this._findContainer(panelEl);
-    if (!container) {
-      htHabitsDbg({
-        step: '_mountSidebar',
-        outcome: 'skip',
-        panelId: state?.panelId,
-        reason: 'no_container',
-        hadJhsHabitContainer: !!state.jhsHabitContainer,
-        hadPanelEl: !!panelEl,
-      });
-      return;
-    }
-
-    // Remove any stray duplicate .ht-sidebar elements we don't own
-    container.querySelectorAll('.ht-sidebar').forEach(el => {
-      if (el !== state.sidebarEl) el.remove();
-    });
-
-    // Build shell if missing or disconnected
-    if (!state.sidebarEl || !state.sidebarEl.isConnected) {
-      state.sidebarEl?.remove?.();
-      const shellSt = this._states.get(state.panelId);
-      const headerHost =
-        state.jhsHabitContainer && shellSt?.jhsHabitControlsEl ? shellSt.jhsHabitControlsEl : null;
-      state.sidebarEl = this._buildSidebarShell(state, headerHost);
-    }
-    // Always refresh — async `_renderSidebar` may still hold a `body` reference to a node that
-    // was detached when `.jhs-body` was cleared during a concurrent `_renderState` habit pass.
-    if (state.sidebarEl) {
-      state.bodyEl = state.sidebarEl.querySelector('.ht-sidebar-body');
-    }
-
-    // Only insert if not already the first child of this exact container
-    const firstChild = container.firstChild;
-    if (firstChild !== state.sidebarEl) {
-      container.insertBefore(state.sidebarEl, firstChild);
-    }
-
-    // Set up observer only once — only watches for our element being removed
-    if (!state.observer) {
-      state.observer = new MutationObserver(() => {
-        if (!state.sidebarEl || state.sidebarEl.isConnected) return;
-        // Sidebar was removed by Thymer — schedule a single remount
-        if (state._remountScheduled) return;
-        state._remountScheduled = true;
-        setTimeout(() => {
-          state._remountScheduled = false;
-          if (state.sidebarEl?.isConnected) return;
-          this._mountSidebar(panel, state);
-          if (state.bodyEl?.dataset?.mode !== 'stats') {
-            this._renderSidebar(state);
-          }
-        }, 80);
-      });
-      // Only watch direct children of the container — not subtree — so our own renders don't trigger it
-      state.observer.observe(container, { childList: true });
-    }
-
-    htHabitsDbg({
-      step: '_mountSidebar.done',
-      panelId: state.panelId,
-      containerClass: (container.className && String(container.className).slice(0, 120)) || container.nodeName,
-      containerIsJhsBody: !!container?.classList?.contains?.('jhs-body'),
-      sidebarConnected: !!state.sidebarEl?.isConnected,
-      habitBodyConnected: !!state.bodyEl?.isConnected,
-      hasHtSidebarClass: !!state.sidebarEl?.classList?.contains?.('ht-sidebar'),
-    });
-  }
-
-  _findContainer(panelEl) {
-    if (!panelEl) return null;
-    for (const sel of ['.page-content', '.editor-wrapper', '.editor-panel', '#editor']) {
-      if (panelEl.matches?.(sel)) return panelEl;
-      const child = panelEl.querySelector?.(sel);
-      if (child) return child;
-    }
-    return null;
-  }
-
-  /** Open inline stats view; optional `habitId` pre-selects that habit in the stats dropdown. */
-  _habitEnterStatsView(state, opts = {}) {
-    const body = state.bodyEl;
-    const refs = state._htHabitShell;
-    if (!body || !body.isConnected || !refs?.statsBtn) return;
-    if (state.htManageMode) {
-      state.htManageMode = false;
-      refs.manageBtn?.classList.remove('active');
-    }
-    delete state._htStatsCal;
-    const hid = opts && opts.habitId;
-    if (hid) {
-      const ok = (this._config?.habits || []).some((h) => h.id === hid && !h.archived);
-      if (ok) state.statsSelected = 'habit:' + hid;
-    }
-    body.dataset.mode = 'stats';
-    refs.statsBtn.innerHTML = htIcon('arrow-left');
-    refs.statsBtn.title = 'Back to habits';
-    refs.statsBtn.classList.add('active');
-    refs.prevBtn.style.display = 'none';
-    refs.dateEl.style.display = 'none';
-    refs.nextBtn.style.display = 'none';
-    if (refs.manageBtn) refs.manageBtn.style.display = 'none';
-    void this._renderStats(state, body);
-  }
-
-  _habitExitStatsView(state) {
-    const body = state.bodyEl;
-    const refs = state._htHabitShell;
-    if (!body || !body.isConnected || !refs?.statsBtn) return;
-    body.dataset.mode = 'habits';
-    refs.statsBtn.innerHTML = htIcon('chart-bar');
-    refs.statsBtn.title = 'View stats';
-    refs.statsBtn.classList.remove('active');
-    if (state.isJournalPanel) {
-      refs.prevBtn.style.display = 'none';
-      refs.nextBtn.style.display = 'none';
-    } else {
-      refs.prevBtn.style.display = '';
-      refs.nextBtn.style.display = '';
-    }
-    refs.dateEl.style.display = '';
-    if (refs.manageBtn) refs.manageBtn.style.display = '';
-    void this._renderSidebar(state);
-  }
-
-  /**
-   * Top bar: among categories that contain ≥1 active habit, how many have ≥1 habit
-   * completed today (at-least-one-per-category), not “all habits done”.
-   */
-  _htCategoryProgressFromLog(config, log, dateStr) {
-    const d = dateStr || htToday();
-    const cats = [...(config?.categories || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
-    let eligible = 0;
-    let done = 0;
-    for (const cat of cats) {
-      const habitsInCat = (config?.habits || []).filter((h) => h.categoryId === cat.id && !h.archived);
-      const applying = habitsInCat.filter((h) => htHabitAppliesOnDate(h, d));
-      if (applying.length === 0) continue;
-      eligible++;
-      const anyDone = applying.some((h) => htCompletionNorm(log.completions?.[h.id], h).done);
-      if (anyDone) done++;
-    }
-    const pct = eligible > 0 ? Math.round((done / eligible) * 100) : 0;
-    return { done, eligible, pct };
-  }
-
-  _htRecomputeCategoryDone(log, config, dateStr) {
-    const d = dateStr || htToday();
-    if (!log.categoryDone) log.categoryDone = {};
-    for (const cat of config.categories || []) {
-      const habitsInCat = (config.habits || []).filter((x) => x.categoryId === cat.id && !x.archived);
-      const applying = habitsInCat.filter((h) => htHabitAppliesOnDate(h, d));
-      if (applying.length === 0) {
-        delete log.categoryDone[cat.id];
-        continue;
-      }
-      const anyDone = applying.some((h) => htCompletionNorm(log.completions?.[h.id], h).done);
-      if (anyDone) log.categoryDone[cat.id] = true;
-      else delete log.categoryDone[cat.id];
-    }
-  }
-
-  /** Advance completion: done (check) → fail (×) → N/A → clear; numeric with target snaps partial to target. */
-  _htCycleHabitCompletion(log, habit, hId) {
-    const h = habit;
-    const raw = log.completions?.[hId];
-    const norm = htCompletionNorm(raw, h);
-    const target = h.target || 0;
-    const hasTarget = target > 0;
-    if (hasTarget) {
-      if (norm.kind === 'empty') log.completions[hId] = target;
-      else if (norm.done) log.completions[hId] = HT_COMP_FAIL;
-      else if (norm.kind === 'fail') log.completions[hId] = HT_COMP_NA;
-      else if (norm.kind === 'na') delete log.completions[hId];
-      else if (norm.kind === 'partial') log.completions[hId] = target;
-    } else {
-      if (norm.kind === 'empty') log.completions[hId] = true;
-      else if (norm.done) log.completions[hId] = HT_COMP_FAIL;
-      else if (norm.kind === 'fail') log.completions[hId] = HT_COMP_NA;
-      else if (norm.kind === 'na') delete log.completions[hId];
-    }
-  }
-
-  _htCancelPendingHabitTap(state) {
-    if (state._htPendingHabitTapTimer) {
-      clearTimeout(state._htPendingHabitTapTimer);
-      state._htPendingHabitTapTimer = null;
-    }
-    state._htPendingHabitTap = null;
-  }
-
-  /** Multi-press counter; locks whether the stroke started on an empty cell. */
-  _htSidebarPressSeqBump(state, habit, dayLog, hId, dateStr) {
-    const now = Date.now();
-    if (now - (state._htSidebarDragLastUp || 0) < HT_SIDEBAR_DRAG_CLICK_GAP_MS) {
-      state._htSidebarDragClickSeq = Math.min(3, (state._htSidebarDragClickSeq || 0) + 1);
-    } else {
-      state._htSidebarDragClickSeq = 1;
-      state._htDragSeqSourceEmpty =
-        this._htDragModeFromCompletion(habit, dayLog, hId, dateStr) === null;
-    }
-    return state._htSidebarDragClickSeq;
-  }
-
-  _htDragModeForPressSeq(state, habit, log, hId, dateStr, clickCount) {
-    if (state._htDragSeqSourceEmpty) {
-      return this._htSidebarDragModeFromClickCount(clickCount);
-    }
-    return this._htDragModeFromCompletion(habit, log, hId, dateStr) || 'done';
-  }
-
-  _htSidebarDragModeFromClickCount(count) {
-    if (count >= 3) return 'na';
-    if (count === 2) return 'fail';
-    return 'done';
-  }
-
-  /** Drag paint mode from an existing mark; null = empty (use click-count). */
-  _htDragModeFromCompletion(habit, log, hId, dateStr) {
-    const raw = log?.completions?.[hId];
-    const norm = htCompletionNorm(raw, habit);
-    const surf = htHabitDaySurface(log, habit, dateStr);
-    if (norm.kind === 'fail') return 'fail';
-    if (norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')) return 'na';
-    if (norm.done || norm.kind === 'partial') return 'done';
-    return null;
-  }
-
-  _htApplyDragCompletion(batch, habit, hId, mode) {
-    if (mode === 'fail') batch.completions[hId] = HT_COMP_FAIL;
-    else if (mode === 'na') batch.completions[hId] = HT_COMP_NA;
-    else if (mode === 'done') {
-      const target = habit.target || 0;
-      batch.completions[hId] = target > 0 ? target : true;
-    }
-  }
-
-  _htSyncDayLogState(state, dateStr, log) {
-    state._htDayLogDate = dateStr;
-    state._htDayLog = JSON.parse(
-      JSON.stringify(log || { date: dateStr, completions: {}, categoryDone: {}, notes: '' })
-    );
-    state._htDayLog.date = dateStr;
-  }
-
-  async _htEnsureSidebarDragLog(state, dateStr) {
-    if (state._htSidebarDragLog && state._htSidebarDragLog.date === dateStr) {
-      return state._htSidebarDragLog;
-    }
-    let base =
-      state._htDayLogDate === dateStr && state._htDayLog
-        ? state._htDayLog
-        : await this._loadLog(dateStr);
-    state._htSidebarDragLog = JSON.parse(JSON.stringify(base));
-    state._htSidebarDragLog.date = dateStr;
-    return state._htSidebarDragLog;
-  }
-
-  _htArmSidebarDragPaintFlush(state, dateStr) {
-    if (state._htSidebarDragFlushArmed) return;
-    state._htSidebarDragFlushArmed = true;
-    const finish = async () => {
-      window.removeEventListener('pointerup', finish, true);
-      window.removeEventListener('pointercancel', finish, true);
-      state._htSidebarDragFlushArmed = false;
-      state._htSidebarDragArmed = false;
-      state._htSidebarDragMode = null;
-      const seen = state._htSidebarDragSeen;
-      state._htSidebarDragSeen = null;
-      const batch = state._htSidebarDragLog;
-      state._htSidebarDragLog = null;
-      if (!batch || !seen?.size) return;
-      try {
-        const latest = await this._loadLog(dateStr);
-        for (const hid of seen) {
-          if (Object.prototype.hasOwnProperty.call(batch.completions, hid)) {
-            latest.completions[hid] = batch.completions[hid];
-          }
+  async _markHabitDoneByName(nameOrId, dayKey) {
+    const key = dayKey || this._dayKey;
+    const want = String(nameOrId || '').trim().toLowerCase();
+    if (!key || !want) return false;
+    await this._ensureDayLog(key);
+    const entries = this._dayEntries?.(key) || [];
+    let hit = null;
+    for (const e of entries) {
+      for (const h of e.habits || []) {
+        const n = String(h.name || '').trim().toLowerCase();
+        const id = String(h.id || '').trim().toLowerCase();
+        if (n === want || id === want) {
+          hit = { ...h, logGuid: e.guid };
+          break;
         }
-        this._htRecomputeCategoryDone(latest, this._config, dateStr);
-        await this._saveLog(dateStr, latest);
-        this._htSyncDayLogState(state, dateStr, latest);
-      } catch (_) {}
-    };
-    window.addEventListener('pointerup', finish, { once: true, capture: true });
-    window.addEventListener('pointercancel', finish, { once: true, capture: true });
-  }
-
-  _htPaintSidebarHabitDrag(state, habitEl, dateStr, config) {
-    if (!state._htSidebarDragArmed || !state._htSidebarDragMode) return false;
-    const hid = habitEl?.dataset?.habitId;
-    if (!hid) return false;
-    if (!state._htSidebarDragSeen) state._htSidebarDragSeen = new Set();
-    if (state._htSidebarDragSeen.has(hid)) return false;
-    const habit = (config.habits || []).find((h) => h.id === hid && !h.archived);
-    if (!habit) return false;
-    state._htSidebarDragSeen.add(hid);
-    state._htSidebarDragDidPaint = true;
-    const batch = state._htSidebarDragLog;
-    if (!batch) return false;
-    this._htApplyDragCompletion(batch, habit, hid, state._htSidebarDragMode);
-    this._htRecomputeCategoryDone(batch, config, dateStr);
-    this._htSyncDayLogState(state, dateStr, batch);
-    void this._patchHabitEl(habitEl, habit, batch, dateStr, habit.categoryId, state);
+      }
+      if (hit) break;
+    }
+    if (!hit) {
+      const cfg = (this._config.habits || []).find((h) => {
+        const n = String(h.name || '').trim().toLowerCase();
+        const id = String(h.id || '').trim().toLowerCase();
+        return n === want || id === want;
+      });
+      if (cfg) hit = { ...cfg, logGuid: this._primaryLogGuid(key), done: false };
+    }
+    if (!hit) return false;
+    if (hit.done && !this._habitMark(key, hit.name)) return true;
+    this._setHabitMark(key, hit.name, null);
+    this._writeHabitDone(hit, true, key);
+    this._paint();
+    await this._setTaskDoneSdk(hit, true);
+    this._afterDaySave(key);
     return true;
   }
 
-  /** Habits always list by category; tags are a filter only (see tag filter button). */
-  _htGetGroupMode() {
-    return 'category';
-  }
-
-  _htAllTagsSorted(config) {
-    const cfg = config || this._config || {};
-    const seen = new Set();
-    const fromOrder = [...(cfg.tagOrder || [])].filter(Boolean);
-    for (const h of cfg.habits || []) {
-      if (h.archived) continue;
-      for (const t of Array.isArray(h.tags) ? h.tags.filter(Boolean) : []) seen.add(t);
-    }
-    const extra = [...seen].filter((t) => !fromOrder.includes(t));
-    extra.sort((a, b) => String(a).localeCompare(String(b)));
-    return [...fromOrder.filter((t) => seen.has(t)), ...extra];
-  }
-
-  _htGetTagFilter() {
-    return String(this._htActiveTagFilter || '').trim();
-  }
-
-  _htCloseTagFilterMenu() {
-    if (this._htTagFilterCloserHandler) {
-      try {
-        document.removeEventListener('click', this._htTagFilterCloserHandler, true);
-      } catch (_) {}
-      this._htTagFilterCloserHandler = null;
-    }
-    try {
-      this._htTagFilterMenuEl?.remove?.();
-    } catch (_) {}
-    this._htTagFilterMenuEl = null;
-  }
-
-  _htSetTagFilter(tag) {
-    const v = String(tag || '').trim();
-    this._htActiveTagFilter = v;
-    if (this._persistState) {
-      try {
-        if (v) localStorage.setItem('ht_habit_tag_filter', v);
-        else localStorage.removeItem('ht_habit_tag_filter');
-      } catch (_) {}
-      this._htPluginSettingsFlush();
-    }
-    this._htCloseTagFilterMenu();
-    this._htSyncTagFilterButtons();
-    void this.refreshAllPanels();
-  }
-
-  _htSyncTagFilterButtons() {
-    const cur = this._htGetTagFilter();
-    try {
-      document.querySelectorAll('.ht-tag-filter-btn').forEach((b) => {
-        b.classList.toggle('active', !!cur);
-        b.title = cur
-          ? `Filtering by tag “${cur}”. Click to change or clear.`
-          : 'Filter habits by tag';
-      });
-    } catch (_) {}
-  }
-
-  _htToggleTagFilterMenu(anchorBtn, state) {
-    void state;
-    const cfg = this._config;
-    if (!cfg || !anchorBtn) return;
-    if (this._htTagFilterMenuEl) {
-      this._htCloseTagFilterMenu();
-      return;
-    }
-    const tags = this._htAllTagsSorted(cfg);
-    const menu = document.createElement('div');
-    menu.className = 'ht-tag-filter-menu';
-    menu.style.cssText =
-      'position:fixed;z-index:10050;min-width:188px;max-width:min(280px,92vw);max-height:min(340px,52vh);overflow:auto;padding:8px;border:1px solid rgba(255,255,255,0.14);border-radius:10px;background:rgba(26,24,32,0.98);box-shadow:0 12px 40px rgba(0,0,0,0.45);';
-    const rect = anchorBtn.getBoundingClientRect();
-    menu.style.top = `${Math.round(rect.bottom + 6)}px`;
-    menu.style.left = `${Math.round(Math.min(rect.left, Math.max(8, window.innerWidth - 296)))}px`;
-
-    const mkBtn = (label, value) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-      b.style.cssText =
-        'display:block;width:100%;text-align:left;margin:3px 0;font-size:12px;' +
-        (value === this._htGetTagFilter() ? 'border-color:rgba(124,106,247,0.55);background:rgba(124,106,247,0.12);' : '');
-      b.textContent = label;
-      b.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._htSetTagFilter(value);
-      });
-      return b;
-    };
-    menu.appendChild(mkBtn('All habits', ''));
-    if (!tags.length) {
-      const empty = document.createElement('div');
-      empty.style.cssText = 'font-size:11px;color:#8a7e6a;padding:8px 4px;line-height:1.4;';
-      empty.textContent = 'No tags yet — add tags in Quick-edit or Manage Habits.';
-      menu.appendChild(empty);
-    } else {
-      for (const t of tags) menu.appendChild(mkBtn(t, t));
-    }
-    document.body.appendChild(menu);
-    this._htTagFilterMenuEl = menu;
-    this._htTagFilterCloserHandler = (ev) => {
-      if (!this._htTagFilterMenuEl) return;
-      if (this._htTagFilterMenuEl.contains(ev.target)) return;
-      if (anchorBtn.contains(ev.target)) return;
-      this._htCloseTagFilterMenu();
-    };
-    setTimeout(() => document.addEventListener('click', this._htTagFilterCloserHandler, true), 0);
-  }
-
-  /**
-   * Month/week tallies: skip off-days and explicit `__na__` (those don't count toward totals).
-   * Returns whether this calendar day contributes a completed check.
-   */
-  _habitRollupDaySlotForCheckCount(habit, logsByDate, dateStr) {
-    if (!habit || !logsByDate || !dateStr) return null;
-    if (!htHabitAppliesOnDate(habit, dateStr)) return null;
-    const L = logsByDate.get(dateStr) || { completions: {}, categoryDone: {} };
-    const raw = L.completions?.[habit.id];
-    const norm = htCompletionNorm(raw, habit);
-    if (norm.kind === 'na') return null;
-    return { done: !!norm.done };
-  }
-
-  /** Completed checks in the calendar month containing `refDateStr`. */
-  _habitCheckCountInMonth(habit, logsByDate, refDateStr) {
-    const dt = new Date(refDateStr + 'T12:00:00');
-    const y = dt.getFullYear();
-    const m = dt.getMonth();
-    const last = new Date(y, m + 1, 0).getDate();
-    let n = 0;
-    for (let day = 1; day <= last; day++) {
-      const ds = `${y}-${String(m + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      const slot = this._habitRollupDaySlotForCheckCount(habit, logsByDate, ds);
-      if (slot?.done) n++;
-    }
-    return n;
-  }
-
-  /** Completed checks Sun–Sat week containing `refDateStr` (Sunday start). */
-  _habitCheckCountWeekSun(habit, logsByDate, refDateStr) {
-    const dow = new Date(refDateStr + 'T12:00:00').getDay();
-    const sun = htDaysBefore(refDateStr, dow);
-    let n = 0;
-    for (let i = 0; i < 7; i++) {
-      const ds = htDaysAfter(sun, i);
-      const slot = this._habitRollupDaySlotForCheckCount(habit, logsByDate, ds);
-      if (slot?.done) n++;
-    }
-    return n;
-  }
-
-  /** Calendar days in the month of `refDateStr` where ≥1 habit in `habits` was completed (same rules as per-habit rollups). */
-  _categoryDistinctDoneDaysInMonth(habits, logsByDate, refDateStr) {
-    if (!Array.isArray(habits) || !habits.length || !logsByDate || !refDateStr) return 0;
-    const dt = new Date(refDateStr + 'T12:00:00');
-    const y = dt.getFullYear();
-    const m = dt.getMonth();
-    const last = new Date(y, m + 1, 0).getDate();
-    let n = 0;
-    for (let day = 1; day <= last; day++) {
-      const ds = `${y}-${String(m + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      let any = false;
-      for (const h of habits) {
-        const slot = this._habitRollupDaySlotForCheckCount(h, logsByDate, ds);
-        if (slot?.done) {
-          any = true;
-          break;
+  _injectCss() {
+    if (this._styleEl?.isConnected) return;
+    const el = document.createElement('style');
+    el.setAttribute('data-dawn-habits', '1');
+    // Curated production ht-* look — no Path B / load logic.
+    el.textContent = `
+      .dawn-habits-root {
+        color: inherit;
+        font: inherit;
+      }
+      .dawn-habits-status { display: none; }
+      .dawn-habits-header.ht-sidebar-header {
+        display: flex;
+        align-items: center;
+        justify-content: flex-start;
+        gap: 8px;
+        padding: 2px 14px 4px;
+        min-height: 22px;
+        flex-wrap: wrap;
+      }
+      .jhs-panel-date-nav {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        min-width: 0;
+      }
+      .jhs-panel-date-nav .ht-date-label {
+        min-width: 4.5em;
+        text-align: center;
+        font-size: 12px;
+        font-weight: 600;
+        color: rgba(232, 224, 208, 0.92);
+        letter-spacing: 0.01em;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .jhs-panel-date-nav .ht-nav-btn {
+        appearance: none;
+        border: none;
+        background: transparent;
+        color: var(--text-muted, rgba(200,190,170,0.75));
+        width: 26px;
+        height: 24px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .jhs-panel-date-nav .ht-nav-btn:hover {
+        color: inherit;
+        background: rgba(255,255,255,0.06);
+      }
+      .jhs-panel-date-nav .ht-nav-btn .ti { font-size: 15px; }
+      .ht-ch-cluster {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+      }
+      .ht-ch-glyph {
+        font-size: 14px;
+        line-height: 1;
+        opacity: 0.9;
+      }
+      .dawn-habits-date-label {
+        font-size: 12px;
+        font-weight: 600;
+        color: rgba(232, 224, 208, 0.92);
+        letter-spacing: 0.01em;
+        font-variant-numeric: tabular-nums;
+      }
+      .dawn-habits-done-meta {
+        font-size: 11px;
+        color: var(--text-muted, #8a7e6a);
+        font-variant-numeric: tabular-nums;
+        opacity: 0.85;
+      }
+      .ht-layout-btn,
+      .ht-stats-btn,
+      .ht-nav-btn {
+        appearance: none;
+        background: none;
+        border: none;
+        cursor: pointer;
+        color: #8a7e6a;
+        font-size: 14px;
+        padding: 2px 6px;
+        border-radius: 6px;
+        flex-shrink: 0;
+        transition: all 0.15s;
+        line-height: 1;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 24px;
+        min-height: 22px;
+      }
+      .ht-layout-btn:hover,
+      .ht-stats-btn:hover,
+      .ht-nav-btn:hover { color: #e8e0d0; background: rgba(255,255,255,0.07); }
+      .ht-layout-btn.active,
+      .ht-stats-btn.active {
+        color: #e8e0d0;
+        background: rgba(255,255,255,0.07);
+      }
+      .ht-layout-btn .ti,
+      .ht-stats-btn .ti,
+      .ht-nav-btn .ti { font-size: 15px; line-height: 1; }
+      .ht-nav-btn.ht-cat-expand-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 22px;
+        min-height: 22px;
+        padding: 0 2px;
+        box-sizing: border-box;
+      }
+      .ht-nav-btn.ht-cat-expand-toggle .ti {
+        font-size: 18px;
+        opacity: 1;
+      }
+      .ht-progress {
+        margin: 2px 14px 8px;
+        height: 5px;
+        background: rgba(255,255,255,0.08);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .ht-progress.jhs-segment-bar {
+        position: relative;
+        display: block;
+        height: 5px;
+        border-radius: 999px;
+      }
+      .ht-progress.jhs-segment-bar.is-sherbet {
+        box-shadow: 0 0 10px rgba(255, 185, 100, 0.28);
+        animation: ht-cat-all-done-sparkle 2.8s ease-in-out infinite;
+      }
+      .jhs-segment-bar .jhs-fill {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 0;
+        transition: width 0.35s ease, left 0.35s ease;
+      }
+      .jhs-fill.is-segment-gradient {
+        left: 0 !important;
+        width: 100% !important;
+        transition: background 0.45s ease;
+      }
+      .jhs-fill.is-sherbet-full {
+        left: 0 !important;
+        width: 100% !important;
+        background: repeating-linear-gradient(
+          90deg,
+          #fff8ea 0px,
+          #ffe8c8 40px,
+          #ffc888 80px,
+          #ff9848 120px,
+          #f04838 160px,
+          #ff9848 200px,
+          #ffc888 240px,
+          #ffe8c8 280px,
+          #fff8ea 320px
+        );
+        background-size: 320px 100%;
+        animation: ht-streak-sherbet-flow 11s linear infinite;
+      }
+      @keyframes ht-cat-all-done-sparkle {
+        0%, 100% { filter: drop-shadow(0 0 1px rgba(255, 210, 140, 0.35)); }
+        50% { filter: drop-shadow(0 0 7px rgba(255, 185, 100, 0.65)); }
+      }
+      @keyframes ht-streak-sherbet-flow {
+        0% { background-position: 0 0; }
+        100% { background-position: 320px 0; }
+      }
+      .ht-header-stack {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+        align-items: stretch;
+        gap: 14px;
+      }
+      .ht-habit-section-ribbon {
+        display: grid;
+        width: 100%;
+        grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+        gap: 8px 10px;
+        align-items: center;
+        justify-items: stretch;
+        padding: 12px 8px 8px;
+        margin: 0;
+        border-top: none;
+        min-height: 22px;
+        box-sizing: border-box;
+      }
+      .ht-habit-section-ribbon[hidden],
+      .ht-habit-section-ribbon.ht-hidden { display: none !important; }
+      .ht-ribbon-sec {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        padding: 4px 2px;
+        border-radius: 0;
+        border: none;
+        border-bottom: 1px solid transparent;
+        background: transparent;
+        color: #c4b8a8;
+        font-size: 10px;
+        cursor: pointer;
+        line-height: 1.15;
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
+        box-sizing: border-box;
+      }
+      .ht-ribbon-sec-inner {
+        display: grid;
+        grid-template-columns: 14px 30px max-content;
+        align-items: center;
+        justify-content: start;
+        justify-items: stretch;
+        column-gap: 2px;
+        width: 100%;
+        max-width: 100%;
+        box-sizing: border-box;
+      }
+      .ht-ribbon-sec-lead {
+        grid-column: 1;
+        width: 14px;
+        min-width: 14px;
+        max-width: 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: flex-end;
+        justify-self: stretch;
+        position: relative;
+      }
+      .ht-ribbon-marked-dot {
+        position: absolute;
+        right: -1px;
+        bottom: 1px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+      }
+      .ht-ribbon-marked-dot .ht-cat-marked-dot {
+        width: 3px;
+        height: 3px;
+        opacity: 0.82;
+        box-shadow: 0 0 4px rgba(196, 184, 255, 0.16);
+      }
+      .ht-ribbon-sec-inner .ht-ribbon-sec-glyph {
+        grid-column: 2;
+        width: 30px;
+        min-width: 30px;
+        max-width: 30px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        justify-self: center;
+        text-align: center;
+      }
+      .ht-ribbon-sec-lead .ht-cat-inline-check .ti { font-size: 11px; }
+      .ht-ribbon-sec-lead .ht-cat-inline-check--all-done .ti { font-size: 11px; }
+      .ht-ribbon-sec-lead .ht-cat-na-bar { height: 10px; width: 2px; }
+      .ht-ribbon-sec-lead .ht-cat-inline-fail.ht-habit-mark-fail {
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .ht-ribbon-sec-tail {
+        grid-column: 3;
+        display: inline-flex;
+        align-items: baseline;
+        justify-content: flex-start;
+        gap: 1px;
+        min-width: 0;
+        justify-self: start;
+      }
+      .ht-ribbon-sec:hover {
+        background: transparent;
+        color: #e8e0d0;
+        border-bottom-color: rgba(255, 183, 77, 0.35);
+      }
+      .ht-ribbon-sec-glyph { font-size: 13px; line-height: 1; flex-shrink: 0; }
+      .ht-ribbon-slot.ht-ribbon-slot--expanded {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        min-height: 30px;
+        padding: 4px;
+        opacity: 0;
+        visibility: visible;
+        pointer-events: auto;
+        cursor: pointer;
+      }
+      .ht-ribbon-slot.ht-ribbon-slot--expanded:focus-visible {
+        outline: 1px solid rgba(124, 106, 247, 0.55);
+        outline-offset: 2px;
+        opacity: 0.08;
+      }
+      .ht-ribbon-sec-streak {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 1px;
+        font-size: 9px;
+        font-weight: 600;
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.02em;
+      }
+      .ht-ribbon-sec-streak .ti {
+        font-size: 10px;
+        vertical-align: -0.05em;
+        opacity: 0.95;
+        color: currentColor;
+      }
+      .ht-ribbon-sec-streak .ht-streak-day-count { font-size: 9px; font-weight: 700; }
+      .ht-cat-inline-na,
+      .ht-cat-inline-fail {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 1;
+      }
+      .ht-cat-na-bar {
+        display: inline-block;
+        width: 2px;
+        height: 12px;
+        border-radius: 1px;
+        background: linear-gradient(180deg, rgba(218, 185, 110, 0.95), rgba(168, 132, 58, 0.82));
+        box-shadow: 0 0 5px rgba(200, 165, 72, 0.2);
+        vertical-align: middle;
+      }
+      .ht-cat-marked-dot {
+        display: inline-block;
+        width: 4px;
+        height: 4px;
+        border-radius: 999px;
+        background: rgba(196, 184, 255, 0.70);
+        box-shadow: 0 0 6px rgba(196, 184, 255, 0.22);
+        opacity: 0.95;
+      }
+      .ht-habit-mark-fail { color: rgba(142, 72, 72, 0.82); }
+      .ht-category {
+        margin: 0 0 16px 0;
+      }
+      .ht-category--ribbon-collapsed { display: none; }
+      .dawn-habits-list .ht-habit.ht-fail .ht-habit-check-minimal,
+      .dawn-habits-list .ht-habit.ht-fail .ht-habit-check-minimal .ti {
+        color: rgba(232, 120, 100, 0.95);
+      }
+      .dawn-habits-list .ht-habit.ht-fail .ht-habit-name,
+      .dawn-habits-list .ht-habit.ht-fail .ht-habit-line-name {
+        color: #a87868;
+        text-decoration: line-through;
+        text-decoration-color: rgba(168,120,104,0.55);
+      }
+      .dawn-habits-list .ht-habit.ht-na {
+        opacity: 0.55;
+      }
+      .dawn-habits-list .ht-habit.ht-na .ht-habit-check-minimal,
+      .dawn-habits-list .ht-habit.ht-na .ht-habit-check-minimal .ti {
+        color: #8a7e6a;
+      }
+      .dawn-habits-list .ht-habit.ht-na .ht-habit-name,
+      .dawn-habits-list .ht-habit.ht-na .ht-habit-line-name {
+        color: #8a7e6a;
+        font-style: italic;
+      }
+      .ht-category-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 14px 4px;
+        cursor: pointer;
+        user-select: none;
+        border-radius: 8px;
+        margin: 0 6px;
+      }
+      .ht-category-header:hover { background: rgba(255,255,255,0.06); }
+      .ht-category-caret {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 12px;
+        opacity: 0;
+        color: #8a7e6a;
+        transition: opacity 0.12s, transform 0.12s;
+      }
+      .ht-category-caret .ti { font-size: 9px; }
+      .ht-category-header:hover .ht-category-caret,
+      .ht-category-header:focus-within .ht-category-caret { opacity: 1; }
+      @media (hover: none), (pointer: coarse) {
+        .ht-category-caret { opacity: 0.65; }
+      }
+      .ht-category-caret.open { transform: rotate(90deg); }
+      .ht-category-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #8a7e6a;
+      }
+      .ht-category-streak {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        font-size: 11px;
+        color: #8a7e6a;
+        opacity: 0.88;
+        font-variant-numeric: tabular-nums;
+      }
+      .ht-category-streak .ti { font-size: 11px; }
+      .ht-cat-inline-check {
+        display: inline-flex;
+        align-items: center;
+        line-height: 1;
+        color: #5ad389;
+        margin-right: 2px;
+      }
+      .ht-cat-inline-check .ti { font-size: 12px; opacity: 0.92; }
+      .ht-cat-inline-check--recovered .ti { color: rgba(255, 140, 160, 0.92) !important; }
+      .ht-cat-inline-check--all-done {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        line-height: 1;
+        color: #ffe8c8;
+      }
+      .ht-cat-inline-check--all-done .ti {
+        font-size: 13px;
+        opacity: 1;
+        background: repeating-linear-gradient(
+          90deg,
+          #fff8ea 0px,
+          #ffe8c8 40px,
+          #ffc888 80px,
+          #ff9848 120px,
+          #f04838 160px,
+          #ff9848 200px,
+          #ffc888 240px,
+          #ffe8c8 280px,
+          #fff8ea 320px
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .dawn-habits-list.ht-category-habits {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px 10px;
+        padding: 6px 10px 12px 14px;
+        align-items: start;
+      }
+      .dawn-habits-root.ht-habit-layout-single-col .dawn-habits-list.ht-category-habits {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .dawn-habits-list.ht-category-habits.ht-hidden { display: none; }
+      @media (max-width: 520px) {
+        .dawn-habits-list.ht-category-habits {
+          grid-template-columns: minmax(0, 1fr);
         }
       }
-      if (any) n++;
-    }
-    return n;
-  }
-
-  /** Sun–Sat week containing `refDateStr`: days where ≥1 habit in `habits` was completed. */
-  _categoryDistinctDoneDaysInWeekSun(habits, logsByDate, refDateStr) {
-    if (!Array.isArray(habits) || !habits.length || !logsByDate || !refDateStr) return 0;
-    const dow = new Date(refDateStr + 'T12:00:00').getDay();
-    const sun = htDaysBefore(refDateStr, dow);
-    let n = 0;
-    for (let i = 0; i < 7; i++) {
-      const ds = htDaysAfter(sun, i);
-      let any = false;
-      for (const h of habits) {
-        const slot = this._habitRollupDaySlotForCheckCount(h, logsByDate, ds);
-        if (slot?.done) {
-          any = true;
-          break;
+      .dawn-habits-list .ht-habit {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+        padding: 8px 8px 9px;
+        margin: 0;
+        border-radius: 10px;
+        border: 1px solid transparent;
+        background: transparent;
+        cursor: pointer;
+        transition: background 0.12s, border-color 0.12s;
+        text-align: left;
+        width: 100%;
+        box-sizing: border-box;
+        color: inherit;
+        font: inherit;
+        user-select: none;
+      }
+      .dawn-habits-list .ht-habit:hover {
+        background: rgba(255,255,255,0.06);
+        border-color: rgba(255,255,255,0.06);
+      }
+      .dawn-habits-list .ht-habit-top {
+        display: flex;
+        flex-direction: row;
+        align-items: flex-start;
+        gap: 8px;
+        min-width: 0;
+      }
+      .dawn-habits-list .ht-habit-orbit {
+        flex-shrink: 0;
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 1px solid rgba(255,255,255,0.07);
+        background: transparent;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-sizing: border-box;
+        pointer-events: none;
+      }
+      .dawn-habits-list .ht-habit.ht-done .ht-habit-orbit {
+        border-color: rgba(255,255,255,0.12);
+      }
+      .dawn-habits-list .ht-habit-check-minimal {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 22px;
+        min-height: 22px;
+        border: none;
+        background: transparent;
+        color: var(--text-muted, #8a7e6a);
+      }
+      .dawn-habits-list .ht-habit-check-minimal .ti {
+        font-size: 17px;
+        line-height: 1;
+      }
+      .dawn-habits-list .ht-check-faint {
+        opacity: 0 !important;
+        transition: opacity 0.12s ease;
+      }
+      @media (hover: hover) and (pointer: fine) {
+        .dawn-habits-list .ht-habit:not(.ht-done):hover .ht-check-faint {
+          opacity: 0.38 !important;
         }
       }
-      if (any) n++;
-    }
-    return n;
+      @media (hover: none) {
+        .dawn-habits-list .ht-habit:not(.ht-done) .ht-check-faint {
+          opacity: 0.22 !important;
+        }
+      }
+      .dawn-habits-list .ht-habit.ht-done .ht-habit-check-minimal,
+      .dawn-habits-list .ht-habit.ht-done .ht-habit-check-minimal .ti {
+        color: rgba(130, 188, 156, 0.92);
+      }
+      .dawn-habits-list .ht-habit-num {
+        font-size: 11px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+        color: #e8e0d0;
+      }
+      .dawn-habits-list .ht-habit-num .ht-num-tgt {
+        opacity: 0.55;
+        font-weight: 500;
+        font-size: 9px;
+      }
+      .dawn-habits-list .ht-habit {
+        touch-action: manipulation;
+        -webkit-touch-callout: none;
+      }
+      .dawn-habits-list .ht-habit-name:has(.ht-num-input) {
+        overflow: visible;
+        text-overflow: unset;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+        white-space: normal;
+      }
+      .ht-num-btn {
+        background: rgba(255,255,255,0.08);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 4px;
+        color: #e8e0d0;
+        font-size: 13px;
+        width: 20px;
+        height: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        flex-shrink: 0;
+        padding: 0;
+        line-height: 1;
+      }
+      .ht-num-btn:hover { background: rgba(255,255,255,0.15); }
+      .ht-num-fail-btn {
+        font-size: 15px;
+        font-weight: 700;
+        color: rgba(255, 120, 120, 0.95);
+        border-color: rgba(255, 120, 120, 0.35);
+        width: 22px;
+        height: 22px;
+      }
+      .ht-num-na-btn .ht-cat-na-bar {
+        height: 11px;
+        width: 3px;
+      }
+      .ht-num-input {
+        width: 44px;
+        padding: 2px 4px;
+        background: rgba(255,255,255,0.1);
+        border: 1px solid rgba(124,106,247,0.6);
+        border-radius: 4px;
+        color: #e8e0d0;
+        font-size: 12px;
+        text-align: center;
+        outline: none;
+      }
+      .dawn-habits-list .ht-habit-name-col {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+      .dawn-habits-list .ht-habit-line-meta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-height: 18px;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .dawn-habits-list .ht-habit-streak-cluster {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .dawn-habits-list .ht-habit-streak-core {
+        display: inline-flex;
+        align-items: center;
+        gap: 2px;
+        font-size: 11px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+      }
+      .dawn-habits-list .ht-habit-streak-core .ti {
+        font-size: 12px;
+        line-height: 1;
+      }
+      .dawn-habits-list .ht-streak-day-count { font-variant-numeric: tabular-nums; }
+      .ht-category-streak .ht-streak-day-count { font-variant-numeric: tabular-nums; }
+      .dawn-habits-list .ht-habit-stat-counts {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 2px;
+        font-size: 11px;
+        color: #8a7e6a;
+        font-variant-numeric: tabular-nums;
+        opacity: 0.9;
+      }
+      .dawn-habits-list .ht-roll-num { color: inherit; font-weight: 600; }
+      .dawn-habits-list .ht-roll-suffix { opacity: 0.75; font-size: 10px; }
+      .dawn-habits-list .ht-roll-sep { opacity: 0.45; margin: 0 2px; }
+      .dawn-habits-list .ht-habit-name,
+      .dawn-habits-list .ht-habit-line-name {
+        min-width: 0;
+        color: inherit;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .dawn-habits-list .ht-habit.ht-done .ht-habit-name,
+      .dawn-habits-list .ht-habit.ht-done .ht-habit-line-name {
+        color: #8a7e6a;
+        text-decoration: line-through;
+        text-decoration-color: rgba(138,126,106,0.5);
+      }
+      .dawn-habits-list .ht-habit-stats-link {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        margin: 0;
+        padding: 0;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: #8a7e6a;
+        cursor: pointer;
+        opacity: 0.32;
+        pointer-events: auto;
+        transition: opacity 0.12s, color 0.12s, background 0.12s;
+      }
+      .dawn-habits-list .ht-habit-stats-link .ti { font-size: 14px; }
+      @media (hover: hover) and (pointer: fine) {
+        .dawn-habits-list .ht-habit-stats-link {
+          opacity: 0;
+          pointer-events: none;
+        }
+        .dawn-habits-list .ht-habit:hover .ht-habit-stats-link {
+          opacity: 0.55;
+          pointer-events: auto;
+        }
+      }
+      .dawn-habits-list .ht-habit .ht-habit-stats-link:hover {
+        opacity: 1;
+        color: #e8e0d0;
+        background: rgba(255,255,255,0.08);
+      }
+      .dawn-habits-empty {
+        opacity: 0.7;
+        font-size: 12px;
+        font-style: italic;
+        color: var(--text-muted, rgba(180, 172, 158, 0.85));
+        text-align: center;
+        padding: 12px 8px;
+      }
+      .ht-notes-wrap {
+        margin: 10px 14px 4px;
+        padding-top: 8px;
+        border-top: 1px solid rgba(255, 255, 255, 0.07);
+      }
+      .ht-notes-label {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #8a7e6a;
+        margin-bottom: 6px;
+      }
+      .ht-notes-input {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 2.8em;
+        max-height: 120px;
+        overflow-y: auto;
+        resize: vertical;
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1.35;
+        color: #e8e0d0;
+        background: rgba(0, 0, 0, 0.25);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 6px;
+        padding: 6px 8px;
+        margin: 0;
+      }
+      .ht-notes-input::placeholder { color: rgba(138, 126, 106, 0.75); }
+      .ht-notes-input:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.22);
+        background: rgba(0, 0, 0, 0.32);
+      }
+      .ht-stats-view { padding: 8px 14px 16px; }
+      .ht-stats-range {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 12px;
+      }
+      .ht-range-btn {
+        appearance: none;
+        padding: 3px 10px;
+        border-radius: 20px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: none;
+        color: #8a7e6a;
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s;
+        font: inherit;
+      }
+      .ht-range-btn.active,
+      .ht-range-btn:hover {
+        background: rgba(255,255,255,0.08);
+        border-color: rgba(255,255,255,0.22);
+        color: #e8e0d0;
+      }
+      .ht-stat-cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      .ht-stat-card {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.07);
+        border-radius: 10px;
+        padding: 10px 12px;
+      }
+      .ht-stat-label {
+        font-size: 10px;
+        color: #8a7e6a;
+        margin-bottom: 4px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .ht-stat-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: #e8e0d0;
+        line-height: 1;
+      }
+      .ht-stat-unit { font-size: 11px; color: #8a7e6a; margin-top: 2px; }
+      .ht-stats-hint {
+        font-size: 11px;
+        color: #8a7e6a;
+        opacity: 0.85;
+        line-height: 1.4;
+      }
+      .ht-stats-select {
+        width: 100%; padding: 6px 10px; margin-bottom: 14px;
+        background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 8px; color: #e8e0d0; font-size: 12px; outline: none; cursor: pointer;
+      }
+      .ht-stats-select option { background: #1c1a22; }
+      .ht-stat-card.accent .ht-stat-value { color: #4caf50; }
+      .ht-stat-card.fire .ht-stat-value { color: #ff9800; }
+      .ht-stats-section { margin-bottom: 16px; }
+      .ht-stats-section-title {
+        font-size: 11px; font-weight: 600; color: #8a7e6a;
+        text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
+      }
+      .ht-cal-strip { display: flex; gap: 4px; justify-content: space-between; }
+      .ht-cal-strip-col {
+        flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px;
+      }
+      .ht-cal-strip-col.today .ht-cal-strip-dow { color: #c4b8ff; font-weight: 700; }
+      .ht-cal-strip-dow { font-size: 10px; color: #8a7e6a; }
+      .ht-cal-strip-circle {
+        width: 32px; height: 32px; border-radius: 50%;
+        background: rgba(255,255,255,0.07);
+        border: 1.5px solid rgba(255,255,255,0.1);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 10px; font-weight: 600; color: #8a7e6a;
+      }
+      .ht-cal-strip-circle.done {
+        background: rgba(76,175,80,0.25); border-color: #4caf50; color: #4caf50;
+      }
+      .ht-cal-strip-circle.partial {
+        background: rgba(124,106,247,0.15); border-color: rgba(124,106,247,0.4); color: #c4b8ff;
+      }
+      .ht-cal-strip-date { font-size: 10px; color: #8a7e6a; }
+      .ht-cal-strip-col.today .ht-cal-strip-date { color: #c4b8ff; }
+      .ht-cal-month-nav {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 10px;
+      }
+      .ht-cal-nav-btn {
+        appearance: none; background: none; border: none; cursor: pointer; color: #8a7e6a;
+        font-size: 16px; padding: 0 6px; border-radius: 4px; line-height: 1;
+      }
+      .ht-cal-nav-btn:hover { color: #e8e0d0; }
+      .ht-cal-month-title { font-size: 13px; font-weight: 600; color: #e8e0d0; }
+      .ht-cal-dow-row {
+        display: grid; grid-template-columns: repeat(7, 1fr);
+        margin-bottom: 4px;
+      }
+      .ht-cal-dow-header {
+        font-size: 10px; color: #8a7e6a; text-align: center; padding: 2px 0;
+      }
+      .ht-cal-grid {
+        display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px;
+      }
+      .ht-cal-day {
+        aspect-ratio: 1; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; border-radius: 50%;
+        background: rgba(255,255,255,0.05);
+        position: relative;
+        max-width: 42px; max-height: 42px; margin: 0 auto; width: 100%;
+      }
+      .ht-cal-day.out-of-range { background: rgba(255,255,255,0.02); opacity: 0.4; }
+      .ht-cal-day.empty { background: none; }
+      .ht-cal-day.done {
+        background: rgba(76,175,80,0.2); border: 1.5px solid rgba(76,175,80,0.5);
+      }
+      .ht-cal-day.partial {
+        background: rgba(124,106,247,0.12); border: 1.5px solid rgba(124,106,247,0.3);
+      }
+      .ht-cal-day.today {
+        border: 1.5px solid rgba(196,184,255,0.6) !important;
+      }
+      .ht-cal-day-num {
+        font-size: 11px; color: #e8e0d0; font-weight: 500; line-height: 1;
+      }
+      .ht-cal-day.out-of-range .ht-cal-day-num { color: #8a7e6a; }
+      .ht-cal-day.today .ht-cal-day-num { color: #c4b8ff; }
+      .ht-cal-day-dot {
+        width: 4px; height: 4px; border-radius: 50%;
+        margin-top: 2px; background: transparent;
+      }
+      .ht-cal-day.done .ht-cal-day-dot { background: #4caf50; }
+      .ht-cal-strip-circle { cursor: pointer; }
+      .ht-cal-day:not(.empty):not(.out-of-range) { cursor: pointer; }
+      .ht-cal-strip-circle:hover { transform: scale(1.08); background: rgba(255,255,255,0.12); }
+      .ht-cal-strip-circle.done:hover { background: rgba(76,175,80,0.4) !important; }
+      .ht-cal-day:hover:not(.empty):not(.out-of-range) {
+        transform: scale(1.06);
+        background: rgba(255,255,255,0.1);
+      }
+      .ht-barchart-wrap { position: relative; overflow: visible; }
+      .ht-barchart {
+        position: relative; height: 72px; display: flex; align-items: flex-end;
+        gap: 2px; overflow: visible; margin-right: 30px;
+      }
+      .ht-bar-wrap {
+        flex: 1; display: flex; align-items: flex-end; height: 100%;
+        position: relative;
+      }
+      .ht-bar {
+        width: 100%; border-radius: 2px 2px 0 0;
+        background: rgba(124,106,247,0.22); min-height: 2px;
+        transition: height 0.3s ease;
+      }
+      .ht-bar.done { background: rgba(76,175,80,0.38); }
+      .ht-bar-wrap:hover .ht-bar-tooltip {
+        opacity: 1; transform: translateX(-50%) translateY(0);
+      }
+      .ht-bar-tooltip {
+        position: absolute; bottom: calc(100% + 4px); left: 50%;
+        transform: translateX(-50%) translateY(4px);
+        background: rgba(28,26,34,0.95);
+        border: 1px solid rgba(255,255,255,0.15);
+        color: #e8e0d0; font-size: 10px; font-weight: 600;
+        padding: 2px 6px; border-radius: 4px;
+        white-space: nowrap; pointer-events: none;
+        opacity: 0; transition: opacity 0.15s, transform 0.15s;
+        z-index: 10;
+      }
+      .ht-barchart-labels { display: flex; gap: 2px; margin-top: 3px; }
+      .ht-bar-label-wrap { flex: 1; display: flex; justify-content: center; }
+      .ht-bar-label { font-size: 8px; color: #8a7e6a; line-height: 1; }
+      .ht-target-line {
+        position: absolute; left: 0; right: 0; height: 1px;
+        background: rgba(255,200,0,0.22); pointer-events: none;
+      }
+      .ht-target-label {
+        position: absolute; right: -28px; font-size: 8px; color: rgba(255,200,0,0.55);
+        line-height: 1; text-align: left; transform: translateY(-1px);
+      }
+      .dawn-habits-root.is-stats-mode .ht-date-nav { opacity: 0.45; pointer-events: none; }
+      .dawn-habits-root.is-manage-mode .ht-category,
+      .dawn-habits-root.is-manage-mode .ht-habit-section-ribbon,
+      .dawn-habits-root.is-manage-mode .ht-cat-ribbon,
+      .dawn-habits-root.is-manage-mode .dawn-habits-progress-wrap { display: none; }
+      .dawn-habits-root.is-manage-mode .dawn-habits-manage-host { display: block !important; }
+      .dawn-habits-list-wrap.is-hidden,
+      .dawn-habits-progress-wrap.is-hidden,
+      .ht-notes-wrap.is-hidden,
+      .ht-stats-view.is-hidden { display: none !important; }
+    `;
+    document.documentElement.appendChild(el);
+    this._styleEl = el;
   }
 
-  /**
-   * Streak meter within each 365-day lap: **linear** fill (day N of 365 → N/365) so e.g. day 65
-   * in year two reads as ~18% full, not log-inflated. `yearsCompleted` is ⌊streak/365⌋; ★ tier badge
-   * marks completed 365-day milestones.
-   */
-  _htHabitYearMeter(streakDays) {
-    if (!streakDays || streakDays <= 0) {
-      return { pct: 0, yearsCompleted: 0, inYearDay: 0, atYearBoundary: false };
-    }
-    const yearsCompleted = Math.floor(streakDays / 365);
-    const inYearDay = ((streakDays - 1) % 365) + 1;
-    const pct = Math.min(100, Math.round((inYearDay / 365) * 100));
-    const atYearBoundary = streakDays % 365 === 0;
-    return { pct, yearsCompleted, inYearDay, atYearBoundary };
+  _waitFor(pred, cb) {
+    let n = 0;
+    const tick = () => {
+      try {
+        if (pred(globalThis)) {
+          cb(globalThis.BootKernel || globalThis.__dawnBoot);
+          return;
+        }
+      } catch (_) {}
+      n += 1;
+      if (n > 240) {
+        console.warn('[Dawn/Habits] wait timeout');
+        return;
+      }
+      setTimeout(tick, 40);
+    };
+    tick();
   }
 
-  _buildSidebarShell(state, headerHost = null) {
-    // Each panel tracks its own viewed date, defaulting to today
-    if (!state.dateStr) state.dateStr = htToday();
-    const isEmbeddedInSuite = !!headerHost;
-    const startCollapsed = !isEmbeddedInSuite && !!this._collapsed;
+  _loadIndexFromStorage() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_INDEX);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.byDay && typeof parsed.byDay === 'object') {
+        // Normalize: habits present ⇒ treated as hydrated.
+        const byDay = parsed.byDay;
+        for (const list of Object.values(byDay)) {
+          for (const e of list || []) {
+            if (!Array.isArray(e.habits)) continue;
+            // Old caches without itemGuid can't toggle — force rehydrate.
+            // Line-item caches need itemGuid to toggle. JSON completions use id only — keep those.
+            const hasJsonIds = e.habits.some((h) => h?.id);
+            const missingLineIds = !hasJsonIds && e.habits.some((h) => !h?.itemGuid);
+            if (missingLineIds) {
+              delete e.habits;
+              delete e.hydrated;
+            } else if (e.hydrated !== true) {
+              e.hydrated = true;
+            }
+          }
+        }
+        this._index = {
+          byDay,
+          count: parsed.count || 0,
+          builtAt: parsed.builtAt || 0,
+          ms: parsed.ms || 0,
+          full: parsed.full === true,
+        };
+      }
+    } catch (_) {}
+  }
 
-    const sidebar = document.createElement('div');
-    sidebar.className =
-      'ht-sidebar' + (isEmbeddedInSuite ? ' ht-embedded' : '') + (startCollapsed ? ' ht-collapsed' : '');
+  _saveIndexToStorage() {
+    try {
+      localStorage.setItem(
+        HABITS_LS_INDEX,
+        JSON.stringify({
+          byDay: this._index.byDay,
+          count: this._index.count,
+          builtAt: this._index.builtAt,
+          ms: this._index.ms,
+          full: this._index.full === true,
+        })
+      );
+    } catch (_) {}
+  }
 
-    const header = document.createElement('div');
-    header.className = 'ht-sidebar-header';
-
-    let toggleBtn = null;
-    if (!isEmbeddedInSuite) {
-      toggleBtn = document.createElement('button');
-      toggleBtn.className = 'ht-toggle-btn';
-      toggleBtn.title = this._collapsed ? 'Expand habits' : 'Collapse habits';
-      toggleBtn.innerHTML = this._collapsed ? htIcon('chevron-down') : htIcon('chevron-up');
-      toggleBtn.addEventListener('click', () => this._toggleCollapse());
-    }
-
-    // Date nav: prev arrow — date label — next arrow
-    const prevBtn = document.createElement('button');
-    prevBtn.className = 'ht-nav-btn';
-    prevBtn.innerHTML = htIcon('chevron-left');
-    prevBtn.title = 'Previous day';
-
-    const dateEl = document.createElement('span');
-    dateEl.className = 'ht-date-label';
-
-    const nextBtn = document.createElement('button');
-    nextBtn.className = 'ht-nav-btn';
-    nextBtn.innerHTML = htIcon('chevron-right');
-    nextBtn.title = 'Next day';
-
-    const updateDateDisplay = () => {
-      const isToday = state.dateStr === htToday();
-      const d = new Date(state.dateStr + 'T12:00:00');
-      if (isToday) {
-        dateEl.textContent = 'Today';
-        dateEl.style.color = '#e8e0d0';
+  _loadUiPrefs() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_UI);
+      if (!raw) return;
+      const p = JSON.parse(raw) || {};
+      if (p.viewMode === 'stats' || p.viewMode === 'list') this._viewMode = p.viewMode;
+      if (p.statsRange === 7 || p.statsRange === 30) this._statsRange = p.statsRange;
+      if (typeof p.statsSelected === 'string' && p.statsSelected) {
+        this._statsSelected = p.statsSelected;
+      }
+      this._singleCol = p.singleCol === true;
+      if (p.catCollapsed && typeof p.catCollapsed === 'object') {
+        this._catCollapsed = { ...p.catCollapsed };
+      } else if (p.catCollapsed === true) {
+        this._catCollapsed = { [HABITS_DEFAULT_CAT.id]: true };
       } else {
-        dateEl.textContent = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        dateEl.style.color = '#c4a882';
+        this._catCollapsed = this._catCollapsed || {};
       }
-      nextBtn.classList.toggle('ht-nav-btn-muted', isToday);
+      if (typeof p.activeCatId === 'string' && p.activeCatId) {
+        this._activeCatId = p.activeCatId;
+      }
+    } catch (_) {}
+  }
+
+  _prefsMirrorKeys() {
+    return [HABITS_LS_CONFIG, HABITS_LS_MARKS, HABITS_LS_VALUES, HABITS_LS_UI, HABITS_LS_DONE];
+  }
+
+  _initPathBPrefs() {
+    let n = 0;
+    const tick = () => {
+      const api = globalThis.ThymerPluginSettings;
+      if (api?.init && (api.__dawnPathBHost || !api.__pathBStub)) {
+        try {
+          api.init({
+            plugin: this,
+            pluginId: 'dawn-habits-addon',
+            label: 'Habits',
+            data: this.data,
+            mirrorKeys: () => this._prefsMirrorKeys(),
+            onHydrated: () => {
+              try {
+                const prevDone = this._doneByDay && typeof this._doneByDay === 'object' ? this._doneByDay : {};
+                this._loadMarks();
+                this._loadValues();
+                this._loadUiPrefs();
+                this._loadDone();
+                this._doneByDay = Object.assign({}, this._doneByDay || {}, prevDone);
+                this._saveDone();
+                if (this._vaultConfigLoaded) {
+                  try {
+                    localStorage.setItem(HABITS_LS_CONFIG, JSON.stringify(this._config || {}));
+                  } catch (_) {}
+                  this._schedulePrefsFlush();
+                } else {
+                  this._loadConfig();
+                  void this._loadVaultConfig();
+                }
+                this._paint?.();
+              } catch (_) {}
+            },
+          });
+        } catch (e) {
+          console.warn('[Dawn/Habits] PathB init', e);
+        }
+        return;
+      }
+      n += 1;
+      if (n > 240) return;
+      setTimeout(tick, 40);
     };
+    tick();
+  }
 
-    prevBtn.addEventListener('click', () => {
-      state.dateStr = htDaysBefore(state.dateStr, 1);
-      updateDateDisplay();
-      this._renderSidebar(state);
-    });
+  _schedulePrefsFlush() {
+    try {
+      const api = globalThis.ThymerPluginSettings;
+      if (!api?.scheduleFlush) return;
+      if (!this._pluginSettingsPluginId) {
+        this._pluginSettingsPluginId = 'dawn-habits-addon';
+        this._pluginSettingsSyncMode = 'synced';
+      }
+      api.scheduleFlush(this, () => this._prefsMirrorKeys());
+    } catch (_) {}
+  }
 
-    nextBtn.addEventListener('click', () => {
-      if (state.dateStr >= htToday()) return;
-      state.dateStr = htDaysAfter(state.dateStr, 1);
-      updateDateDisplay();
-      this._renderSidebar(state);
-    });
+  _saveUiPrefs() {
+    try {
+      localStorage.setItem(
+        HABITS_LS_UI,
+        JSON.stringify({
+          viewMode: this._viewMode,
+          statsRange: this._statsRange,
+          statsSelected: this._statsSelected || 'overall',
+          singleCol: !!this._singleCol,
+          catCollapsed: this._catCollapsed && typeof this._catCollapsed === 'object' ? this._catCollapsed : {},
+          activeCatId: this._activeCatId || HABITS_DEFAULT_CAT.id,
+        })
+      );
+    } catch (_) {}
+    this._schedulePrefsFlush();
+  }
 
-    // Hide date nav buttons if synced to journal (date is controlled by the journal page)
-    if (state.isJournalPanel) {
-      prevBtn.style.display = 'none';
-      nextBtn.style.display = 'none';
+  _loadNotes() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_NOTES);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (p && typeof p === 'object') this._notesByDay = p;
+    } catch (_) {}
+  }
+
+  _saveNotes() {
+    try {
+      localStorage.setItem(HABITS_LS_NOTES, JSON.stringify(this._notesByDay || {}));
+    } catch (_) {}
+  }
+
+  _loadConfig() {
+    try {
+      let raw = localStorage.getItem(HABITS_LS_CONFIG);
+      if (!raw) {
+        try {
+          const backup = localStorage.getItem('jhs_habit_config_backup_v1');
+          if (backup) {
+            const wrap = JSON.parse(backup);
+            const cfg = wrap && wrap.config && typeof wrap.config === 'object' ? wrap.config : wrap;
+            if (cfg && (Array.isArray(cfg.habits) ? cfg.habits.length : 0)) {
+              raw = JSON.stringify(cfg);
+              localStorage.setItem(HABITS_LS_CONFIG, raw);
+            }
+          }
+        } catch (_) {}
+      }
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      this._applyConfigObject(p);
+    } catch (_) {}
+  }
+
+  _applyConfigObject(p) {
+    if (!p || typeof p !== 'object') return false;
+    const cats = Array.isArray(p.categories)
+      ? p.categories.filter((c) => c && c.id && c.name)
+      : [];
+    const habits = Array.isArray(p.habits)
+      ? p.habits.filter((h) => h && h.name).map((h) => this._normalizeHabitRow(h))
+      : [];
+    if (!habits.length && !cats.length) return false;
+    const catsNorm = (cats.length ? cats : [{ ...HABITS_DEFAULT_CAT }]).map((c, i) => ({
+      id: String(c.id),
+      name: String(c.name),
+      icon: String(c.icon || c.emoji || '').trim(),
+      emoji: String(c.emoji || c.icon || '').trim(),
+      order: Number.isFinite(Number(c.order)) ? Number(c.order) : i,
+    }));
+    this._vaultConfigRaw = p;
+    this._config = {
+      categories: catsNorm,
+      habits,
+      hideOffDayHabits: !!p.hideOffDayHabits,
+      showDayNotes: p.showDayNotes !== false,
+      habitGroupMode: String(p.habitGroupMode || 'category'),
+      tagOrder: Array.isArray(p.tagOrder) ? p.tagOrder.map((t) => String(t || '').trim()).filter(Boolean) : [],
+      guidedFlows: Array.isArray(p.guidedFlows) ? p.guidedFlows : [],
+      recoveryInventory: Array.isArray(p.recoveryInventory) ? p.recoveryInventory : [],
+      recoveryEarned:
+        p.recoveryEarned && typeof p.recoveryEarned === 'object'
+          ? p.recoveryEarned
+          : { milestones: {}, awards: {} },
+      categoryRecovered:
+        p.categoryRecovered && typeof p.categoryRecovered === 'object' ? p.categoryRecovered : {},
+    };
+    this._normalizeRecoveryCfg(this._config);
+    if (!catsNorm.some((c) => c.id === this._activeCatId)) {
+      this._activeCatId = catsNorm[0].id;
     }
+    return true;
+  }
 
-    updateDateDisplay();
+  _saveConfig() {
+    try {
+      localStorage.setItem(HABITS_LS_CONFIG, JSON.stringify(this._config || {}));
+    } catch (_) {}
+    this._schedulePrefsFlush();
+    try {
+      this._refreshQuickAccess?.();
+    } catch (_) {}
+    if (!this._applyingVaultConfig) this._scheduleVaultConfigFlush();
+  }
 
-    const statsBtn = document.createElement('button');
-    statsBtn.className = 'ht-stats-btn';
-    statsBtn.innerHTML = htIcon('chart-bar');
-    statsBtn.title = 'View stats';
-
-    const enterStats = () => {
-      this._habitEnterStatsView(state);
-    };
-    const exitStats = () => {
-      this._habitExitStatsView(state);
-    };
-
-    statsBtn.addEventListener('click', () => {
-      const b = state.bodyEl;
-      if (b?.dataset?.mode === 'stats') exitStats();
-      else enterStats();
-    });
-
-    const tagFilterBtn = document.createElement('button');
-    tagFilterBtn.type = 'button';
-    tagFilterBtn.className = 'ht-nav-btn ht-tag-filter-btn';
-    tagFilterBtn.innerHTML = htIcon('sunrise');
-    tagFilterBtn.title = this._htGetTagFilter()
-      ? `Filtering by tag “${this._htGetTagFilter()}”. Click to change or clear.`
-      : 'Filter habits by tag';
-    tagFilterBtn.style.fontSize = '12px';
-    tagFilterBtn.classList.toggle('active', !!this._htGetTagFilter());
-    tagFilterBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this._htToggleTagFilterMenu(tagFilterBtn, state);
-    });
-
-    const catExpandToggleBtn = document.createElement('button');
-    catExpandToggleBtn.type = 'button';
-    catExpandToggleBtn.className = 'ht-nav-btn ht-cat-expand-toggle';
-    catExpandToggleBtn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const cats = this._config?.categories || [];
-      if (!cats.length) return;
-      const anyExpanded = cats.some((c) => !this._catCollapsed[c.id]);
-      this._htSetAllCategoriesCollapsed(state, anyExpanded);
-    });
-    state._htCatExpandToggleBtn = catExpandToggleBtn;
-
-    /**
-     * Inline manage toggle — standalone sidebar only. When habits are embedded in Journal Header Suite,
-     * the suite header gear (left) opens the same mode so we hide this duplicate control.
-     */
-    let manageBtn = null;
-    if (!isEmbeddedInSuite) {
-      manageBtn = document.createElement('button');
-      manageBtn.type = 'button';
-      manageBtn.className = 'ht-nav-btn ht-manage-toggle';
-      manageBtn.innerHTML = htIcon('list-details');
-      manageBtn.title = state.htManageMode ? 'Done editing habits' : 'Edit habits & layout (inline)';
-      manageBtn.classList.toggle('active', !!state.htManageMode);
-      manageBtn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        state.htManageMode = !state.htManageMode;
-        manageBtn.classList.toggle('active', state.htManageMode);
-        manageBtn.title = state.htManageMode ? 'Done editing habits' : 'Edit habits & layout (inline)';
-        void this._renderSidebar(state);
-      });
-    }
-    state._htManageToggleBtn = manageBtn;
-
-    // Search button + input
-    const searchBtn = document.createElement('button');
-    searchBtn.className = 'ht-nav-btn';
-    searchBtn.innerHTML = htIcon('search');
-    searchBtn.title = 'Search habits';
-    searchBtn.style.fontSize = '12px';
-
-    const searchWrap = document.createElement('div');
-    searchWrap.style.cssText = 'display:none;flex:1;align-items:center;gap:4px;';
-    const searchInput = document.createElement('input');
-    searchInput.className = 'ht-input';
-    searchInput.placeholder = 'Search habits…';
-    searchInput.style.cssText = 'flex:1;height:22px;font-size:11px;padding:2px 6px;';
-    const searchClose = document.createElement('button');
-    searchClose.className = 'ht-nav-btn';
-    searchClose.innerHTML = htIcon('x');
-    searchClose.style.fontSize = '10px';
-    searchWrap.appendChild(searchInput);
-    searchWrap.appendChild(searchClose);
-
-    let searchOpen = false;
-    const openSearch = () => {
-      searchOpen = true;
-      searchWrap.style.display = 'flex';
-      searchBtn.style.display = 'none';
-      searchInput.value = '';
-      searchInput.focus();
-      state._searchQuery = '';
-      this._renderSidebar(state);
-    };
-    const closeSearch = () => {
-      searchOpen = false;
-      searchWrap.style.display = 'none';
-      searchBtn.style.display = '';
-      state._searchQuery = '';
-      this._renderSidebar(state);
-    };
-    searchBtn.addEventListener('click', openSearch);
-    searchClose.addEventListener('click', closeSearch);
-    let searchDebounce = null;
-    searchInput.addEventListener('input', () => {
-      state._searchQuery = searchInput.value.trim().toLowerCase();
-      clearTimeout(searchDebounce);
-      if (!state._searchQuery) {
-        // Instant clear on empty
-        this._renderSidebar(state);
+  _scheduleVaultConfigFlush() {
+    clearTimeout(this._configFlushTimer);
+    this._configFlushTimer = setTimeout(() => {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      const run = () => this._persistVaultConfig();
+      if (boot?.enqueue) {
+        boot.enqueue(run, { id: 'habits:config-flush', tier: 'onDemand' });
       } else {
-        searchDebounce = setTimeout(() => this._renderSidebar(state), 120);
+        void run();
       }
-    });
-    searchInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeSearch();
-    });
+    }, 500);
+  }
 
-    // Show/hide nav controls based on collapsed state
-    const updateNavVisibility = () => {
-      const collapsed = !isEmbeddedInSuite && sidebar.classList.contains('ht-collapsed');
-      prevBtn.style.display = collapsed ? 'none' : '';
-      dateEl.style.display = collapsed ? 'none' : '';
-      nextBtn.style.display = collapsed ? 'none' : '';
-      statsBtn.style.display = collapsed ? 'none' : '';
-      tagFilterBtn.style.display = collapsed ? 'none' : '';
-      catExpandToggleBtn.style.display = collapsed ? 'none' : '';
-      if (manageBtn) manageBtn.style.display = collapsed ? 'none' : '';
-      searchBtn.style.display = collapsed || searchOpen ? 'none' : '';
-      searchWrap.style.display = collapsed ? 'none' : (searchOpen ? 'flex' : 'none');
-      if (state._htRibbonEl) {
-        const rib = state._htRibbonEl;
-        rib.hidden = collapsed || rib.childElementCount === 0;
+  _propText(record, names) {
+    const keys = Array.isArray(names) ? names : [names];
+    for (const k of keys) {
+      try {
+        const t = record.text?.(k);
+        if (typeof t === 'string' && t) return t;
+      } catch (_) {}
+      try {
+        const prop = record.prop?.(k);
+        const t = (typeof prop?.text === 'function' ? prop.text() : null) || prop?.get?.();
+        if (typeof t === 'string' && t) return t;
+      } catch (_) {}
+    }
+    try {
+      const props = record.getProperties?.() || {};
+      if (!Array.isArray(props)) {
+        for (const k of keys) {
+          const raw = props[k];
+          if (raw == null) continue;
+          const inner = Array.isArray(raw) && raw.length >= 2 ? raw[1] : raw;
+          if (typeof inner === 'string' && inner) return inner;
+        }
       }
-      this._htSyncCategoryExpandToggleBtn(state);
-    };
-    this._htSyncTagFilterButtons();
-
-    // Patch _toggleCollapse to also update visibility (standalone sidebar only)
-    if (toggleBtn) {
-      toggleBtn.addEventListener('click', () => setTimeout(updateNavVisibility, 0));
-      header.appendChild(toggleBtn);
-    }
-    header.appendChild(prevBtn);
-    header.appendChild(dateEl);
-    header.appendChild(nextBtn);
-    header.appendChild(catExpandToggleBtn);
-    header.appendChild(tagFilterBtn);
-    if (manageBtn) header.appendChild(manageBtn);
-    header.appendChild(statsBtn);
-    header.appendChild(searchBtn);
-    header.appendChild(searchWrap);
-
-    const ribbonEl = document.createElement('div');
-    ribbonEl.className = 'ht-habit-section-ribbon';
-    ribbonEl.hidden = true;
-
-    const headerStack = document.createElement('div');
-    headerStack.className = 'ht-header-stack';
-    headerStack.appendChild(header);
-    headerStack.appendChild(ribbonEl);
-    state._htRibbonEl = ribbonEl;
-    updateNavVisibility();
-
-    const body = document.createElement('div');
-    body.className = 'ht-sidebar-body';
-
-    if (headerHost) {
-      try { headerHost.replaceChildren(); } catch (_) {}
-      header.classList.add('ht-jhs-header-host');
-      headerHost.appendChild(headerStack);
-      state.jhsExternalHeaderHost = headerHost;
-    } else {
-      state.jhsExternalHeaderHost = null;
-      sidebar.appendChild(headerStack);
-    }
-    sidebar.appendChild(body);
-
-    state._htHabitShell = { statsBtn, prevBtn, dateEl, nextBtn, manageBtn };
-
-    return sidebar;
+    } catch (_) {}
+    return '';
   }
 
-  _toggleCollapse() {
-    this._collapsed = !this._collapsed;
-    if (this._persistState) {
-      localStorage.setItem('ht_sidebar_collapsed', String(this._collapsed));
-      this._htPluginSettingsFlush();
-    }
-    for (const [, state] of (this._panelStates || new Map())) {
-      if (!state.sidebarEl) continue;
-      // Embedded-in-suite habit panels have no collapse affordance; keep them expanded.
-      const isEmbeddedInSuite = !!state.jhsExternalHeaderHost;
-      state.sidebarEl.classList.toggle('ht-collapsed', isEmbeddedInSuite ? false : this._collapsed);
-      const btn =
-        state.sidebarEl.querySelector('.ht-toggle-btn') ||
-        state.jhsExternalHeaderHost?.querySelector?.('.ht-toggle-btn');
-      if (btn) {
-        btn.innerHTML = this._collapsed ? htIcon('chevron-down') : htIcon('chevron-up');
-        btn.title = this._collapsed ? 'Expand habits' : 'Collapse habits';
+  _parseSettingsJson(record) {
+    const named = this._propText(record, ['settings_json', 'Settings JSON', 'data']);
+    const tryParse = (raw) => {
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) return raw;
+      if (!raw || typeof raw !== 'string') return null;
+      try {
+        const p = JSON.parse(raw);
+        return p && typeof p === 'object' ? p : null;
+      } catch (_) {
+        return null;
       }
-      const collapsedEff = isEmbeddedInSuite ? false : this._collapsed;
-      if (state._htRibbonEl) {
-        const rib = state._htRibbonEl;
-        rib.hidden = collapsedEff || rib.childElementCount === 0;
+    };
+    const hit = tryParse(named);
+    if (hit) return hit;
+    try {
+      const list =
+        (typeof record.getAllProperties === 'function' ? record.getAllProperties() : null) ||
+        record.getProperties?.() ||
+        [];
+      const arr = Array.isArray(list) ? list : Object.values(list);
+      for (const raw of arr) {
+        let s = '';
+        if (raw && typeof raw.text === 'function') {
+          try {
+            s = String(raw.text() || '');
+          } catch (_) {}
+        } else {
+          const inner = Array.isArray(raw) && raw.length >= 2 ? raw[1] : raw;
+          s = typeof inner === 'string' ? inner : inner && typeof inner === 'object' ? JSON.stringify(inner) : '';
+        }
+        const parsed = tryParse(s);
+        if (parsed && (parsed.completions || parsed.habits || parsed.categories)) return parsed;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async _writeSettingsJson(record, obj) {
+    if (!record || !obj) return false;
+    const json = typeof obj === 'string' ? obj : JSON.stringify(obj);
+    for (const k of ['settings_json', 'Settings JSON', 'data']) {
+      try {
+        const prop = record.prop?.(k);
+        if (!prop) continue;
+        if (typeof prop.set === 'function') {
+          await prop.set(json);
+          return true;
+        }
+        if (typeof prop.setText === 'function') {
+          await prop.setText(json);
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  _isConfigRecord(record, title) {
+    try {
+      const g = record?.guid || record?.getGuid?.() || '';
+      if (g && g === HABITS_CONFIG_GUID_PROD) return true;
+    } catch (_) {}
+    const kind = this._propText(record, ['record_kind', 'Record kind']);
+    const pluginId = this._propText(record, ['plugin_id', 'Plugin ID']);
+    const name = String(title || '').trim().toLowerCase();
+    return (
+      kind === 'config' ||
+      pluginId === 'habit-tracker:config' ||
+      name === 'config'
+    );
+  }
+
+  async _loadVaultConfig() {
+    if (this._vaultConfigLoaded) return true;
+    const tryRec = async (g) => {
+      if (!g) return false;
+      try {
+        const rec = await this.data.getRecord?.(g);
+        if (!rec) return false;
+        const title = rec.getName?.() || rec.name || '';
+        return this._applyVaultConfigRecord(rec, title);
+      } catch (_) {
+        return false;
+      }
+    };
+    const guids = [this._configGuid, HABITS_CONFIG_GUID_PROD];
+    for (const g of guids) {
+      if (await tryRec(g)) {
+        this._vaultConfigLoaded = true;
+        this._paint();
+        return true;
       }
     }
+    try {
+      if (typeof this.data.searchByQuery === 'function') {
+        const hits = (await this.data.searchByQuery('habit-tracker:config')) || [];
+        for (const rec of hits) {
+          const title = rec.getName?.() || rec.name || '';
+          if (this._applyVaultConfigRecord(rec, title)) {
+            this._vaultConfigLoaded = true;
+            this._paint();
+            return true;
+          }
+        }
+      }
+    } catch (_) {}
+    return false;
   }
 
-  // ── Render sidebar ───────────────────────────────────────────────────────
-
-  // Guard helper — check if we should abort mid-render
-  _inStatsMode(state) {
-    return state.bodyEl?.dataset?.mode === 'stats';
+  async _getLogsCollection(boot) {
+    const data = this.data;
+    for (const g of [HABITS_COLL_GUID_PROD, HABITS_COLL_GUID]) {
+      try {
+        const c = await data.getCollection?.(g);
+        if (c?.getAllRecords) return c;
+      } catch (_) {}
+    }
+    try {
+      const cols = boot?.getAllCollections
+        ? await boot.getAllCollections(data)
+        : await data.getAllCollections?.();
+      for (const c of cols || []) {
+        const name = c?.name || c?.getName?.() || '';
+        const guid = c?.guid || c?.id || '';
+        if (name === HABITS_COLL_NAME || guid === HABITS_COLL_GUID || guid === HABITS_COLL_GUID_PROD) {
+          return c;
+        }
+      }
+    } catch (_) {}
+    return null;
   }
 
-  /** 7d/30d stats window — persisted across journal navigation (same as sidebar collapse) */
-  _getStatsRangeDays(state) {
-    const stored = this._persistState ? parseInt(localStorage.getItem('ht_stats_range'), 10) : NaN;
-    if (stored === 7 || stored === 30) return stored;
-    const mem = state.statsRange === 90 ? 30 : state.statsRange;
-    if (mem === 7 || mem === 30) return mem;
-    return this._collapsed ? 30 : 7;
-  }
-
-  _persistStatsRangeDays(state, days) {
-    state.statsRange = days;
-    if (this._persistState) {
-      localStorage.setItem('ht_stats_range', String(days));
-      this._htPluginSettingsFlush();
+  _applyVaultConfigRecord(record, title) {
+    if (!record || !this._isConfigRecord(record, title)) return false;
+    try {
+      const guid = record.guid || record.getGuid?.() || '';
+      if (guid) this._configGuid = guid;
+    } catch (_) {}
+    const p = this._parseSettingsJson(record);
+    if (!p) return false;
+    this._applyingVaultConfig = true;
+    try {
+      if (!this._applyConfigObject(p)) return false;
+      try {
+        localStorage.setItem(HABITS_LS_CONFIG, JSON.stringify(this._config || {}));
+      } catch (_) {}
+      try {
+        this._refreshQuickAccess?.();
+      } catch (_) {}
+      this._vaultConfigLoaded = true;
+      this._schedulePrefsFlush();
+      return true;
+    } finally {
+      this._applyingVaultConfig = false;
     }
   }
 
-  /** Day notes textarea under the habit list; persists to log record `notes` field + JSON. */
-  _renderNotesSection(body, log, dateStr, state, token) {
-    const stale = () => state._renderToken !== token || this._inStatsMode(state);
-    body.querySelector('.ht-notes-wrap')?.remove();
-    if (this._config && this._config.showDayNotes === false) {
-      return;
+  async _persistVaultConfig() {
+    let rec = null;
+    if (this._configGuid) {
+      try {
+        rec = await this.data.getRecord?.(this._configGuid);
+      } catch (_) {}
     }
-
-    const wrap = document.createElement('div');
-    wrap.className = 'ht-notes-wrap';
-    const label = document.createElement('div');
-    label.className = 'ht-notes-label';
-    label.textContent = 'Notes';
-    const ta = document.createElement('textarea');
-    ta.className = 'ht-notes-input';
-    ta.rows = 2;
-    ta.placeholder = 'Notes for this day…';
-    ta.value = log.notes || '';
-    ta.setAttribute('spellcheck', 'true');
-
-    const flush = async () => {
-      if (stale()) return;
-      clearTimeout(state._notesSaveTimer);
-      const text = ta.value;
-      const fresh = await this._loadLog(dateStr);
-      if (stale()) return;
-      fresh.notes = text;
-      await this._saveLog(dateStr, fresh);
+    if (!rec) {
+      try {
+        const coll = await this._getLogsCollection();
+        const arr = (await coll?.getAllRecords?.()) || [];
+        rec = arr.find((r) => this._isConfigRecord(r, r.getName?.() || r.name)) || null;
+        const g = rec?.guid || rec?.getGuid?.();
+        if (g) this._configGuid = g;
+      } catch (_) {}
+    }
+    if (!rec) return false;
+    const payload = {
+      ...(this._vaultConfigRaw && typeof this._vaultConfigRaw === 'object' ? this._vaultConfigRaw : {}),
+      categories: (this._config.categories || []).map((c) => ({
+        id: c.id,
+        name: c.name,
+        emoji: c.emoji || c.icon || '',
+        order: c.order || 0,
+      })),
+      habits: (this._config.habits || []).map((h) => ({
+        id: h.id,
+        name: h.name,
+        categoryId: h.categoryId,
+        order: h.order || 0,
+        target: h.target || 0,
+        unit: h.unit || null,
+        seedDate: h.seedDate || h.streakSeed || null,
+        tags: h.tags || [],
+        weekdays: h.weekdays || [],
+        quickAccess: !!h.quickAccess,
+        startDate: h.startDate || null,
+        archived: !!h.archived,
+      })),
+      habitGroupMode: this._config.habitGroupMode || 'category',
+      hideOffDayHabits: !!this._config.hideOffDayHabits,
+      tagOrder: this._config.tagOrder || [],
+      showDayNotes: this._config.showDayNotes !== false,
+      guidedFlows: this._config.guidedFlows || [],
+      recoveryInventory: this._config.recoveryInventory || [],
+      recoveryEarned: this._config.recoveryEarned || { milestones: {}, awards: {} },
     };
-
-    ta.addEventListener('input', () => {
-      clearTimeout(state._notesSaveTimer);
-      state._notesSaveTimer = setTimeout(() => { void flush(); }, 450);
-    });
-    ta.addEventListener('blur', () => { void flush(); });
-
-    wrap.appendChild(label);
-    wrap.appendChild(ta);
-    body.appendChild(wrap);
+    this._vaultConfigRaw = payload;
+    return this._writeSettingsJson(rec, payload);
   }
 
-  _htSidebarSections(config, state, dateStr) {
-    const query = (state._searchQuery || '').trim().toLowerCase();
-    const hideOff = !!config.hideOffDayHabits;
-    const tagFilter = this._htGetTagFilter();
-    const manage = !!state?.htManageMode;
-    const passes = (h) => {
-      if (h.archived) return false;
-      if (manage) return true;
-      if (hideOff && !htHabitAppliesOnDate(h, dateStr)) return false;
-      if (!query) return true;
-      return String(h.name || '').toLowerCase().includes(query);
-    };
-    const passesTag = (h) => {
-      if (manage) return true;
-      if (!tagFilter) return true;
-      const tags = Array.isArray(h.tags) ? h.tags.filter(Boolean) : [];
-      return tags.includes(tagFilter);
-    };
+  _habitIdOf(h) {
+    if (h?.id) return String(h.id);
+    const cfg = this._habitCfg(h?.name);
+    return cfg?.id ? String(cfg.id) : '';
+  }
 
+  async _persistLogHabit(h, dayKey) {
+    const key = dayKey || this._dayKey;
+    const guid = h?.logGuid || this._primaryLogGuid(key);
+    const id = this._habitIdOf(h);
+    if (!guid || !id) return false;
+    try {
+      const rec = await this.data.getRecord?.(guid);
+      if (!rec) return false;
+      const obj = this._parseSettingsJson(rec) || { completions: {}, date: key };
+      if (!obj.completions || typeof obj.completions !== 'object') obj.completions = {};
+      const mark = this._habitMark(key, h.name);
+      const val = this._habitValue(key, h.name);
+      const cfg = this._habitCfg(h.name);
+      const numeric = cfg.type === 'number' || (Number(cfg.target) || 0) > 0;
+      if (mark === 'fail') obj.completions[id] = HABITS_COMP_FAIL;
+      else if (mark === 'na') obj.completions[id] = HABITS_COMP_NA;
+      else if (numeric) {
+        const n = val > 0 ? val : h.done ? Number(cfg.target) || 0 : 0;
+        if (n > 0) obj.completions[id] = n;
+        else delete obj.completions[id];
+      } else if (h.done) obj.completions[id] = true;
+      else delete obj.completions[id];
+      obj.date = key;
+      return await this._writeSettingsJson(rec, obj);
+    } catch (e) {
+      console.warn('[Dawn/Habits] log JSON write', e);
+      return false;
+    }
+  }
+
+  _recoveryId() {
+    return Math.random().toString(36).slice(2, 10);
+  }
+
+  _milestoneLabel(n) {
+    if (n === 7) return '1 week';
+    if (n === 30) return '30 days';
+    if (n === 90) return '90 days';
+    if (n === 365) return '1 year';
+    if (n > 365 && n % 365 === 0) return `${n / 365} years`;
+    return `${n} days`;
+  }
+
+  _toastRecovery(title, message) {
+    try {
+      this.ui.addToaster?.({ title, message, dismissible: true, autoDestroyTime: 4800 });
+    } catch (_) {
+      try {
+        this._app?._toast?.(title, message);
+      } catch (_) {}
+    }
+  }
+
+  _normalizeRecoveryCfg(cfg) {
+    const o = cfg && typeof cfg === 'object' ? cfg : this._config;
+    if (!Array.isArray(o.recoveryInventory)) o.recoveryInventory = [];
+    if (!o.recoveryEarned || typeof o.recoveryEarned !== 'object') {
+      o.recoveryEarned = { milestones: {}, awards: {} };
+    }
+    if (!o.recoveryEarned.milestones) o.recoveryEarned.milestones = {};
+    if (!o.recoveryEarned.awards) o.recoveryEarned.awards = {};
+    if (!o.categoryRecovered || typeof o.categoryRecovered !== 'object') o.categoryRecovered = {};
+    const now = Date.now();
+    o.recoveryInventory = (o.recoveryInventory || []).filter((r) => (Number(r?.expiresAt) || 0) > now);
+    return o;
+  }
+
+  _activeRecoveries(cfg) {
+    const o = this._normalizeRecoveryCfg(cfg || this._config);
+    return [...(o.recoveryInventory || [])].sort(
+      (a, b) => (Number(a.expiresAt) || 0) - (Number(b.expiresAt) || 0)
+    );
+  }
+
+  _grantRecovery(cfg, source, label) {
+    const o = this._normalizeRecoveryCfg(cfg || this._config);
+    const item = {
+      id: this._recoveryId(),
+      earnedAt: Date.now(),
+      expiresAt: Date.now() + HABITS_RECOVERY_DECAY_MS,
+      source: String(source || 'award'),
+      label: String(label || 'Streak Recovery'),
+    };
+    o.recoveryInventory.push(item);
+    return item;
+  }
+
+  _categoryHabitsOnDay(catId, dayKey) {
+    const want = String(catId || HABITS_DEFAULT_CAT.id);
     const out = [];
-    const sortedCats = [...config.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
-    for (const cat of sortedCats) {
-      const habits = config.habits
-        .filter((h) => h.categoryId === cat.id && passes(h) && passesTag(h))
-        .sort((a, b) => (a.order || 0) - (b.order || 0));
-      if (!manage && habits.length === 0) continue;
-      out.push({ kind: 'category', cat, habits });
+    for (const e of this._dayEntries(dayKey)) {
+      for (const h of e?.habits || []) {
+        if (this._habitCategoryId(h.name) === want) out.push(h);
+      }
     }
     return out;
   }
 
-  /**
-   * Gallery-style ribbon: when ribbon mode is on, collapsed sections appear as chips under the header.
-   */
-  _htFillHabitRibbon(state, config, dateStr, logsByDate) {
-    const ribbon = state._htRibbonEl || state.sidebarEl?.querySelector?.('.ht-habit-section-ribbon');
-    if (!ribbon) return;
-    const standaloneCollapsed =
-      !state.jhsExternalHeaderHost && state.sidebarEl?.classList?.contains('ht-collapsed');
-    if (standaloneCollapsed) {
-      ribbon.hidden = true;
-      return;
-    }
-    const sections = this._htSidebarSections(config, state, dateStr);
-    const ribbonSecs = sections.filter((s) => s.kind === 'category');
-    /* Ribbon only meaningful when at least one section is collapsed (chip visible). */
-    const anyCollapsedChip = ribbonSecs.some((s) => !!this._catCollapsed[s.cat.id]);
-    if (!ribbonSecs.length || !anyCollapsedChip) {
-      ribbon.replaceChildren();
-      ribbon.hidden = true;
-      return;
-    }
-
-    const log = this._getLogForDateFromMap(logsByDate, dateStr);
-    ribbon.replaceChildren();
-
-    for (const sec of ribbonSecs) {
-      const isExpanded = !this._catCollapsed[sec.cat.id];
-      if (isExpanded) {
-        const ph = document.createElement('div');
-        ph.className = 'ht-ribbon-slot ht-ribbon-slot--expanded';
-        ph.dataset.catId = sec.cat.id;
-        ph.setAttribute('role', 'button');
-        ph.tabIndex = 0;
-        ph.setAttribute('aria-label', `Collapse ${sec.cat.name || 'category'}`);
-        ph.title = `Collapse “${sec.cat.name || 'category'}”`;
-        const collapseThis = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          this._catCollapsed[sec.cat.id] = true;
-          if (this._persistState) {
-            localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
-            this._htPluginSettingsFlush();
-          }
-          void this._renderSidebar(state);
-        };
-        ph.addEventListener('click', collapseThis);
-        ph.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            collapseThis(e);
-          }
-        });
-        ribbon.appendChild(ph);
-        continue;
-      }
-
-      const chipStreak = this._categoryStreakFromMap(sec.cat.id, undefined, logsByDate, sec.cat);
-      const applying = sec.habits.filter((h) => htHabitAppliesOnDate(h, dateStr));
-      const chipDaySt = htCategoryDayAggregateStatus(log, applying, dateStr);
-      const marked = htCategoryAllMarkedForDay(log, applying, dateStr);
-      const leadHtml = htRibbonLeadCellHtml(chipDaySt, marked);
-      const streakPart = chipStreak > 0 ? htRibbonStreakHtml(chipStreak) : '';
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'ht-ribbon-sec';
-      btn.dataset.catId = sec.cat.id;
-      btn.innerHTML =
-        `<span class="ht-ribbon-sec-inner">${leadHtml}` +
-        `<span class="ht-ribbon-sec-glyph">${htCategoryGlyphHtml(sec.cat.emoji)}</span>` +
-        `<span class="ht-ribbon-sec-tail">${streakPart}</span></span>`;
-      const dayHint =
-        chipDaySt === 'all_done'
-          ? ' · all done today'
-          : chipDaySt === 'partial'
-            ? ' · in progress'
-            : chipDaySt === 'na'
-              ? ' · N/A today'
-              : chipDaySt === 'fail'
-                ? ' · missed today'
-                : '';
-      btn.title = `${sec.cat.name}${dayHint}${chipStreak > 0 ? ` · ${chipStreak}d streak` : ''} — tap to expand`;
-      btn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this._catCollapsed[sec.cat.id] = false;
-        if (this._persistState) {
-          localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
-          this._htPluginSettingsFlush();
-        }
-        void this._renderSidebar(state);
-      });
-      ribbon.appendChild(btn);
-    }
-    ribbon.hidden = false;
+  _categoryRecoveredOnDay(catId, dayKey) {
+    return !!(this._config.categoryRecovered?.[dayKey] || {})[catId];
   }
 
-  async _renderSidebar(state) {
-    let body = state.bodyEl;
-    if (!body || !body.isConnected || this._inStatsMode(state)) {
-      htHabitsDbg({
-        step: '_renderSidebar.abort_entry',
-        panelId: state?.panelId,
-        hasBody: !!body,
-        bodyConnected: !!body?.isConnected,
-        inStatsMode: this._inStatsMode(state),
-        statsDataset: state.bodyEl?.dataset?.mode ?? null,
-      });
-      return;
+  _categoryTouchedOnDay(catId, dayKey) {
+    if (this._categoryRecoveredOnDay(catId, dayKey)) return true;
+    const habits = this._categoryHabitsOnDay(catId, dayKey);
+    return habits.some((h) => h.done && !this._habitMark(dayKey, h.name));
+  }
+
+  _categoryAllDoneOnDay(catId, dayKey) {
+    if (this._categoryRecoveredOnDay(catId, dayKey)) return true;
+    const habits = this._categoryHabitsOnDay(catId, dayKey);
+    if (!habits.length) return false;
+    return habits.every((h) => h.done && !this._habitMark(dayKey, h.name));
+  }
+
+  /** Consecutive touched days *before* dayKey (prod `_categoryStreakFromMap`). Hydrated index only. */
+  _categoryPriorStreak(catId, dayKey) {
+    if (!catId || !dayKey) return 0;
+    let n = 0;
+    for (let i = 1; i < 400; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      if (!this._categoryHabitsOnDay(catId, k).length && !this._categoryRecoveredOnDay(catId, k)) break;
+      if (!this._categoryTouchedOnDay(catId, k)) break;
+      n += 1;
+    }
+    return n;
+  }
+
+  _categoryEffectiveStreak(catId, dayKey) {
+    const prior = this._categoryPriorStreak(catId, dayKey);
+    return this._categoryTouchedOnDay(catId, dayKey) ? prior + 1 : prior;
+  }
+
+  _applyCategoryRecovery(dateStr, catId) {
+    if (!dateStr || !catId) return;
+    this._normalizeRecoveryCfg(this._config);
+    if (!this._config.categoryRecovered[dateStr] || typeof this._config.categoryRecovered[dateStr] !== 'object') {
+      this._config.categoryRecovered[dateStr] = {};
+    }
+    this._config.categoryRecovered[dateStr][catId] = true;
+    this._saveConfig();
+    this._paint();
+  }
+
+  _missedRecoverableCategories(todayKey) {
+    const checkDate = this._shiftDay(todayKey, -1);
+    if (!checkDate) return [];
+    const missed = [];
+    for (const cat of this._config.categories || []) {
+      if (!this._categoryHabitsOnDay(cat.id, checkDate).length) continue;
+      if (this._categoryPriorStreak(cat.id, checkDate) <= 0) continue;
+      if (this._categoryRecoveredOnDay(cat.id, checkDate)) continue;
+      if (this._categoryTouchedOnDay(cat.id, checkDate)) continue;
+      missed.push({ cat, dateStr: checkDate });
+    }
+    return missed;
+  }
+
+  /** Grant Deep Focus / milestone / Full Sweep from the painted index. No vault I/O. */
+  _afterDaySave(dayKey) {
+    const dateStr = dayKey || this._dayKey;
+    if (!dateStr) return;
+    const cfg = this._normalizeRecoveryCfg(this._config);
+    const earned = cfg.recoveryEarned;
+    let changed = false;
+
+    for (const cat of cfg.categories || []) {
+      const applying = this._categoryHabitsOnDay(cat.id, dateStr);
+      if (!applying.length) continue;
+
+      if (this._categoryAllDoneOnDay(cat.id, dateStr) && applying.length >= HABITS_DEEP_FOCUS_MIN) {
+        const key = `deep_focus:${dateStr}:${cat.id}`;
+        if (!earned.awards[key]) {
+          this._grantRecovery(cfg, 'deep_focus', `Deep Focus — ${cat.name}`);
+          earned.awards[key] = true;
+          changed = true;
+          this._toastRecovery(
+            'Streak Recovery earned',
+            `${cat.name}: Deep Focus (${applying.length} habits done).`
+          );
+        }
+      }
+
+      const effective = this._categoryEffectiveStreak(cat.id, dateStr);
+      for (const m of HABITS_RECOVERY_MILESTONES) {
+        if (effective !== m) continue;
+        const mk = `${cat.id}:${m}`;
+        if (earned.milestones[mk]) continue;
+        earned.milestones[mk] = true;
+        this._grantRecovery(cfg, `milestone_${m}`, `${cat.name} — ${this._milestoneLabel(m)}`);
+        changed = true;
+        this._toastRecovery('Streak Recovery earned', `${cat.name} reached ${this._milestoneLabel(m)}.`);
+      }
+      if (effective > 365 && effective % 365 === 0) {
+        const mk = `${cat.id}:${effective}`;
+        if (!earned.milestones[mk]) {
+          earned.milestones[mk] = true;
+          this._grantRecovery(cfg, `milestone_${effective}`, `${cat.name} — ${this._milestoneLabel(effective)}`);
+          changed = true;
+          this._toastRecovery(
+            'Streak Recovery earned',
+            `${cat.name} reached ${this._milestoneLabel(effective)}.`
+          );
+        }
+      }
     }
 
-    // Mark this render with a token — if a newer render starts, this one aborts
-    const token = (state._renderToken || 0) + 1;
-    state._renderToken = token;
-    const stale = () => state._renderToken !== token || this._inStatsMode(state);
-    const bodyDetached = () => {
-      body = state.bodyEl;
-      return !body || !body.isConnected;
+    const eligible = (cfg.categories || []).filter(
+      (cat) => this._categoryHabitsOnDay(cat.id, dateStr).length > 0
+    );
+    if (eligible.length > 0 && eligible.every((cat) => this._categoryTouchedOnDay(cat.id, dateStr))) {
+      const key = `full_sweep:${dateStr}`;
+      if (!earned.awards[key]) {
+        this._grantRecovery(cfg, 'full_sweep', 'Full Sweep — every category');
+        earned.awards[key] = true;
+        changed = true;
+        this._toastRecovery(
+          'Streak Recovery earned',
+          'Full Sweep — at least one habit in every category today.'
+        );
+      }
+    }
+
+    if (changed) this._saveConfig();
+  }
+
+  _loadMarks() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_MARKS);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (p && typeof p === 'object') this._marksByDay = p;
+    } catch (_) {}
+  }
+
+  _saveMarks() {
+    try {
+      localStorage.setItem(HABITS_LS_MARKS, JSON.stringify(this._marksByDay || {}));
+    } catch (_) {}
+    this._schedulePrefsFlush();
+  }
+
+  _loadDone() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_DONE);
+      this._doneByDay = raw ? JSON.parse(raw) || {} : {};
+    } catch (_) {
+      this._doneByDay = {};
+    }
+  }
+
+  _saveDone() {
+    try {
+      localStorage.setItem(HABITS_LS_DONE, JSON.stringify(this._doneByDay || {}));
+    } catch (_) {}
+    this._schedulePrefsFlush();
+  }
+
+  _loadValues() {
+    try {
+      const raw = localStorage.getItem(HABITS_LS_VALUES);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (p && typeof p === 'object') this._valuesByDay = p;
+    } catch (_) {}
+  }
+
+  _saveValues() {
+    try {
+      localStorage.setItem(HABITS_LS_VALUES, JSON.stringify(this._valuesByDay || {}));
+    } catch (_) {}
+    this._schedulePrefsFlush();
+  }
+
+  _normalizeHabitRow(h) {
+    const target = Number(h?.target);
+    const wd = Array.isArray(h?.weekdays)
+      ? [...new Set(h.weekdays.map((x) => Number(x)).filter((n) => n >= 0 && n <= 6))]
+      : [];
+    const sd = String(h?.startDate || '').trim();
+    const seed = String(h?.streakSeed || h?.streakSeedDate || h?.seedDate || '').trim();
+    return {
+      id: String(h?.id || '').trim() || String(h?.name || '').trim().toLowerCase().replace(/\s+/g, '-'),
+      name: String(h?.name || '').trim(),
+      categoryId: String(h?.categoryId || HABITS_DEFAULT_CAT.id),
+      type: h?.type === 'number' || (Number.isFinite(target) && target > 0) ? 'number' : 'bool',
+      target: Number.isFinite(target) && target > 0 ? Math.round(target) : 0,
+      unit: String(h?.unit || '').trim(),
+      icon: String(h?.icon || '').trim(),
+      tags: Array.isArray(h?.tags) ? h.tags.map((t) => String(t || '').trim()).filter(Boolean) : [],
+      weekdays: wd,
+      startDate: /^\d{4}-\d{2}-\d{2}$/.test(sd) ? sd : '',
+      seedDate: /^\d{4}-\d{2}-\d{2}$/.test(seed) ? seed : '',
+      streakSeed: /^\d{4}-\d{2}-\d{2}$/.test(seed) ? seed : '',
+      quickAccess: !!h?.quickAccess,
+      archived: !!h?.archived,
+      order: Number.isFinite(Number(h?.order)) ? Number(h.order) : 0,
+    };
+  }
+
+  _habitAppliesOnDate(h, dayKey) {
+    const key = String(dayKey || '').slice(0, 10);
+    if (!key) return true;
+    if (h?.startDate && key < h.startDate) return false;
+    const wd = Array.isArray(h?.weekdays) ? h.weekdays : [];
+    if (!wd.length) return true;
+    const d = new Date(key + 'T12:00:00');
+    if (Number.isNaN(d.getTime())) return true;
+    return wd.includes(d.getDay());
+  }
+
+  _lsDone(dayKey, name) {
+    const k = dayKey || this._dayKey;
+    const n = String(name || '').trim();
+    return !!(k && n && this._doneByDay?.[k]?.[n]);
+  }
+
+  _setLsDone(dayKey, name, done) {
+    const k = dayKey || this._dayKey;
+    const n = String(name || '').trim();
+    if (!k || !n) return;
+    if (!this._doneByDay || typeof this._doneByDay !== 'object') this._doneByDay = Object.create(null);
+    if (!this._doneByDay[k]) this._doneByDay[k] = Object.create(null);
+    if (done) this._doneByDay[k][n] = true;
+    else delete this._doneByDay[k][n];
+    this._saveDone();
+  }
+
+  _habitCfg(habitName) {
+    const n = String(habitName || '').trim().toLowerCase();
+    const hit = (this._config.habits || []).find(
+      (h) => String(h.name || '').trim().toLowerCase() === n
+    );
+    return hit || { name: habitName, categoryId: HABITS_DEFAULT_CAT.id, type: 'bool', target: 0 };
+  }
+
+  _habitValue(dayKey, habitName) {
+    const k = dayKey || this._dayKey;
+    const n = String(habitName || '').trim();
+    if (!k || !n) return 0;
+    const v = Number(this._valuesByDay?.[k]?.[n]);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  }
+
+  _setHabitValue(dayKey, habitName, value) {
+    const k = dayKey || this._dayKey;
+    const n = String(habitName || '').trim();
+    if (!k || !n) return;
+    if (!this._valuesByDay[k] || typeof this._valuesByDay[k] !== 'object') {
+      this._valuesByDay[k] = Object.create(null);
+    }
+    const v = Math.max(0, Math.round(Number(value) || 0));
+    if (v <= 0) delete this._valuesByDay[k][n];
+    else this._valuesByDay[k][n] = v;
+    this._saveValues();
+  }
+
+  _habitMark(dayKey, habitName) {
+    const k = dayKey || this._dayKey;
+    const n = String(habitName || '').trim();
+    if (!k || !n) return null;
+    const m = this._marksByDay?.[k]?.[n];
+    return m === 'fail' || m === 'na' ? m : null;
+  }
+
+  _setHabitMark(dayKey, habitName, mark) {
+    const k = dayKey || this._dayKey;
+    const n = String(habitName || '').trim();
+    if (!k || !n) return;
+    if (!this._marksByDay[k] || typeof this._marksByDay[k] !== 'object') {
+      this._marksByDay[k] = Object.create(null);
+    }
+    if (mark === 'fail' || mark === 'na') this._marksByDay[k][n] = mark;
+    else delete this._marksByDay[k][n];
+    this._saveMarks();
+  }
+
+  _habitCategoryId(habitName) {
+    const n = String(habitName || '').trim().toLowerCase();
+    const hit = (this._config.habits || []).find(
+      (h) => String(h.name || '').trim().toLowerCase() === n
+    );
+    return hit?.categoryId || HABITS_DEFAULT_CAT.id;
+  }
+
+  /** Seed config habit rows from known names (idle index / hydrate). Keeps existing category assignments. */
+  _syncConfigFromHabitNames(names) {
+    const list = Array.isArray(names) ? names : [];
+    let changed = false;
+    const byLower = new Map(
+      (this._config.habits || []).map((h) => [String(h.name || '').trim().toLowerCase(), h])
+    );
+    for (const name of list) {
+      const n = String(name || '').trim();
+      if (!n) continue;
+      const key = n.toLowerCase();
+      if (byLower.has(key)) continue;
+      const row = { name: n, categoryId: HABITS_DEFAULT_CAT.id, type: 'bool', target: 0 };
+      this._config.habits.push(row);
+      byLower.set(key, row);
+      changed = true;
+    }
+    if (!(this._config.categories || []).length) {
+      this._config.categories = [{ ...HABITS_DEFAULT_CAT }];
+      changed = true;
+    } else if (!this._config.categories.some((c) => c.id === HABITS_DEFAULT_CAT.id)) {
+      // ensure default exists for uncategorized
+      this._config.categories.unshift({ ...HABITS_DEFAULT_CAT });
+      changed = true;
+    }
+    if (changed) this._saveConfig();
+  }
+
+  _openCategoryEditor() {
+    try {
+      document.querySelector('.dawn-habits-cat-overlay')?.remove?.();
+    } catch (_) {}
+    const names = new Set();
+    for (const list of Object.values(this._index.byDay || {})) {
+      for (const e of list || []) {
+        for (const h of e.habits || []) {
+          if (h?.name) names.add(String(h.name).trim());
+        }
+      }
+    }
+    for (const h of this._config.habits || []) {
+      if (h?.name) names.add(String(h.name).trim());
+    }
+    this._syncConfigFromHabitNames([...names]);
+
+    const draftCats = (this._config.categories || [{ ...HABITS_DEFAULT_CAT }]).map((c) => ({
+      id: c.id,
+      name: c.name,
+    }));
+    const draftAssign = Object.create(null);
+    const draftType = Object.create(null);
+    const draftTarget = Object.create(null);
+    for (const n of names) {
+      const cfg = this._habitCfg(n);
+      draftAssign[n] = cfg.categoryId || HABITS_DEFAULT_CAT.id;
+      draftType[n] = cfg.type === 'number' ? 'number' : 'bool';
+      draftTarget[n] = cfg.target > 0 ? cfg.target : 8;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'dawn-habits-cat-overlay';
+    overlay.style.cssText =
+      'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;padding:16px;';
+    const panel = document.createElement('div');
+    panel.style.cssText =
+      'width:min(420px,100%);max-height:80vh;overflow:auto;background:var(--panel-bg-color,#1c1a22);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:16px 18px;color:inherit;font:inherit;';
+    panel.innerHTML =
+      '<h3 style="margin:0 0 6px;font-size:16px">Habit categories</h3><p style="margin:0 0 12px;font-size:12px;color:#8a7e6a;line-height:1.4">Lab LS config (<code>dawn:habit_config_v1</code>). Ribbon appears when 2+ categories exist.</p>';
+
+    const catList = document.createElement('div');
+    panel.appendChild(catList);
+    const renderCats = () => {
+      catList.innerHTML = '';
+      for (const c of draftCats) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;margin:0 0 6px';
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.value = c.name;
+        inp.style.cssText =
+          'flex:1;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;font:inherit';
+        inp.addEventListener('input', () => {
+          c.name = inp.value.trim() || c.name;
+        });
+        row.appendChild(inp);
+        if (c.id !== HABITS_DEFAULT_CAT.id) {
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.textContent = '×';
+          rm.title = 'Remove category';
+          rm.addEventListener('click', () => {
+            const i = draftCats.findIndex((x) => x.id === c.id);
+            if (i >= 0) draftCats.splice(i, 1);
+            for (const n of Object.keys(draftAssign)) {
+              if (draftAssign[n] === c.id) draftAssign[n] = HABITS_DEFAULT_CAT.id;
+            }
+            renderCats();
+            renderHabits();
+          });
+          row.appendChild(rm);
+        }
+        catList.appendChild(row);
+      }
     };
 
-    const config = this._config;
-
-    if (!state.htManageMode && state._htInlineDragCleanup) {
-      try {
-        state._htInlineDragCleanup();
-      } catch (_) {}
-      state._htInlineDragCleanup = null;
-    }
-
-    htHabitsDbg({
-      step: '_renderSidebar.start',
-      panelId: state.panelId,
-      token,
-      dateStr: state.dateStr || null,
-      configPresent: !!config,
-      categoryCount: config?.categories?.length ?? 0,
-      habitCount: config?.habits?.filter?.((h) => !h.archived)?.length ?? 0,
-      searchQuery: state._searchQuery || '',
+    const addRow = document.createElement('div');
+    addRow.style.cssText = 'display:flex;gap:8px;margin:8px 0 14px';
+    const addIn = document.createElement('input');
+    addIn.type = 'text';
+    addIn.placeholder = 'New category name';
+    addIn.style.cssText =
+      'flex:1;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;font:inherit';
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = 'Add';
+    addBtn.addEventListener('click', () => {
+      const name = addIn.value.trim();
+      if (!name) return;
+      const id = 'cat_' + Date.now().toString(36);
+      draftCats.push({ id, name });
+      addIn.value = '';
+      renderCats();
+      renderHabits();
     });
+    addRow.append(addIn, addBtn);
+    panel.appendChild(addRow);
 
-    if (!config || config.categories.length === 0) {
-      if (stale() || bodyDetached()) {
-        htHabitsDbg({ step: '_renderSidebar.abort_empty_config', panelId: state.panelId, token, reason: 'stale_or_detached_before_logs' });
+    const habLab = document.createElement('div');
+    habLab.style.cssText =
+      'font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8a7e6a;margin:0 0 8px';
+    habLab.textContent = 'Assign habits';
+    panel.appendChild(habLab);
+    const habHost = document.createElement('div');
+    panel.appendChild(habHost);
+    const renderHabits = () => {
+      habHost.innerHTML = '';
+      const sorted = [...names].sort((a, b) => a.localeCompare(b));
+      if (!sorted.length) {
+        habHost.textContent = 'No hydrated habit names yet — expand Habits on a day first.';
         return;
       }
-      const dateStrEmpty = state.dateStr || htToday();
-      const logRowsEmpty = await this._getAllLogRows();
-      if (stale() || bodyDetached()) {
-        htHabitsDbg({ step: '_renderSidebar.abort_empty_config', panelId: state.panelId, token, reason: 'stale_or_detached_after_getAllLogRows' });
-        return;
-      }
-      const logEmpty = this._getLogForDateFromMap(this._buildLogsByDateMapFromRows(logRowsEmpty), dateStrEmpty);
-      body.innerHTML = '';
-      if (state.htManageMode) {
-        const editorShell = document.createElement('div');
-        editorShell.className = 'ht-inline-manage-editor-shell';
-        editorShell.style.cssText =
-          'margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.03);';
-        this._renderSettings(editorShell, this._config, {
-          panelState: state,
-          layoutAsIcons: true,
-        });
-        body.appendChild(editorShell);
-        body.classList.toggle('ht-habit-layout-single-col', this._htReadHabitLayoutSingleColumn());
-        body.classList.toggle('ht-manage-mode', true);
-        try {
-          state._htInlineDragCleanup?.();
-        } catch (_) {}
-        const dragCleanups = [
-          this._htAttachSettingsDragBridge(state.sidebarEl),
-          this._htAttachSettingsDragBridge(state.bodyEl),
-        ];
-        state._htInlineDragCleanup = () => {
-          for (const fn of dragCleanups) {
-            try {
-              fn();
-            } catch (_) {}
-          }
-        };
-        this._renderNotesSection(body, logEmpty, dateStrEmpty, state, token);
-        htHabitsDbg({
-          step: '_renderSidebar.empty_config_manage_editor',
-          panelId: state.panelId,
-          token,
-          dateStr: dateStrEmpty,
-        });
-        return;
-      }
-      const emptyDiv = document.createElement('div');
-      emptyDiv.className = 'ht-empty';
-      emptyDiv.innerHTML = `
-        <div class="ht-empty-icon">${htIcon('plant')}</div>
-        <div>No habits yet.</div>
-        <div style="margin-top:4px;font-size:11px;">Turn on inline editing (suite gear or toolbar) to add categories and habits.</div>
-        <button class="ht-setup-btn" data-action="open-settings">Set up habits</button>
-      `;
-      emptyDiv.querySelector('[data-action="open-settings"]')?.addEventListener('click', () => this.openSettings());
-      body.appendChild(emptyDiv);
-      body.classList.toggle('ht-habit-layout-single-col', this._htReadHabitLayoutSingleColumn());
-      this._renderNotesSection(body, logEmpty, dateStrEmpty, state, token);
-      htHabitsDbg({ step: '_renderSidebar.empty_config_rendered', panelId: state.panelId, token, dateStr: dateStrEmpty });
-      return;
-    }
-
-    // One Plugin Backend load: log rows + merged map for streak badges
-    const dateStr = state.dateStr || htToday();
-    const logRows = await this._getAllLogRows();
-    if (stale() || bodyDetached()) {
-      htHabitsDbg({
-        step: '_renderSidebar.abort_main',
-        panelId: state.panelId,
-        token,
-        reason: stale() ? 'stale_token_or_stats' : 'body_detached',
-        dateStr,
-      });
-      return;
-    }
-    const logsByDate = this._buildLogsByDateMapFromRows(logRows);
-    const log = this._getLogForDateFromMap(logsByDate, dateStr);
-    this._htSyncDayLogState(state, dateStr, log);
-
-    // Progress bar — categories with ≥1 habit done today (unfiltered full setup).
-    const activeTagF = this._htGetTagFilter();
-    const { done: catDoneCount, eligible: catEligible, pct } = this._htCategoryProgressFromLog(config, log, dateStr);
-    const progressTitle =
-      catEligible > 0
-        ? `${catDoneCount} of ${catEligible} categories with at least one habit done today${
-            activeTagF ? ` (filtered: ${activeTagF})` : ''
-          }`
-        : '';
-
-    // If stats view is in body, clear it first
-    if (body.querySelector('.ht-stats-view')) body.innerHTML = '';
-
-    let progressWrap = body.querySelector('.ht-progress');
-    if (!progressWrap) {
-      progressWrap = document.createElement('div');
-      progressWrap.className = 'ht-progress';
-      progressWrap.title = progressTitle;
-      progressWrap.innerHTML = `<div class="ht-progress-fill" style="width:${pct}%;background:${htCategoryProgressFillStyle(pct)}"></div>`;
-      body.insertBefore(progressWrap, body.firstChild);
-    } else {
-      progressWrap.title = progressTitle;
-      const fill = progressWrap.querySelector('.ht-progress-fill');
-      if (fill) {
-        fill.style.width = pct + '%';
-        fill.style.background = htCategoryProgressFillStyle(pct);
-      }
-    }
-    if (progressWrap) progressWrap.style.display = '';
-
-    body.classList.toggle('ht-habit-layout-single-col', this._htReadHabitLayoutSingleColumn());
-
-    // Build into a fragment first — swap in one shot to avoid collapse during awaits
-    const fragment = document.createDocumentFragment();
-    if (state.htManageMode) {
-      const editorShell = document.createElement('div');
-      editorShell.className = 'ht-inline-manage-editor-shell';
-      editorShell.style.cssText =
-        'margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.03);';
-      this._renderSettings(editorShell, this._config, {
-        panelState: state,
-        layoutAsIcons: true,
-      });
-      fragment.appendChild(editorShell);
-      fragment.appendChild(this._buildManageCategoriesBar(state));
-    }
-    if (state.htManageMode) {
-      fragment.appendChild(this._buildManageTagsBar(state));
-    }
-
-    const sections = this._htSidebarSections(config, state, dateStr);
-    let secWalk = 0;
-    for (const sec of sections) {
-      secWalk++;
-      if (secWalk % 8 === 0) {
-        await new Promise((r) => setTimeout(r, 0));
-        if (stale() || bodyDetached()) return;
-      }
-
-      const query = state._searchQuery || '';
-      const visibleHabits = sec.habits;
-      const cat = sec.cat;
-
-      const applying = visibleHabits.filter((h) => htHabitAppliesOnDate(h, dateStr));
-      const catDayStatus = htCategoryDayAggregateStatus(log, applying, dateStr);
-      const doneSlotHtml = htCategoryDayLeadInnerHtml(catDayStatus);
-      const markedDotHtml = htCategoryAllMarkedForDay(log, applying, dateStr)
-        ? `<span class="ht-cat-marked-dot" title="All habits tended to" aria-hidden="true"></span>`
-        : '';
-      const streak = this._categoryStreakFromMap(cat.id, undefined, logsByDate, cat);
-      const streakBadgeHtml = streak > 0 ? htCategoryStreakBadgeHtml(streak) : '';
-      const isOpen = !this._catCollapsed[cat.id];
-      const headerEmojiHtml = htCategoryGlyphHtml(cat.emoji);
-      const headerNameHtml = htEsc(cat.name);
-
-      const ribbonMode = this._htHabitRibbonMode;
-      const showInlineHeader = !ribbonMode || isOpen;
-      const galleryHdr = ribbonMode && isOpen;
-
-      let catRollHtml = '';
-      if (isOpen && visibleHabits.length) {
-        const catMo = this._categoryDistinctDoneDaysInMonth(visibleHabits, logsByDate, dateStr);
-        const catWk = this._categoryDistinctDoneDaysInWeekSun(visibleHabits, logsByDate, dateStr);
-        catRollHtml =
-          `<span class="ht-category-roll ht-habit-stat-counts" title="Days this calendar month / this week (Sun–Sat) with at least one habit done">` +
-          `<span class="ht-roll-num">${catMo}</span><span class="ht-roll-suffix">30d</span>` +
-          `<span class="ht-roll-sep">·</span>` +
-          `<span class="ht-roll-num">${catWk}</span><span class="ht-roll-suffix">7d</span>` +
-          `</span>`;
-      }
-
-      const catEl = document.createElement('div');
-      catEl.className = 'ht-category';
-
-      let catHeader = null;
-      if (showInlineHeader) {
-        catHeader = document.createElement('div');
-        catHeader.className =
-          'ht-category-header' + (galleryHdr ? ' ht-category-header--gallery' : '');
-        if (galleryHdr) {
-          catHeader.innerHTML = `
-        <div class="ht-category-header-inner">
-          <span class="ht-ch-lead-spacer" aria-hidden="true"></span>
-          <span class="ht-ch-cluster">
-            <span class="ht-category-caret ${isOpen ? 'open' : ''}">${htIcon('chevron-right')}</span>
-            <span class="ht-ch-cat-done-wrap">${doneSlotHtml}</span>
-              <span class="ht-ch-cat-marked">${markedDotHtml}</span>
-            <span class="ht-category-emoji">${headerEmojiHtml}</span>
-            <span class="ht-category-name ht-category-name--gallery">${headerNameHtml}</span>
-            ${streakBadgeHtml}${catRollHtml}
-          </span>
-          <span class="ht-ch-trailing" aria-hidden="true"></span>
-        </div>`;
-        } else {
-          catHeader.innerHTML = `
-        <div class="ht-category-header-inner">
-          <span class="ht-ch-lead-spacer" aria-hidden="true"></span>
-          <span class="ht-ch-cluster">
-            <span class="ht-category-caret ${isOpen ? 'open' : ''}">${htIcon('chevron-right')}</span>
-            <span class="ht-ch-cat-done-wrap">${doneSlotHtml}</span>
-            <span class="ht-ch-cat-marked">${markedDotHtml}</span>
-            <span class="ht-category-emoji">${headerEmojiHtml}</span>
-            <span class="ht-category-name">${headerNameHtml}</span>
-            ${streakBadgeHtml}${catRollHtml}
-          </span>
-          <span class="ht-ch-trailing" aria-hidden="true"></span>
-        </div>`;
+      for (const n of sorted) {
+        const row = document.createElement('label');
+        row.style.cssText =
+          'display:flex;gap:8px;align-items:center;margin:0 0 6px;font-size:13px';
+        const lab = document.createElement('span');
+        lab.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis';
+        lab.textContent = n;
+        const sel = document.createElement('select');
+        sel.style.cssText =
+          'padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;font:inherit';
+        for (const c of draftCats) {
+          const o = document.createElement('option');
+          o.value = c.id;
+          o.textContent = c.name;
+          if (c.id === draftAssign[n]) o.selected = true;
+          sel.appendChild(o);
         }
-        catHeader.addEventListener('click', () => {
-          this._toggleCategory(cat.id, state);
+        sel.addEventListener('change', () => {
+          draftAssign[n] = sel.value;
         });
+        const typeSel = document.createElement('select');
+        typeSel.style.cssText = sel.style.cssText;
+        for (const [tv, tl] of [
+          ['bool', 'Check'],
+          ['number', 'Count'],
+        ]) {
+          const o = document.createElement('option');
+          o.value = tv;
+          o.textContent = tl;
+          if (tv === draftType[n]) o.selected = true;
+          typeSel.appendChild(o);
+        }
+        const tgt = document.createElement('input');
+        tgt.type = 'number';
+        tgt.min = '1';
+        tgt.max = '99';
+        tgt.value = String(draftTarget[n] || 8);
+        tgt.title = 'Target count';
+        tgt.style.cssText =
+          'width:52px;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;font:inherit';
+        tgt.style.display = draftType[n] === 'number' ? '' : 'none';
+        typeSel.addEventListener('change', () => {
+          draftType[n] = typeSel.value === 'number' ? 'number' : 'bool';
+          tgt.style.display = draftType[n] === 'number' ? '' : 'none';
+        });
+        tgt.addEventListener('input', () => {
+          const v = parseInt(tgt.value, 10);
+          draftTarget[n] = Number.isFinite(v) && v > 0 ? v : 8;
+        });
+        row.append(lab, sel, typeSel, tgt);
+        habHost.appendChild(row);
       }
+    };
+    renderCats();
+    renderHabits();
 
-      const habitsEl = document.createElement('div');
-      habitsEl.className = 'ht-category-habits' + ((isOpen || query) ? '' : ' ht-hidden');
-      habitsEl.dataset.catId = cat.id;
-      delete habitsEl.dataset.tagKey;
-
-      for (const habit of visibleHabits) {
-        const rawVal = log.completions[habit.id];
-        const surf = htHabitDaySurface(log, habit, dateStr);
-        const norm = htCompletionNorm(rawVal, habit);
-        const hasTarget = (habit.target || 0) > 0;
-        const isNumeric = hasTarget;
-        const currentVal = typeof rawVal === 'number' ? rawVal : rawVal === true ? 1 : 0;
-        const isDone = norm.done;
-        const hStreak = this._habitStreakFromMap(habit.id, undefined, logsByDate, habit);
-
-        const rowCls = ['ht-habit'];
-        if (isDone) rowCls.push('ht-done');
-        if (surf.offDay) rowCls.push('ht-habit-offday');
-        if (norm.kind === 'fail') rowCls.push('ht-fail');
-        if (norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')) rowCls.push('ht-na');
-
-        const habitEl = document.createElement('div');
-        habitEl.className = rowCls.join(' ');
-        habitEl.dataset.habitId = habit.id;
-
-        let indicatorHTML = '';
-        if (norm.kind === 'fail') {
-          indicatorHTML = `<div class="ht-habit-mark ht-habit-mark-fail" aria-hidden="true">×</div>`;
-        } else if (norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')) {
-          indicatorHTML = `<div class="ht-habit-mark ht-habit-mark-na" aria-hidden="true">/</div>`;
-        } else if (isNumeric) {
-          const r = 10;
-          const circ = 2 * Math.PI * r;
-          const pRing = Math.min(1, currentVal / habit.target);
-          const dash = circ * pRing;
-          const label = currentVal >= habit.target ? htIcon('check') : `${currentVal}`;
-          indicatorHTML = `
-            <div class="ht-habit-ring">
-              <svg width="26" height="26" viewBox="0 0 26 26">
-                <circle class="ht-habit-ring-bg" cx="13" cy="13" r="${r}"/>
-                <circle class="ht-habit-ring-fill" cx="13" cy="13" r="${r}"
-                  stroke-dasharray="${circ}"
-                  stroke-dashoffset="${circ - dash}"/>
-              </svg>
-              <div class="ht-habit-ring-label">${label}</div>
-            </div>`;
-        } else {
-          indicatorHTML = `<div class="ht-habit-check-minimal"><span class="ht-check-glyph">${
-            isDone ? htIcon('check') : htIcon('check', 'ht-check-faint')
-          }</span></div>`;
-        }
-
-        const unitLabel = habit.unit ? htEsc(habit.unit) : '';
-        const targetLabel = hasTarget
-          ? `<span style="font-size:10px;color:#8a7e6a;margin-left:2px;">${currentVal}/${habit.target}${
-              unitLabel ? ' ' + unitLabel : ''
-            }</span>`
-          : '';
-        const moChecks = this._habitCheckCountInMonth(habit, logsByDate, dateStr);
-        const wkChecks = this._habitCheckCountWeekSun(habit, logsByDate, dateStr);
-        const streakCore = hStreak > 0 ? htHabitStreakCoreHtml(hStreak, hStreak >= 7) : '';
-        const cntSeg =
-          `<span class="ht-habit-stat-counts">` +
-          `<span class="ht-roll-num">${moChecks}</span><span class="ht-roll-suffix">30d</span>` +
-          `<span class="ht-roll-sep">·</span>` +
-          `<span class="ht-roll-num">${wkChecks}</span><span class="ht-roll-suffix">7d</span>` +
-          `</span>`;
-        const streakLabel = streakCore
-          ? `${streakCore}<span class="ht-streak-dotsep"> · </span>${cntSeg}`
-          : cntSeg;
-        const yearM = this._htHabitYearMeter(hStreak);
-        const tierBadge =
-          yearM.yearsCompleted > 0
-            ? `<span class="ht-year-tier" title="${yearM.yearsCompleted}×365d streak milestone">★${yearM.yearsCompleted}</span>`
-            : '';
-        const boundaryMark = yearM.atYearBoundary
-          ? `<span class="ht-year-boundary" title="365-day milestone">✓</span>`
-          : '';
-        const meterHtml =
-          hStreak > 0
-            ? `<div class="ht-habit-streak-meter-wrap">${tierBadge}${boundaryMark}<div class="ht-habit-streak-meter" aria-hidden="true">${htYearMeterFillHtml(
-                yearM.pct,
-                hStreak
-              )}</div></div>`
-            : '';
-        const streakClusterHTML = `<div class="ht-habit-streak-cluster">
-            <span class="ht-habit-streak ${hStreak >= 7 ? 'hot' : ''}">${streakLabel}</span>
-            ${meterHtml}
-          </div>`;
-
-        const catAbove = '';
-
-        habitEl.innerHTML = `
-          <div class="ht-habit-main">
-            <div class="ht-habit-top">
-              <div class="ht-habit-orbit">${indicatorHTML}</div>
-              <div class="ht-habit-name-col">
-                ${catAbove}
-                <div class="ht-habit-line-name"><span class="ht-habit-name">${htEsc(habit.name)}${targetLabel}</span></div>
-                <div class="ht-habit-line-meta">
-                  ${streakClusterHTML}
-                  <button type="button" class="ht-habit-stats-link" title="Stats for this habit">${htIcon('chevron-right')}</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        `;
-
-        const statsLink = habitEl.querySelector('.ht-habit-stats-link');
-        if (statsLink) {
-          const stopPe = (e) => {
-            e.stopPropagation();
-          };
-          statsLink.addEventListener('mousedown', stopPe);
-          statsLink.addEventListener('touchstart', stopPe, { passive: true });
-          statsLink.addEventListener('click', (e) => {
-            stopPe(e);
-            this._habitEnterStatsView(state, { habitId: habit.id });
-          });
-        }
-
-        let longPressTimer = null;
-        let didLongPress = false;
-        let pressStartX = 0;
-        let pressStartY = 0;
-        let pressDownTime = 0;
-        let localDragArmed = false;
-        let pressClickCount = 1;
-        const dayLog =
-          state._htDayLogDate === dateStr && state._htDayLog ? state._htDayLog : log;
-
-        const cancelPress = () => {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        };
-
-        const armDragPaint = () => {
-          if (localDragArmed || state._htSidebarDragArmed) return;
-          localDragArmed = true;
-          this._htCancelPendingHabitTap(state);
-          this._htArmSidebarDragPaintFlush(state, dateStr);
-          void (async () => {
-            try {
-              const batch = await this._htEnsureSidebarDragLog(state, dateStr);
-              state._htSidebarDragMode = this._htDragModeForPressSeq(
-                state,
-                habit,
-                batch,
-                habit.id,
-                dateStr,
-                pressClickCount
-              );
-              state._htSidebarDragArmed = true;
-              this._htPaintSidebarHabitDrag(state, habitEl, dateStr, config);
-            } catch (_) {}
-          })();
-        };
-
-        habitEl.addEventListener('pointerdown', (e) => {
-          if (state.htManageMode || e.button !== 0) return;
-          if (e.target.closest?.('.ht-habit-stats-link')) return;
-          didLongPress = false;
-          localDragArmed = false;
-          const prevSeq = state._htSidebarDragClickSeq || 0;
-          pressClickCount = this._htSidebarPressSeqBump(
-            state,
-            habit,
-            dayLog,
-            habit.id,
-            dateStr
-          );
-          if (pressClickCount > 1 && prevSeq >= 1) this._htCancelPendingHabitTap(state);
-          pressDownTime = Date.now();
-          pressStartX = e.clientX;
-          pressStartY = e.clientY;
-          if (isNumeric) {
-            longPressTimer = setTimeout(() => {
-              if (localDragArmed || state._htSidebarDragArmed) return;
-              didLongPress = true;
-              cancelPress();
-              this._showNumericInput(habitEl, habit, habit.categoryId, log, dateStr, state);
-            }, HT_LONG_PRESS_MS);
-          }
-        });
-
-        habitEl.addEventListener('pointermove', (e) => {
-          if (!(e.buttons & 1)) return;
-          const threshold = e.pointerType === 'touch' ? 12 : HT_DRAG_MOVE_PX;
-          if (
-            Math.abs(e.clientX - pressStartX) > threshold ||
-            Math.abs(e.clientY - pressStartY) > threshold
-          ) {
-            cancelPress();
-            armDragPaint();
-          }
-        });
-
-        habitEl.addEventListener('pointerenter', (e) => {
-          if (!(e.buttons & 1)) return;
-          if (!state._htSidebarDragArmed) return;
-          this._htPaintSidebarHabitDrag(state, habitEl, dateStr, config);
-        });
-
-        habitEl.addEventListener('pointerup', () => {
-          state._htSidebarDragLastUp = Date.now();
-          cancelPress();
-        });
-
-        habitEl.addEventListener('pointercancel', cancelPress);
-
-        habitEl.addEventListener('click', (e) => {
-          if (state.htManageMode) return;
-          if (didLongPress || state._htSidebarDragDidPaint) {
-            didLongPress = false;
-            state._htSidebarDragDidPaint = false;
-            return;
-          }
-          if (habitEl.querySelector('.ht-num-input')) return;
-          const runTap = async () => {
-            const seq = state._htSidebarDragClickSeq || 1;
-            if (state._htDragSeqSourceEmpty && seq >= 2) {
-              const freshLog = await this._loadLog(dateStr);
-              const mode = this._htSidebarDragModeFromClickCount(seq);
-              this._htApplyDragCompletion(freshLog, habit, habit.id, mode);
-              this._htRecomputeCategoryDone(freshLog, this._config, dateStr);
-              await this._saveLog(dateStr, freshLog);
-              this._htSyncDayLogState(state, dateStr, freshLog);
-              if (mode === 'done') this._celebrate(habitEl);
-              await this._patchHabitEl(habitEl, habit, freshLog, dateStr, habit.categoryId, state);
-              return;
-            }
-            await this._tapHabit(habit, habit.categoryId, log, dateStr, state, habitEl, isDone);
-          };
-          if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
-            this._htCancelPendingHabitTap(state);
-            state._htPendingHabitTap = () => {
-              void runTap();
-            };
-            state._htPendingHabitTapTimer = setTimeout(() => {
-              state._htPendingHabitTapTimer = null;
-              const fn = state._htPendingHabitTap;
-              state._htPendingHabitTap = null;
-              fn?.();
-            }, HT_SIDEBAR_DRAG_CLICK_GAP_MS);
-            return;
-          }
-          this._htCancelPendingHabitTap(state);
-          void runTap();
-        });
-
-        if (state.htManageMode) {
-          habitEl.appendChild(this._buildHabitManageStrip(state, habit));
-        }
-
-        habitsEl.appendChild(habitEl);
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:16px';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => overlay.remove());
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.textContent = 'Save';
+    save.addEventListener('click', () => {
+      if (!draftCats.some((c) => c.id === HABITS_DEFAULT_CAT.id)) {
+        draftCats.unshift({ ...HABITS_DEFAULT_CAT });
       }
-
-      if (state.htManageMode) {
-        const addRow = document.createElement('div');
-        addRow.className = 'ht-manage-add-habit-row';
-        addRow.style.cssText =
-          'display:flex;gap:6px;margin-top:8px;padding-top:10px;border-top:1px dashed rgba(255,255,255,0.1);';
-        const addInput = document.createElement('input');
-        addInput.className = 'ht-input';
-        addInput.placeholder = `Add habit to ${cat.name || 'category'}`;
-        addInput.style.cssText = 'flex:1;min-width:0;';
-        const addBtn = document.createElement('button');
-        addBtn.type = 'button';
-        addBtn.className = 'ht-btn ht-btn-primary ht-btn-sm';
-        addBtn.textContent = 'Add';
-        const doAdd = () => {
-          const nm = String(addInput.value || '').trim();
-          if (!nm) return;
-          const cfg = this._config;
-          const order = cfg.habits.filter((h) => !h.archived && h.categoryId === cat.id).length;
-          cfg.habits.push({
-            id: htGenId(),
-            name: nm,
-            categoryId: cat.id,
-            order,
-            tags: [],
-            weekdays: [],
-          });
-          addInput.value = '';
-          htNormalizeHabitConfig(cfg);
-          this._htSchedulePersistHabitConfig();
-          void this._htRefreshManageModeHabitSidebars();
-        };
-        addBtn.addEventListener('click', (e) => {
-          e.preventDefault();
-          doAdd();
-        });
-        addInput.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') doAdd();
-        });
-        addRow.appendChild(addInput);
-        addRow.appendChild(addBtn);
-        habitsEl.appendChild(addRow);
+      this._config.categories = draftCats.map((c) => ({
+        id: c.id,
+        name: String(c.name || 'Category').trim() || 'Category',
+      }));
+      this._config.habits = Object.keys(draftAssign).map((name) => ({
+        name,
+        categoryId: draftAssign[name] || HABITS_DEFAULT_CAT.id,
+        type: draftType[name] === 'number' ? 'number' : 'bool',
+        target:
+          draftType[name] === 'number'
+            ? Math.max(1, Number(draftTarget[name]) || 8)
+            : 0,
+      }));
+      if (!this._config.categories.some((c) => c.id === this._activeCatId)) {
+        this._activeCatId = this._config.categories[0].id;
       }
-
-      if (catHeader) catEl.appendChild(catHeader);
-      catEl.appendChild(habitsEl);
-      fragment.appendChild(catEl);
-    }
-
-    if (fragment.childElementCount === 0 && this._htGetTagFilter()) {
-      const anyLive = (config.habits || []).some((h) => !h.archived);
-      const empty = document.createElement('div');
-      empty.className = 'ht-empty';
-      empty.style.padding = '14px 12px';
-      empty.innerHTML = anyLive
-        ? `<div style="font-size:12px;color:#8a7e6a;line-height:1.45;">No habits with tag <strong style="color:#d4cfc6;">${htEsc(
-            this._htGetTagFilter()
-          )}</strong>. Use the tag button in the header and choose <strong style="color:#d4cfc6;">All habits</strong>, or another tag.</div>`
-        : `<div style="font-size:12px;color:#8a7e6a;">No habits yet.</div>`;
-      fragment.appendChild(empty);
-    }
-
-    const fragmentCatBlocks = fragment.childElementCount;
-    if (fragmentCatBlocks === 0) {
-      htHabitsDbg({
-        step: '_renderSidebar.warn_no_categories_in_fragment',
-        panelId: state.panelId,
-        token,
-        dateStr,
-        categoryCount: config.categories?.length ?? 0,
-        searchQuery: state._searchQuery || '',
-        hint: 'No habit sections rendered (search / hide off-days / empty setup).',
-      });
-    }
-
-    // All async work done — now do the atomic swap in one paint frame
-    if (stale() || bodyDetached()) {
-      htHabitsDbg({
-        step: '_renderSidebar.abort_before_swap',
-        panelId: state.panelId,
-        token,
-        reason: stale() ? 'stale' : 'detached',
-        fragmentCatBlocks,
-      });
-      return;
-    }
-    let catsWrap = body.querySelector('.ht-sidebar-cats');
-    if (!catsWrap) {
-      catsWrap = document.createElement('div');
-      catsWrap.className = 'ht-sidebar-cats';
-      body.appendChild(catsWrap);
-    }
-    // Single DOM swap — no intermediate empty state, no collapse
-    catsWrap.replaceChildren(fragment);
-    body.classList.toggle('ht-manage-mode', !!state.htManageMode);
-    if (state.htManageMode) {
-      try {
-        state._htInlineDragCleanup?.();
-      } catch (_) {}
-      const dragCleanups = [
-        this._htAttachSettingsDragBridge(state.sidebarEl),
-        this._htAttachSettingsDragBridge(state.bodyEl),
-      ];
-      state._htInlineDragCleanup = () => {
-        for (const fn of dragCleanups) {
-          try {
-            fn();
-          } catch (_) {}
-        }
-      };
-      this._htWireManageModeHabitDnD(state);
-    }
-    this._htFillHabitRibbon(state, config, dateStr, logsByDate);
-    htHabitsDbg({
-      step: '_renderSidebar.done',
-      panelId: state.panelId,
-      token,
-      dateStr,
-      fragmentCatBlocks,
-      catsWrapChildCount: catsWrap.childElementCount,
+      this._saveConfig();
+      this._saveUiPrefs();
+      overlay.remove();
+      this._paint();
     });
-    this._renderNotesSection(body, log, dateStr, state, token);
-    this._htSyncTagFilterButtons();
-    this._htSyncCategoryExpandToggleBtn(state);
+    actions.append(cancel, save);
+    panel.appendChild(actions);
+    overlay.appendChild(panel);
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    document.documentElement.appendChild(overlay);
   }
 
-  /** Icon + visibility for the single “expand / collapse all categories” header control. */
-  _htSyncCategoryExpandToggleBtn(state) {
-    const btn = state?._htCatExpandToggleBtn;
+  _readNotesProp(record) {
+    if (!record) return '';
+    try {
+      const prop = record.prop?.(HABITS_NOTES_PROP);
+      if (prop) {
+        if (typeof prop.text === 'function') {
+          const t = String(prop.text() || '');
+          if (t) return t;
+        }
+        const v = prop.get?.();
+        if (v != null && String(v)) return String(v);
+      }
+    } catch (_) {}
+    try {
+      const obj = this._parseSettingsJson(record);
+      if (obj && typeof obj.notes === 'string') return obj.notes;
+    } catch (_) {}
+    return '';
+  }
+
+  async _writeNotesProp(logGuid, text) {
+    if (!logGuid) return false;
+    try {
+      const rec = await this.data.getRecord?.(logGuid);
+      if (!rec) return false;
+      const prop = rec.prop?.(HABITS_NOTES_PROP);
+      if (prop && typeof prop.set === 'function') {
+        await prop.set(String(text || ''));
+        return true;
+      }
+      if (prop && typeof prop.setText === 'function') {
+        await prop.setText(String(text || ''));
+        return true;
+      }
+      const obj = this._parseSettingsJson(rec) || { completions: {} };
+      obj.notes = String(text || '');
+      return await this._writeSettingsJson(rec, obj);
+    } catch (e) {
+      console.warn('[Dawn/Habits] notes write', e);
+    }
+    return false;
+  }
+
+  _primaryLogGuid(dayKey) {
+    const entries = this._dayEntries(dayKey);
+    return entries?.[0]?.guid || '';
+  }
+
+  _isHabitsTabExpanded() {
+    try {
+      const shell = globalThis.__dawnJhsShell;
+      return !!(shell?.isExpanded?.() && shell?.getActiveTab?.() === 'habits');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  _dayHasLocalMarks(dayKey) {
+    const k = dayKey || this._dayKey;
+    if (!k) return false;
+    const done = this._doneByDay?.[k];
+    const marks = this._marksByDay?.[k];
+    const vals = this._valuesByDay?.[k];
+    if (done && Object.keys(done).length) return true;
+    if (marks && Object.keys(marks).length) return true;
+    if (vals && Object.keys(vals).length) return true;
+    return false;
+  }
+
+  _completionsFromLocal(dayKey) {
+    const key = dayKey || this._dayKey;
+    const completions = {};
+    for (const h of this._config.habits || []) {
+      const id = String(h.id || '').trim();
+      if (!id) continue;
+      const mark = this._habitMark(key, h.name);
+      const numeric = h.type === 'number' || (Number(h.target) || 0) > 0;
+      if (mark === 'fail') completions[id] = HABITS_COMP_FAIL;
+      else if (mark === 'na') completions[id] = HABITS_COMP_NA;
+      else if (numeric) {
+        const n = this._habitValue(key, h.name);
+        if (n > 0) completions[id] = n;
+      } else if (this._lsDone(key, h.name)) {
+        completions[id] = true;
+      }
+    }
+    return completions;
+  }
+
+  _attachLogToIndex(dayKey, guid, title, habits) {
+    if (!dayKey || !guid) return;
+    if (!this._index) this._index = { byDay: {}, count: 0, builtAt: 0, ms: 0, full: false };
+    if (!this._index.byDay) this._index.byDay = {};
+    if (this._logMiss) delete this._logMiss[dayKey];
+    const list = this._index.byDay[dayKey] || [];
+    let entry = list.find((e) => e && e.guid === guid);
+    if (!entry) {
+      entry = { guid, title: String(title || dayKey).slice(0, 80) };
+      list.push(entry);
+      this._index.byDay[dayKey] = list;
+      if (!this._index.full) this._index.count = Object.keys(this._index.byDay).length;
+    }
+    if (Array.isArray(habits)) {
+      entry.habits = habits;
+      entry.hydrated = true;
+    }
+    this._saveIndexToStorage();
+  }
+
+  async _setRecordText(record, keys, value) {
+    if (!record || value == null) return false;
+    const names = Array.isArray(keys) ? keys : [keys];
+    for (const k of names) {
+      try {
+        const prop = record.prop?.(k);
+        if (!prop) continue;
+        if (typeof prop.set === 'function') {
+          await prop.set(value);
+          return true;
+        }
+        if (typeof prop.setText === 'function') {
+          await prop.setText(value);
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  async _applyLogRowMeta(record, { pluginId, kind }) {
+    await this._setRecordText(record, ['plugin_id', 'Plugin ID'], pluginId);
+    await this._setRecordText(record, ['record_kind', 'Record kind'], kind);
+    try {
+      const p = record.prop?.('plugin') || record.prop?.('Plugin');
+      if (p && typeof p.setChoice === 'function') {
+        if (p.setChoice('Habit Tracker')) return;
+        if (p.setChoice('habit-tracker')) return;
+      }
+      if (p?.set) p.set('habit-tracker');
+    } catch (_) {}
+  }
+
+  async _ensureDayLog(dayKey) {
+    const key = dayKey || this._dayKey;
+    if (!key) return '';
+    const have = this._primaryLogGuid(key);
+    if (have) return have;
+    if (!this._ensuringLog) this._ensuringLog = Object.create(null);
+    if (this._ensuringLog[key]) return this._ensuringLog[key];
+    this._ensuringLog[key] = this._createDayLog(key);
+    try {
+      return await this._ensuringLog[key];
+    } finally {
+      delete this._ensuringLog[key];
+    }
+  }
+
+  async _createDayLog(dayKey) {
+    const key = dayKey;
+    const pluginId = 'habit-tracker:log:' + key;
+    const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+    const coll = await this._getLogsCollection(boot);
+    if (!coll?.createRecord) {
+      console.warn('[Dawn/Habits] cannot create day log — no Habit Logs collection');
+      return '';
+    }
+    let guid = '';
+    try {
+      guid = coll.createRecord(key);
+    } catch (e) {
+      console.warn('[Dawn/Habits] create day log', e);
+      return '';
+    }
+    if (!guid) return '';
+    let rec = null;
+    for (let i = 0; i < 24; i++) {
+      await new Promise((r) => setTimeout(r, i < 6 ? 40 : 90));
+      try {
+        rec = await this.data.getRecord?.(guid);
+      } catch (_) {
+        rec = null;
+      }
+      if (rec) break;
+    }
+    const completions = this._completionsFromLocal(key);
+    const doc = {
+      date: key,
+      completions,
+      notes: this._notesByDay?.[key] || '',
+      categoryDone: {},
+    };
+    if (rec) {
+      await this._applyLogRowMeta(rec, { pluginId, kind: 'log' });
+      await this._writeSettingsJson(rec, doc);
+    }
+    const habits = [];
+    for (const [id, raw] of Object.entries(completions)) {
+      const row = this._habitFromCompletion(id, raw, key);
+      if (row) habits.push(row);
+    }
+    this._attachLogToIndex(key, guid, key, habits);
+    return guid;
+  }
+
+  async _hydrateNotesForDay(dayKey) {
+    const guid = this._primaryLogGuid(dayKey);
+    if (!guid) return;
+    try {
+      const rec = await this.data.getRecord?.(guid);
+      const fromVault = this._readNotesProp(rec);
+      // Prefer vault when present; keep LS as offline fallback.
+      if (fromVault || !(dayKey in this._notesByDay)) {
+        this._notesByDay[dayKey] = fromVault;
+        this._saveNotes();
+      }
+      if (this._notesInputEl && this._dayKey === dayKey) {
+        const note = this._notesByDay[dayKey] || '';
+        if (this._notesInputEl.value !== note) this._notesInputEl.value = note;
+      }
+    } catch (_) {}
+  }
+
+  _schedulePersistNotes(dayKey, text) {
+    if (!dayKey) return;
+    this._notesByDay[dayKey] = text;
+    this._saveNotes();
+    clearTimeout(this._notesTimer);
+    this._notesTimer = setTimeout(() => {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      const run = () => this._persistNotesToLog(dayKey, text);
+      if (boot?.enqueue) {
+        boot.enqueue(run, { id: 'habits:notes-' + dayKey, tier: 'onDemand' });
+      } else {
+        void run();
+      }
+    }, 450);
+  }
+
+  async _persistNotesToLog(dayKey, text) {
+    if (!dayKey) return;
+    // Ensure day hydrated so we know the log guid.
+    await this._hydrateDay(dayKey);
+    const guid = this._primaryLogGuid(dayKey);
+    if (!guid) return;
+    const ok = await this._writeNotesProp(guid, text);
+    if (!ok) {
+      console.warn('[Dawn/Habits] Notes property write skipped — LS fallback kept');
+    }
+  }
+
+  _mount(el) {
+    this._root = el;
+    el.innerHTML = '';
+    el.className = 'dawn-habits-root';
+    el.style.cssText = '';
+    if (!this._catCollapsed || typeof this._catCollapsed !== 'object') this._catCollapsed = {};
+
+    const status = document.createElement('div');
+    status.className = 'dawn-habits-status';
+    this._statusEl = status;
+
+    const header = document.createElement('div');
+    header.className = 'dawn-habits-header ht-sidebar-header';
+
+    const dateNav = document.createElement('div');
+    dateNav.className = 'jhs-panel-date-nav';
+    const prevBtn = document.createElement('button');
+    prevBtn.type = 'button';
+    prevBtn.className = 'ht-nav-btn';
+    prevBtn.title = 'Previous day';
+    prevBtn.setAttribute('aria-label', 'Previous day');
+    prevBtn.innerHTML = '<i class="ti ti-chevron-left" aria-hidden="true"></i>';
+    prevBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._nudgeHabitDay(-1);
+    });
+    const dateLabel = document.createElement('div');
+    dateLabel.className = 'ht-date-label dawn-habits-date-label';
+    this._dateLabelEl = dateLabel;
+    const nextBtn = document.createElement('button');
+    nextBtn.type = 'button';
+    nextBtn.className = 'ht-nav-btn';
+    nextBtn.title = 'Next day';
+    nextBtn.setAttribute('aria-label', 'Next day');
+    nextBtn.innerHTML = '<i class="ti ti-chevron-right" aria-hidden="true"></i>';
+    nextBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._nudgeHabitDay(1);
+    });
+    dateNav.append(prevBtn, dateLabel, nextBtn);
+
+    const catExpandBtn = document.createElement('button');
+    catExpandBtn.type = 'button';
+    catExpandBtn.className = 'ht-nav-btn ht-cat-expand-toggle';
+    catExpandBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const cats = this._config?.categories || [];
+      if (!cats.length) return;
+      const anyExpanded = cats.some((c) => !this._isCatCollapsed(c.id));
+      this._setAllCatsCollapsed(anyExpanded);
+    });
+    this._catExpandBtn = catExpandBtn;
+
+    const doneMeta = document.createElement('div');
+    doneMeta.className = 'dawn-habits-done-meta';
+    this._doneMetaEl = doneMeta;
+
+    const layoutBtn = document.createElement('button');
+    layoutBtn.type = 'button';
+    layoutBtn.className = 'ht-layout-btn';
+    layoutBtn.title = 'Use single-column layout';
+    layoutBtn.setAttribute('aria-label', 'Toggle habit layout');
+    layoutBtn.innerHTML = '<i class="ti ti-layout-list" aria-hidden="true"></i>';
+    layoutBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._singleCol = !this._singleCol;
+      this._saveUiPrefs();
+      this._syncLayout();
+    });
+    this._singleColBtn = layoutBtn;
+
+    const statsBtn = document.createElement('button');
+    statsBtn.type = 'button';
+    statsBtn.className = 'ht-stats-btn';
+    statsBtn.title = 'View stats';
+    statsBtn.innerHTML = '<i class="ti ti-chart-bar" aria-hidden="true"></i>';
+    statsBtn.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._viewMode = this._viewMode === 'stats' ? 'list' : 'stats';
+      this._saveUiPrefs();
+      this._paint();
+    });
+    this._statsBtn = statsBtn;
+
+    header.appendChild(dateNav);
+    header.appendChild(catExpandBtn);
+    header.appendChild(doneMeta);
+    header.appendChild(layoutBtn);
+    header.appendChild(statsBtn);
+
+    const progressWrap = document.createElement('div');
+    progressWrap.className = 'dawn-habits-progress-wrap';
+    const progress = document.createElement('div');
+    progress.className = 'ht-progress jhs-segment-bar';
+    progress.setAttribute('aria-hidden', 'true');
+    this._progressEl = progress;
+    progressWrap.appendChild(progress);
+    this._progressWrapEl = progressWrap;
+
+    const ribbon = document.createElement('div');
+    ribbon.className = 'ht-habit-section-ribbon';
+    ribbon.hidden = true;
+    this._ribbonEl = ribbon;
+
+    const headerStack = document.createElement('div');
+    headerStack.className = 'ht-header-stack';
+    headerStack.append(header, ribbon);
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'dawn-habits-list-wrap';
+    this._listWrapEl = listWrap;
+    // Manage mode paints into this host; board sections rebuild into listWrap.
+    const manageHost = document.createElement('div');
+    manageHost.className = 'dawn-habits-list ht-category-habits dawn-habits-manage-host';
+    manageHost.style.display = 'none';
+    this._listEl = manageHost;
+    listWrap.appendChild(manageHost);
+    this._iconStripEl = null;
+    this._catCaretEl = null;
+    this._catLeadEl = null;
+    this._catNameEl = null;
+    this._catStreakEl = null;
+
+    const notes = document.createElement('div');
+    notes.className = 'ht-notes-wrap';
+    const notesLabel = document.createElement('div');
+    notesLabel.className = 'ht-notes-label';
+    notesLabel.textContent = 'Notes';
+    const notesInput = document.createElement('textarea');
+    notesInput.className = 'ht-notes-input';
+    notesInput.rows = 2;
+    notesInput.placeholder = 'Notes for this day…';
+    notesInput.setAttribute('spellcheck', 'true');
+    notesInput.addEventListener('input', () => {
+      const k = this._dayKey;
+      if (!k) return;
+      this._schedulePersistNotes(k, notesInput.value);
+    });
+    notesInput.addEventListener('blur', () => {
+      const k = this._dayKey;
+      if (!k) return;
+      this._schedulePersistNotes(k, notesInput.value);
+    });
+    notes.appendChild(notesLabel);
+    notes.appendChild(notesInput);
+    this._notesWrapEl = notes;
+    this._notesInputEl = notesInput;
+
+    const statsView = document.createElement('div');
+    statsView.className = 'ht-stats-view is-hidden';
+    this._statsViewEl = statsView;
+
+    el.appendChild(status);
+    el.appendChild(headerStack);
+    el.appendChild(progressWrap);
+    el.appendChild(listWrap);
+    el.appendChild(notes);
+    el.appendChild(statsView);
+
+    this._syncLayout();
+    const shell = globalThis.__dawnJhsShell;
+    this._onDay(shell?.getDay?.() || null, { dayKey: shell?.getDayKey?.() || null, gen: 0 });
+    this._paint();
+  }
+
+  _syncLayout() {
+    if (this._root) {
+      this._root.classList.toggle('ht-habit-layout-single-col', !!this._singleCol);
+    }
+    if (this._singleColBtn) {
+      this._singleColBtn.classList.toggle('active', !!this._singleCol);
+      this._singleColBtn.title = this._singleCol
+        ? 'Use two-column layout'
+        : 'Use single-column layout';
+      this._singleColBtn.setAttribute('aria-label', this._singleColBtn.title);
+      const icon = this._singleColBtn.querySelector('.ti');
+      if (icon) {
+        icon.className = 'ti ' + (this._singleCol ? 'ti-columns' : 'ti-layout-list');
+        icon.setAttribute('aria-hidden', 'true');
+      }
+    }
+  }
+
+  _syncCatCollapse() {
+    /* Per-section collapse is applied in _paintBoardSections. */
+  }
+
+  _isCatCollapsed(catId) {
+    if (!this._catCollapsed || typeof this._catCollapsed !== 'object') return false;
+    return !!this._catCollapsed[catId];
+  }
+
+  _setCatCollapsed(catId, on) {
+    if (!catId) return;
+    if (!this._catCollapsed || typeof this._catCollapsed !== 'object') this._catCollapsed = {};
+    if (on) this._catCollapsed[catId] = true;
+    else delete this._catCollapsed[catId];
+    this._saveUiPrefs();
+  }
+
+  _setAllCatsCollapsed(collapsed) {
+    const cats = this._config?.categories || [];
+    if (!cats.length) return;
+    if (!this._catCollapsed || typeof this._catCollapsed !== 'object') this._catCollapsed = {};
+    for (const cat of cats) {
+      if (!cat?.id) continue;
+      if (collapsed) this._catCollapsed[cat.id] = true;
+      else delete this._catCollapsed[cat.id];
+    }
+    this._saveUiPrefs();
+    this._paint();
+  }
+
+  _syncCatExpandToggle() {
+    const btn = this._catExpandBtn;
     if (!btn) return;
     const cats = this._config?.categories || [];
-    const embedded = !!state.jhsExternalHeaderHost;
-    const sidebarCollapsed = !embedded && state.sidebarEl?.classList.contains('ht-collapsed');
-    if (sidebarCollapsed || !cats.length) {
+    if (!cats.length) {
       btn.style.display = 'none';
       return;
     }
     btn.style.display = '';
-    const anyExpanded = cats.some((c) => !this._catCollapsed[c.id]);
-    btn.innerHTML = anyExpanded ? htIcon('chevron-up') : htIcon('chevron-down');
+    const anyExpanded = cats.some((c) => !this._isCatCollapsed(c.id));
+    btn.innerHTML = anyExpanded
+      ? '<i class="ti ti-chevron-up" aria-hidden="true"></i>'
+      : '<i class="ti ti-chevron-down" aria-hidden="true"></i>';
     btn.title = anyExpanded ? 'Collapse all categories' : 'Expand all categories';
+    btn.setAttribute('aria-label', btn.title);
   }
 
-  /** `collapsed === true` hides habit lists (same flag as per-category chevron). */
-  _htSetAllCategoriesCollapsed(state, collapsed) {
-    const cfg = this._config;
-    if (!cfg?.categories?.length) return;
-    for (const c of cfg.categories) {
-      this._catCollapsed[c.id] = collapsed;
-    }
-    if (this._persistState) {
-      localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
-      this._htPluginSettingsFlush();
-    }
-    void this._renderSidebar(state);
-  }
-
-  _toggleCategory(catId, state) {
-    this._catCollapsed[catId] = !this._catCollapsed[catId];
-    if (this._persistState) {
-      localStorage.setItem('ht_cat_collapsed', JSON.stringify(this._catCollapsed));
-      this._htPluginSettingsFlush();
-    }
-    if (this._htHabitRibbonMode) {
-      void this._renderSidebar(state);
-      return;
-    }
-
-    const body = state.bodyEl;
-    if (!body) return;
-    const habitsEl = body.querySelector(`[data-cat-id="${catId}"]`);
-    const catHeader = habitsEl?.previousElementSibling;
-    const caret = catHeader?.querySelector('.ht-category-caret');
-
-    const isOpen = !this._catCollapsed[catId];
-    habitsEl?.classList.toggle('ht-hidden', !isOpen);
-    caret?.classList.toggle('open', isOpen);
-    this._htSyncCategoryExpandToggleBtn(state);
-  }
-
-  // Tap a habit: boolean = toggle, numeric = +1 up to target (then tap again resets to 0)
-  async _tapHabit(habit, catId, log, dateStr, state, habitEl, wasDone) {
-    const freshLog = await this._loadLog(dateStr);
-    log = freshLog;
-    const cfg = this._config;
-    const hasTarget = (habit.target || 0) > 0;
-
-    if (!hasTarget) {
-      const prevNorm = htCompletionNorm(log.completions[habit.id], habit);
-      this._htCycleHabitCompletion(log, habit, habit.id);
-      const nextNorm = htCompletionNorm(log.completions[habit.id], habit);
-      if (nextNorm.done && !prevNorm.done) this._celebrate(habitEl);
-    } else {
-      const raw = log.completions[habit.id];
-      const norm = htCompletionNorm(raw, habit);
-      if (norm.kind === 'na' || norm.kind === 'fail') {
-        log.completions[habit.id] = 1;
-      } else {
-        const currentVal = typeof raw === 'number' ? raw : 0;
-        if (currentVal >= habit.target) {
-          delete log.completions[habit.id];
-        } else {
-          log.completions[habit.id] = currentVal + 1;
-          if (currentVal + 1 >= habit.target) this._celebrate(habitEl);
-        }
-      }
-    }
-
-    this._htRecomputeCategoryDone(log, cfg, dateStr);
-    await this._saveLog(dateStr, log);
-    this._htSyncDayLogState(state, dateStr, log);
-    await this._patchHabitEl(habitEl, habit, log, dateStr, catId, state);
-  }
-
-  // Patch a single habit element in-place after a tap (no full re-render)
-  async _patchHabitEl(habitEl, habit, log, dateStr, catId, state) {
-    if (!habitEl || !habitEl.isConnected) {
-      await this._renderSidebar(state);
-      return;
-    }
-
-    const hasTarget = (habit.target || 0) > 0;
-    const rawVal = log.completions[habit.id];
-    const surf = htHabitDaySurface(log, habit, dateStr);
-    const norm = htCompletionNorm(rawVal, habit);
-    const currentVal = typeof rawVal === 'number' ? rawVal : rawVal === true ? 1 : 0;
-    const isDone = norm.done;
-
-    habitEl.classList.toggle('ht-done', isDone);
-    habitEl.classList.toggle('ht-habit-offday', !!surf.offDay);
-    habitEl.classList.toggle('ht-fail', norm.kind === 'fail');
-    habitEl.classList.toggle(
-      'ht-na',
-      norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')
+  _shiftDay(iso, delta) {
+    if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return null;
+    const [y, m, d] = iso.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + delta);
+    return (
+      dt.getFullYear() +
+      '-' +
+      String(dt.getMonth() + 1).padStart(2, '0') +
+      '-' +
+      String(dt.getDate()).padStart(2, '0')
     );
+  }
 
-    const indSlot = habitEl.querySelector('.ht-habit-orbit');
-    if (indSlot) {
-      if (norm.kind === 'fail') {
-        indSlot.innerHTML = `<div class="ht-habit-mark ht-habit-mark-fail" aria-hidden="true">×</div>`;
-      } else if (norm.kind === 'na' || (surf.displayNa && norm.kind === 'empty')) {
-        indSlot.innerHTML = `<div class="ht-habit-mark ht-habit-mark-na" aria-hidden="true">/</div>`;
-      } else if (hasTarget) {
-        const r = 10;
-        const circ = 2 * Math.PI * r;
-        const pRing = Math.min(1, currentVal / habit.target);
-        const dash = circ * pRing;
-        const label = currentVal >= habit.target ? htIcon('check') : `${currentVal}`;
-        indSlot.innerHTML = `
-            <div class="ht-habit-ring">
-              <svg width="26" height="26" viewBox="0 0 26 26">
-                <circle class="ht-habit-ring-bg" cx="13" cy="13" r="${r}"/>
-                <circle class="ht-habit-ring-fill" cx="13" cy="13" r="${r}"
-                  stroke-dasharray="${circ}"
-                  stroke-dashoffset="${circ - dash}"/>
-              </svg>
-              <div class="ht-habit-ring-label">${label}</div>
-            </div>`;
-        const nameEl = habitEl.querySelector('.ht-habit-name');
-        if (nameEl) {
-          const existing = nameEl.querySelector('span');
-          if (existing) {
-            existing.textContent = `${currentVal}/${habit.target}${habit.unit ? ' ' + habit.unit : ''}`;
+  _nudgeHabitDay(delta) {
+    const t = new Date();
+    const today =
+      t.getFullYear() +
+      '-' +
+      String(t.getMonth() + 1).padStart(2, '0') +
+      '-' +
+      String(t.getDate()).padStart(2, '0');
+    const cur = this._dayKey || today;
+    const next = this._shiftDay(cur, delta);
+    if (!next) return;
+    this._dayKey = next;
+    this._paint();
+    void this._hydrateDay(next);
+    if (!this._index.full) {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      void this._runIdleIndex(boot, !!boot?.isMobile?.());
+    }
+  }
+
+  _habitRollCounts(habitName, dayKey) {
+    const name = String(habitName || '').trim().toLowerCase();
+    if (!name || !dayKey) return { d7: 0, d30: 0 };
+    let d7 = 0;
+    let d30 = 0;
+    for (let i = 0; i < 30; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const entries = this._dayEntries(k);
+      let done = false;
+      for (const e of entries) {
+        for (const h of e?.habits || []) {
+          if (String(h.name || '').trim().toLowerCase() === name && h.done) {
+            done = true;
+            break;
           }
         }
-      } else {
-        indSlot.innerHTML = `<div class="ht-habit-check-minimal"><span class="ht-check-glyph">${
-          isDone ? htIcon('check') : htIcon('check', 'ht-check-faint')
-        }</span></div>`;
+        if (done) break;
+      }
+      if (done) {
+        d30 += 1;
+        if (i < 7) d7 += 1;
       }
     }
+    return { d7, d30 };
+  }
 
-    const habitsEl = habitEl.closest('.ht-category-habits');
-    const catHeader = habitsEl?.previousElementSibling;
-    if (catHeader) {
-      const doneSlot = catHeader.querySelector('.ht-ch-cat-done-wrap');
-      const applying = [];
-      if (habitsEl) {
-        for (const row of habitsEl.querySelectorAll('.ht-habit[data-habit-id]')) {
-          const hid = row.dataset.habitId;
-          const h = this._config?.habits?.find((x) => x.id === hid);
-          if (!h) continue;
-          if (!htHabitAppliesOnDate(h, dateStr)) continue;
-          applying.push(h);
+  _overallStats(dayKey, rangeDays) {
+    let checks = 0;
+    let slots = 0;
+    let daysWithLog = 0;
+    for (let i = 0; i < rangeDays; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const entries = this._dayEntries(k);
+      let daySlots = 0;
+      let dayDone = 0;
+      for (const e of entries) {
+        for (const h of e?.habits || []) {
+          daySlots += 1;
+          if (h.done) dayDone += 1;
         }
       }
-      if (doneSlot) {
-        const st = htCategoryDayAggregateStatus(log, applying, dateStr);
-        doneSlot.innerHTML = htCategoryDayLeadInnerHtml(st);
-      }
-      const markedSlot = catHeader.querySelector('.ht-ch-cat-marked');
-      if (markedSlot) {
-        markedSlot.innerHTML = htCategoryAllMarkedForDay(log, applying, dateStr)
-          ? `<span class="ht-cat-marked-dot" title="All habits tended to" aria-hidden="true"></span>`
-          : '';
+      if (daySlots) {
+        daysWithLog += 1;
+        slots += daySlots;
+        checks += dayDone;
       }
     }
+    const rate = slots ? Math.round((checks / slots) * 100) : 0;
+    return { checks, slots, daysWithLog, rate };
+  }
 
-    // Recompute streaks immediately so click updates are visible without refresh.
+  _collectHabitNames(dayKey, rangeDays) {
+    const names = new Map(); // lower -> display
+    const push = (raw) => {
+      const t = String(raw || '').trim();
+      if (!t) return;
+      const k = t.toLowerCase();
+      if (!names.has(k)) names.set(k, t);
+    };
+    for (let i = 0; i < Math.max(1, rangeDays || 1); i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      for (const e of this._dayEntries(k)) {
+        for (const h of e?.habits || []) push(h.name);
+      }
+    }
+    return Array.from(names.values()).sort((a, b) => a.localeCompare(b));
+  }
+
+  _habitDayState(habitName, dayKey) {
+    const name = String(habitName || '').trim().toLowerCase();
+    if (!name || !dayKey) return { seen: false, done: false };
+    let seen = false;
+    let done = false;
+    for (const e of this._dayEntries(dayKey)) {
+      for (const h of e?.habits || []) {
+        if (String(h.name || '').trim().toLowerCase() !== name) continue;
+        seen = true;
+        if (h.done) done = true;
+      }
+    }
+    return { seen, done };
+  }
+
+  _habitBestStreak(habitName, dayKey, lookback) {
+    const name = String(habitName || '').trim().toLowerCase();
+    if (!name || !dayKey) return 0;
+    let best = 0;
+    let cur = 0;
+    for (let i = lookback - 1; i >= 0; i--) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) continue;
+      const st = this._habitDayState(name, k);
+      if (st.seen && st.done) {
+        cur += 1;
+        if (cur > best) best = cur;
+      } else if (st.seen) {
+        cur = 0;
+      }
+      // Unhydrated / no entry: break continuity without resetting best.
+      else {
+        cur = 0;
+      }
+    }
+    return best;
+  }
+
+  _habitRangeStats(habitName, dayKey, rangeDays) {
+    let daysWith = 0;
+    let daysDone = 0;
+    for (let i = 0; i < rangeDays; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const st = this._habitDayState(habitName, k);
+      if (!st.seen) continue;
+      daysWith += 1;
+      if (st.done) daysDone += 1;
+    }
+    const rate = daysWith ? Math.round((daysDone / daysWith) * 100) : 0;
+    return {
+      daysWith,
+      daysDone,
+      rate,
+      streak: this._habitConsecutiveStreak(habitName, dayKey),
+      best: this._habitBestStreak(habitName, dayKey, Math.max(rangeDays, 60)),
+    };
+  }
+
+  _scheduleHydrateRange(dayKey, rangeDays) {
+    if (!dayKey) return;
+    const keys = [];
+    for (let i = 0; i < rangeDays; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const entries = this._dayEntries(k);
+      if (this._needsHydrate(k)) keys.push(k);
+    }
+    if (!keys.length) return;
+    const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+    const run = async () => {
+      for (const k of keys) {
+        if (this._dayKey !== dayKey && this._viewMode === 'stats') {
+          // Still hydrate if user stayed in stats on same anchor; abort if day flipped away from request.
+        }
+        await this._hydrateDay(k);
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    };
+    if (boot?.enqueue) {
+      boot.enqueue(() => run(), {
+        id: 'habits:hydrate-range-' + dayKey + '-' + rangeDays,
+        tier: 'onDemand',
+      });
+    } else {
+      void run();
+    }
+  }
+
+  _enterHabitStats(habitName) {
+    const name = String(habitName || '').trim();
+    if (!name) return;
+    this._viewMode = 'stats';
+    this._statsSelected = 'habit:' + name;
+    this._saveUiPrefs();
+    this._paint();
+  }
+
+  _overallDayDone(dayKey) {
+    let slots = 0;
+    let done = 0;
+    for (const e of this._dayEntries(dayKey)) {
+      for (const h of e?.habits || []) {
+        slots += 1;
+        if (h.done) done += 1;
+      }
+    }
+    return { seen: slots > 0, done: slots > 0 && done >= slots, partial: slots > 0 && done > 0 && done < slots };
+  }
+
+  _formatDayLabel(key) {
+    if (!key || !/^\d{4}-\d{2}-\d{2}$/.test(key)) return key || '—';
     try {
-      const logsByDate = await this._loadAllLogsByDate();
-      const habitStreak = this._habitStreakFromMap(habit.id, undefined, logsByDate, habit);
-      const moChecks = this._habitCheckCountInMonth(habit, logsByDate, dateStr);
-      const wkChecks = this._habitCheckCountWeekSun(habit, logsByDate, dateStr);
-      const streakCore = habitStreak > 0 ? htHabitStreakCoreHtml(habitStreak, habitStreak >= 7) : '';
-      const cntSeg =
-        `<span class="ht-habit-stat-counts">` +
-        `<span class="ht-roll-num">${moChecks}</span><span class="ht-roll-suffix">30d</span>` +
-        `<span class="ht-roll-sep">·</span>` +
-        `<span class="ht-roll-num">${wkChecks}</span><span class="ht-roll-suffix">7d</span>` +
-        `</span>`;
-      const streakLabel = streakCore
-        ? `${streakCore}<span class="ht-streak-dotsep"> · </span>${cntSeg}`
-        : cntSeg;
-      const yearM = this._htHabitYearMeter(habitStreak);
-      const tierBadge =
-        yearM.yearsCompleted > 0
-          ? `<span class="ht-year-tier" title="${yearM.yearsCompleted}×365d streak milestone">★${yearM.yearsCompleted}</span>`
-          : '';
-      const boundaryMark = yearM.atYearBoundary
-        ? `<span class="ht-year-boundary" title="365-day milestone">✓</span>`
-        : '';
-      const meterHtml =
-        habitStreak > 0
-          ? `<div class="ht-habit-streak-meter-wrap">${tierBadge}${boundaryMark}<div class="ht-habit-streak-meter" aria-hidden="true">${htYearMeterFillHtml(
-              yearM.pct,
-              habitStreak
-            )}</div></div>`
-          : '';
-      const hotCls = habitStreak >= 7 ? ' hot' : '';
-      const inner = `<span class="ht-habit-streak${hotCls}">${streakLabel}</span>${meterHtml}`;
-      const metaRow = habitEl.querySelector('.ht-habit-line-meta');
-      let cluster = habitEl.querySelector('.ht-habit-streak-cluster');
-      if (!cluster && metaRow) {
-        cluster = document.createElement('div');
-        cluster.className = 'ht-habit-streak-cluster';
-        const statsA = metaRow.querySelector('.ht-habit-stats-link');
-        if (statsA) metaRow.insertBefore(cluster, statsA);
-        else metaRow.appendChild(cluster);
-      }
-      if (cluster) {
-        cluster.classList.remove('ht-habit-streak-cluster-empty');
-        cluster.innerHTML = inner;
-      }
+      const today = new Date();
+      const tkey =
+        today.getFullYear() +
+        '-' +
+        String(today.getMonth() + 1).padStart(2, '0') +
+        '-' +
+        String(today.getDate()).padStart(2, '0');
+      if (key === tkey) return 'Today';
+      const d = new Date(key + 'T12:00:00');
+      if (Number.isNaN(d.getTime())) return key;
+      const opts = { month: 'short', day: 'numeric' };
+      if (key.slice(0, 4) !== tkey.slice(0, 4)) opts.year = 'numeric';
+      return d.toLocaleDateString(undefined, opts);
+    } catch (_) {
+      return key;
+    }
+  }
 
-      if (catHeader && habitsEl?.dataset?.catId) {
-        const secCatId = habitsEl.dataset.catId;
-        const cat = (this._config?.categories || []).find((c) => c.id === secCatId) || null;
-        const catStreak = this._categoryStreakFromMap(secCatId, undefined, logsByDate, cat);
-        const catStreakEl = catHeader.querySelector('.ht-category-streak');
-        const catStreakHtml = htCategoryStreakBadgeHtml(catStreak);
-        if (catStreak > 0) {
-          if (!catStreakEl) {
-            const cluster = catHeader.querySelector('.ht-ch-cluster');
-            if (cluster) cluster.insertAdjacentHTML('beforeend', catStreakHtml);
-            else catHeader.insertAdjacentHTML('beforeend', catStreakHtml);
-          } else {
-            catStreakEl.outerHTML = catStreakHtml;
-          }
-        } else if (catStreakEl) {
-          catStreakEl.remove();
+  _streakTierSolid(dayCount) {
+    const d = Math.max(0, Math.floor(Number(dayCount) || 0));
+    if (d <= 0) return 'rgba(150, 158, 178, 0.55)';
+    const t = Math.min(1, d / 364);
+    const u = Math.pow(t, 0.5);
+    const h = 168 - u * 158;
+    const s = 10 + u * 48;
+    const l = 59 - u * 11;
+    const a = 0.66 + u * 0.26;
+    return (
+      'hsla(' +
+      Math.round(h) +
+      ', ' +
+      Math.round(s) +
+      '%, ' +
+      Math.round(l) +
+      '%, ' +
+      a.toFixed(2) +
+      ')'
+    );
+  }
+
+  _habitDoneOnDay(habitName, dayKey) {
+    const name = String(habitName || '').trim().toLowerCase();
+    if (!name || !dayKey) return false;
+    for (const e of this._dayEntries(dayKey)) {
+      for (const h of e?.habits || []) {
+        if (String(h.name || '').trim().toLowerCase() === name && h.done) return true;
+      }
+    }
+    return false;
+  }
+
+  _habitConsecutiveStreak(habitName, dayKey) {
+    if (!habitName || !dayKey) return 0;
+    let n = 0;
+    const name = String(habitName).trim().toLowerCase();
+    for (let i = 0; i < 120; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const mark = this._habitMark(k, habitName);
+      if (mark) break;
+      let seen = false;
+      let done = this._lsDone(k, habitName);
+      const entries = this._dayEntries(k);
+      for (const e of entries) {
+        for (const h of e?.habits || []) {
+          if (String(h.name || '').trim().toLowerCase() !== name) continue;
+          seen = true;
+          if (h.done) done = true;
         }
+      }
+      const cfg = this._habitCfg(habitName);
+      if (!seen && !done && !(this._config.habits || []).some((h) => String(h.name || '').trim().toLowerCase() === name && !h.archived)) {
+        break;
+      }
+      if (cfg.type === 'number') {
+        const target = Math.max(1, Number(cfg.target) || 8);
+        if (this._habitValue(k, habitName) >= target) done = true;
+      }
+      if (!done) break;
+      n += 1;
+    }
+    return n;
+  }
+
+  _categoryAllDoneStreak(dayKey) {
+    if (!dayKey) return 0;
+    let n = 0;
+    for (let i = 0; i < 400; i++) {
+      const k = this._shiftDay(dayKey, -i);
+      if (!k) break;
+      const habits = [];
+      for (const e of this._dayEntries(k)) {
+        for (const h of e?.habits || []) habits.push(h);
+      }
+      if (!habits.length) break;
+      if (!habits.every((h) => h.done)) break;
+      n += 1;
+    }
+    return n;
+  }
+
+  _streakCoreHtml(days) {
+    const d = Math.max(0, Math.floor(Number(days) || 0));
+    if (!d) return '';
+    const c = this._streakTierSolid(Math.min(d, 364));
+    return (
+      '<span class="ht-habit-streak-core" style="color:' +
+      c +
+      '"><i class="ti ti-flame" aria-hidden="true"></i><span class="ht-streak-day-count">' +
+      d +
+      'd</span></span>'
+    );
+  }
+
+  _progressFillColor(kind) {
+    switch (kind) {
+      case 'done':
+        return 'rgba(30, 92, 53, 0.95)';
+      case 'partial':
+        return 'rgba(72, 150, 112, 0.62)';
+      case 'fail':
+        return 'rgba(229, 115, 115, 0.92)';
+      case 'na':
+        return 'rgba(200, 165, 72, 0.82)';
+      default:
+        return 'rgba(255,255,255,0.08)';
+    }
+  }
+
+  _groupedProgressGradient(segments, blendPct = 3.5) {
+    const list = Array.isArray(segments) ? segments : [];
+    const total = list.length;
+    if (!total) return null;
+    const groupOrder = ['done', 'partial', 'na', 'fail'];
+    const chunks = [];
+    let leftPct = 0;
+    for (const kind of groupOrder) {
+      const count = list.filter((s) => s === kind).length;
+      if (!count) continue;
+      const widthPct = (count / total) * 100;
+      chunks.push({ kind, left: leftPct, width: widthPct });
+      leftPct += widthPct;
+    }
+    const emptyCount = list.filter((s) => s === 'empty').length;
+    if (emptyCount) chunks.push({ kind: 'empty', left: leftPct, width: (emptyCount / total) * 100 });
+    if (!chunks.length) return null;
+    if (chunks.length === 1) return this._progressFillColor(chunks[0].kind);
+
+    const stops = [];
+    const clampPct = (pct) => Math.max(0, Math.min(100, pct));
+    const pushStop = (color, pct) => {
+      stops.push({ p: clampPct(pct), color });
+    };
+    for (let i = 0; i < chunks.length; i++) {
+      const c = chunks[i];
+      const start = c.left;
+      const end = c.left + c.width;
+      const color = this._progressFillColor(c.kind);
+      if (i === 0) pushStop(color, start);
+      if (i > 0) {
+        const prev = chunks[i - 1];
+        const prevColor = this._progressFillColor(prev.kind);
+        const half = Math.min(blendPct, c.width * 0.42, prev.width * 0.42);
+        pushStop(prevColor, start - half);
+        pushStop(color, start + half);
+      }
+      if (i === chunks.length - 1) {
+        pushStop(color, end);
+      } else {
+        const next = chunks[i + 1];
+        const half = Math.min(blendPct, c.width * 0.42, next.width * 0.42);
+        pushStop(color, end - half);
+      }
+    }
+    stops.sort((a, b) => a.p - b.p);
+    const merged = [];
+    for (const s of stops) {
+      const prev = merged[merged.length - 1];
+      if (prev && Math.abs(prev.p - s.p) < 0.001) merged[merged.length - 1] = s;
+      else merged.push(s);
+    }
+    return 'linear-gradient(90deg, ' + merged.map((s) => `${s.color} ${s.p.toFixed(2)}%`).join(', ') + ')';
+  }
+
+  _categoryProgressSegments(cats, habitsAll, dayKey) {
+    const segments = [];
+    let allCategoriesAllDone = true;
+    let hasEligible = false;
+    for (const cat of cats || []) {
+      const inCat = (habitsAll || []).filter((h) => this._habitCategoryId(h.name) === cat.id);
+      const applying = inCat.filter((h) => this._habitAppliesOnDate(h, dayKey));
+      if (!applying.length) continue;
+      hasEligible = true;
+      const status = this._categoryDayAggStatus(applying, dayKey);
+      if (status === 'all_done') segments.push('done');
+      else if (status === 'fail') segments.push('fail');
+      else if (status === 'na') segments.push('na');
+      else if (status === 'partial') segments.push('partial');
+      else segments.push('empty');
+      if (status !== 'all_done') allCategoriesAllDone = false;
+    }
+    if (!hasEligible) allCategoriesAllDone = false;
+    return { segments, sherbet: !!(allCategoriesAllDone && hasEligible) };
+  }
+
+  _paintProgress(cats, habitsAll, dayKey) {
+    const bar = this._progressEl;
+    if (!bar) return;
+    const { segments, sherbet } = this._categoryProgressSegments(cats, habitsAll, dayKey);
+    bar.innerHTML = '';
+    bar.classList.toggle('is-sherbet', !!sherbet);
+    if (!segments.length) {
+      bar.style.display = 'none';
+      return;
+    }
+    bar.style.display = 'block';
+    if (sherbet) {
+      const fill = document.createElement('span');
+      fill.className = 'jhs-fill is-sherbet-full';
+      fill.style.left = '0';
+      fill.style.width = '100%';
+      bar.appendChild(fill);
+      return;
+    }
+    const gradient = this._groupedProgressGradient(segments);
+    if (!gradient) return;
+    const fill = document.createElement('span');
+    fill.className = 'jhs-fill is-segment-gradient';
+    fill.style.background = gradient;
+    bar.appendChild(fill);
+  }
+
+  _onExpand(expanded) {
+    if (!expanded) return;
+    this._paint();
+    if (this._dayKey) void this._hydrateDay(this._dayKey);
+    const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+    const prep = async () => {
+      await this._loadVaultConfig();
+      if (!this._primaryLogGuid(this._dayKey) && this._dayHasLocalMarks(this._dayKey)) {
+        await this._ensureDayLog(this._dayKey);
+      }
+      this._scheduleHydrateDay(this._dayKey);
+      await this._hydrateNotesForDay(this._dayKey);
+    };
+    if (boot?.enqueue) {
+      boot.enqueue(prep, { id: 'habits:expand-config', tier: 'onDemand' });
+    } else {
+      void prep();
+    }
+    const age = Date.now() - (this._index.builtAt || 0);
+    if (!this._index.full || age > HABITS_INDEX_TTL_MS) {
+      void this._runIdleIndex(boot, !!boot?.isMobile?.());
+    }
+    const promptRecoveries = async () => {
+      const y = this._shiftDay(this._dayKey, -1);
+      if (y) await this._hydrateDay(y);
+      this._app?._maybePromptRecoveries?.(this._dayKey);
+    };
+    if (boot?.enqueue) {
+      boot.enqueue(promptRecoveries, {
+        id: 'habits:recovery-prompt-' + (this._dayKey || ''),
+        tier: 'onDemand',
+      });
+    } else {
+      void promptRecoveries();
+    }
+  }
+
+  _onDay(dayLabel, meta) {
+    this._gen += 1;
+    this._dayKey = this._normalizeDayKey((meta && meta.dayKey) || dayLabel);
+    // Cancel in-flight hydrate for a previous day — rapid flips must stay paint-only.
+    this._hydrating.clear();
+    this._paint();
+    if (this._isHabitsTabExpanded() && this._dayKey) {
+      void this._hydrateDay(this._dayKey);
+    }
+  }
+
+  _normalizeDayKey(raw) {
+    const s = String(raw || '').trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const compact = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+    if (compact) return compact[1] + '-' + compact[2] + '-' + compact[3];
+    return this._dayKeyFromLabel(s);
+  }
+
+  _dayKeyFromLabel(label) {
+    if (!label) return null;
+    const s = String(label).trim();
+    const iso = s.match(/(\d{4}-\d{2}-\d{2})/);
+    if (iso) return iso[1];
+    const compact = s.match(/(\d{4})(\d{2})(\d{2})/);
+    if (compact) return compact[1] + '-' + compact[2] + '-' + compact[3];
+    const cleaned = s.replace(/^[A-Za-z]{3}\s+/, '');
+    let d = Date.parse(cleaned + (/\d{4}/.test(cleaned) ? '' : ' 2026'));
+    if (Number.isNaN(d)) d = Date.parse(s + (/\d{4}/.test(s) ? '' : ' 2026'));
+    if (Number.isNaN(d)) return null;
+    try {
+      const dt = new Date(d);
+      return (
+        dt.getFullYear() +
+        '-' +
+        String(dt.getMonth() + 1).padStart(2, '0') +
+        '-' +
+        String(dt.getDate()).padStart(2, '0')
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  _dayEntries(key) {
+    const k = this._normalizeDayKey(key) || key;
+    return (k && this._index.byDay[k]) || [];
+  }
+
+  async _searchRecords(query) {
+    if (!query || typeof this.data.searchByQuery !== 'function') return [];
+    try {
+      const result = await this.data.searchByQuery(query, 24);
+      if (result?.error) console.warn('[Dawn/Habits] search', result.error);
+      if (Array.isArray(result)) return result;
+      if (Array.isArray(result?.records)) return result.records;
+      if (Array.isArray(result?.matching_records)) return result.matching_records;
+    } catch (_) {}
+    return [];
+  }
+
+  async _findDayLogRecord(dayKey) {
+    const key = this._normalizeDayKey(dayKey);
+    if (!key) return null;
+    const rid = 'habit-tracker:log:' + key;
+    const guidFromHit = (hit) => {
+      try {
+        return String(hit?.guid || hit?.id || hit?.getGuid?.() || '').trim();
+      } catch (_) {
+        return '';
+      }
+    };
+    const matchRec = (rec) => {
+      if (!rec) return false;
+      const pid = this._propText(rec, ['plugin_id', 'Plugin ID']);
+      const title = String(rec.getName?.() || rec.name || '').trim();
+      const kind = this._propText(rec, ['record_kind', 'Record kind']);
+      return pid === rid || title === key || (kind === 'log' && String(pid || '').endsWith(key));
+    };
+    const queries = [rid, key];
+    for (const q of queries) {
+      const hits = await this._searchRecords(q);
+      for (const hit of hits || []) {
+        if (!hit) continue;
+        if (matchRec(hit)) return hit;
+        const guid = guidFromHit(hit);
+        if (!guid) continue;
+        try {
+          const rec = await this.data.getRecord?.(guid);
+          if (matchRec(rec) || rec) {
+            if (matchRec(rec)) return rec;
+            const title = String(rec.getName?.() || rec.name || '').trim();
+            if (title === key) return rec;
+          }
+        } catch (_) {}
+      }
+      if ((hits || []).length === 1) {
+        const guid = guidFromHit(hits[0]);
+        if (guid) {
+          try {
+            const rec = await this.data.getRecord?.(guid);
+            if (rec) return rec;
+          } catch (_) {}
+        }
+      }
+    }
+    return null;
+  }
+
+  _needsHydrate(dayKey) {
+    const key = this._normalizeDayKey(dayKey);
+    if (!key) return false;
+    const entries = this._dayEntries(key);
+    if (this._logMiss?.[key] && !entries.length && this._index?.full) return false;
+    if (!(this._config.habits || []).length) return true;
+    if (!entries.length) return true;
+    return entries.some((e) => e?.guid && e.hydrated !== true);
+  }
+
+  _scheduleHydrateDay(dayKey) {
+    const key = this._normalizeDayKey(dayKey);
+    if (!key) return;
+    if (!this._needsHydrate(key)) return;
+    if (this._hydrating.has(key)) return;
+    void this._hydrateDay(key);
+  }
+
+  async _hydrateDay(dayKey) {
+    const key = this._normalizeDayKey(dayKey);
+    if (!key || this._hydrating.has(key)) return;
+    this._hydrating.add(key);
+    this._paint();
+    try {
+      await this._loadVaultConfig();
+      let entries = this._dayEntries(key);
+      if (!entries.length) {
+        const rec = await this._findDayLogRecord(key);
+        const guid = rec?.guid || rec?.getGuid?.() || '';
+        if (guid) this._attachLogToIndex(key, guid, key);
+        else if (!this._index?.full && !this._building) {
+          const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+          await this._runIdleIndex(boot, !!boot?.isMobile?.());
+        } else if (this._index?.full) {
+          if (!this._logMiss) this._logMiss = Object.create(null);
+          this._logMiss[key] = true;
+        }
+        entries = this._dayEntries(key);
+      }
+      if (!entries.length) return;
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (!e?.guid || e.hydrated === true) continue;
+        try {
+          const rec = await this.data.getRecord?.(e.guid);
+          e.habits = await this._habitsFromRecord(rec, key);
+          e.hydrated = Array.isArray(e.habits);
+          if (!(this._config.habits || []).length) delete e.hydrated;
+        } catch (err) {
+          console.warn('[Dawn/Habits] hydrate log', e.guid, err);
+          e.hydrateError = String(err?.message || err);
+        }
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      this._saveIndexToStorage();
+      if (this._dayKey === key) await this._hydrateNotesForDay(key);
+      this._paint();
+    } finally {
+      this._hydrating.delete(key);
+      this._paint();
+    }
+  }
+
+  _linePlain(li) {
+    if (!li) return '';
+    try {
+      if (typeof li.getPlainText === 'function') {
+        const t = li.getPlainText();
+        if (t) return String(t).trim();
       }
     } catch (_) {}
-
-    // Update progress bar (category at-least-one completion)
-    const body = state.bodyEl;
-    if (body) {
-      const cfg = this._config;
-      const tagFil = this._htGetTagFilter();
-      const { done: cDone, eligible: cElig, pct: cPct } = this._htCategoryProgressFromLog(cfg, log, dateStr);
-      const pw = body.querySelector('.ht-progress');
-      if (pw) {
-        pw.style.display = '';
-        pw.title =
-          cElig > 0
-            ? tagFil
-              ? `${cDone} of ${cElig} categories with at least one habit done today (filtered by tag “${tagFil}”)`
-              : `${cDone} of ${cElig} categories with at least one habit done today`
-            : '';
+    try {
+      const segs = li.segments;
+      if (Array.isArray(segs) && segs.length) {
+        return segs
+          .map((s) => (s && (s.text || s.content || '')) || '')
+          .join('')
+          .trim();
       }
-      const fill = body.querySelector('.ht-progress-fill');
-      if (fill) {
-        fill.style.width = cPct + '%';
-        fill.style.background = htCategoryProgressFillStyle(cPct);
+    } catch (_) {}
+    try {
+      if (typeof li.text === 'string') return li.text.trim();
+      if (typeof li.getText === 'function') return String(li.getText() || '').trim();
+    } catch (_) {}
+    return '';
+  }
+
+  _habitFromCompletion(id, raw, dayKey, opts) {
+    const persistLs = opts?.persistLs !== false;
+    const cfg = (this._config.habits || []).find((h) => String(h.id) === String(id));
+    const name = cfg?.name;
+    if (!name) return null;
+    const target = Number(cfg?.target) || 0;
+    if (raw === HABITS_COMP_FAIL) {
+      if (persistLs && dayKey) this._setHabitMark(dayKey, name, 'fail');
+      return { id, name, done: false, mark: 'fail' };
+    }
+    if (raw === HABITS_COMP_NA) {
+      if (persistLs && dayKey) this._setHabitMark(dayKey, name, 'na');
+      return { id, name, done: false, mark: 'na' };
+    }
+    if (typeof raw === 'number') {
+      if (persistLs && dayKey) this._setHabitValue(dayKey, name, raw);
+      if (persistLs) this._setLsDone(dayKey, name, target > 0 ? raw >= target : raw > 0);
+      return { id, name, done: target > 0 ? raw >= target : raw > 0, value: raw };
+    }
+    if (raw === true) {
+      if (persistLs) this._setLsDone(dayKey, name, true);
+      return { id, name, done: true };
+    }
+    return null;
+  }
+
+  async _habitsFromRecord(record, dayKey, opts) {
+    if (!record) return [];
+    const parsed = this._parseSettingsJson(record);
+    if (parsed && parsed.completions && typeof parsed.completions === 'object') {
+      const habits = [];
+      for (const [id, raw] of Object.entries(parsed.completions)) {
+        const row = this._habitFromCompletion(id, raw, dayKey, opts);
+        if (row) habits.push(row);
+      }
+      if (typeof parsed.notes === 'string' && dayKey && opts?.persistLs !== false) {
+        this._notesByDay[dayKey] = parsed.notes;
+      }
+      return habits;
+    }
+    if (opts?.jsonOnly) return [];
+    const habits = [];
+    let items = [];
+    try {
+      if (typeof record.getLineItems === 'function') {
+        items = (await record.getLineItems(true)) || (await record.getLineItems()) || [];
+      }
+    } catch (e) {
+      console.warn('[Dawn/Habits] getLineItems', e);
+    }
+    if (!items.length) {
+      try {
+        if (typeof record.getChildren === 'function') {
+          items = (await record.getChildren()) || [];
+        }
+      } catch (e) {
+        console.warn('[Dawn/Habits] getChildren', e);
+      }
+    }
+    for (const li of items) {
+      const name = this._linePlain(li);
+      if (!name) continue;
+      let done = false;
+      try {
+        if (typeof li.isTaskCompleted === 'function') {
+          const v = li.isTaskCompleted();
+          done = v === true;
+        } else if (typeof li.getTaskStatus === 'function') {
+          const st = li.getTaskStatus();
+          done = st === 'done' || st === 8 || String(st).toLowerCase() === 'done';
+        } else if (li.done === true || li.taskstatus === 'done') {
+          done = true;
+        }
+      } catch (_) {}
+      let type = '';
+      try {
+        type = String(li.getType?.() || li.type || '').toLowerCase();
+      } catch (_) {}
+      // Keep tasks; skip obvious non-habits (hr, etc.)
+      if (type && type !== 'task' && type !== 'text' && type !== 'ulist' && type !== 'checkbox') {
+        if (typeof li.isTaskCompleted !== 'function' && typeof li.getTaskStatus !== 'function') {
+          continue;
+        }
+      }
+      let itemGuid = '';
+      try {
+        itemGuid = li.guid || li.getGuid?.() || '';
+      } catch (_) {}
+      habits.push({
+        name: name.slice(0, 48),
+        done: !!done,
+        itemGuid,
+      });
+    }
+    return habits;
+  }
+
+  _paint() {
+    if (!this._statusEl || !this._listEl) return;
+    const key = this._dayKey;
+    const entries = this._dayEntries(key);
+    const hasIndex = !!(this._index.full || this._index.count);
+    const hydrating = key && this._hydrating.has(key);
+    // Never hydrate from paint/onDay — that storms mobile day-flips.
+    // Hydrate only via onExpand (explicit user open of Habits tab).
+
+    const fromLog = [];
+    for (const e of entries) {
+      if (Array.isArray(e.habits)) {
+        for (const h of e.habits) fromLog.push({ ...h, logGuid: e.guid });
+      }
+    }
+    if (fromLog.length && !(this._config.habits || []).length) {
+      this._syncConfigFromHabitNames(fromLog.map((h) => h.name));
+    }
+    const logByName = new Map(
+      fromLog.map((h) => [String(h.name || '').trim().toLowerCase(), h])
+    );
+    const logById = new Map(fromLog.filter((h) => h.id).map((h) => [String(h.id), h]));
+    const cfgHabits = (this._config.habits || []).filter((h) => !h.archived);
+    let habitsAll;
+    if (cfgHabits.length) {
+      habitsAll = cfgHabits
+        .filter((h) => {
+          if (this._manageMode) return true;
+          if (this._config.hideOffDayHabits && !this._habitAppliesOnDate(h, key)) return false;
+          return true;
+        })
+        .sort((a, b) => (a.order || 0) - (b.order || 0))
+        .map((h) => {
+          const hit = (h.id && logById.get(String(h.id))) || logByName.get(String(h.name).trim().toLowerCase());
+          return {
+            ...h,
+            done: !!(hit?.done || this._lsDone(key, h.name)),
+            logGuid: hit?.logGuid || this._primaryLogGuid(key) || '',
+            itemGuid: hit?.itemGuid || '',
+          };
+        });
+    } else {
+      habitsAll = fromLog;
+    }
+    const cats = [...(this._config.categories || [{ ...HABITS_DEFAULT_CAT }])].sort(
+      (a, b) => (a.order || 0) - (b.order || 0)
+    );
+    if (!cats.some((c) => c.id === this._activeCatId)) {
+      this._activeCatId = cats[0]?.id || HABITS_DEFAULT_CAT.id;
+    }
+    const doneN = habitsAll.filter((h) => h.done && !this._habitMark(key, h.name)).length;
+    const pendingHydrate = this._needsHydrate(key);
+
+    this._statusEl.textContent = hasIndex
+      ? (habitsAll.length
+          ? doneN + '/' + habitsAll.length + ' done'
+          : hydrating || pendingHydrate
+            ? 'Loading…'
+            : 'No habits') + (key ? ' · ' + key : '')
+      : 'Index pending…';
+    this._statusEl.title = hasIndex
+      ? 'index ' + this._index.count + (key ? ' · ' + key : '')
+      : 'Waiting for idle Habit Logs index';
+
+    if (this._dateLabelEl) this._dateLabelEl.textContent = this._formatDayLabel(key);
+    if (this._doneMetaEl) {
+      this._doneMetaEl.textContent = habitsAll.length
+        ? doneN + '/' + habitsAll.length
+        : hydrating || pendingHydrate
+          ? '…'
+          : '';
+    }
+    this._paintProgress(cats, habitsAll, key);
+    this._syncCatExpandToggle();
+    this._syncLayout();
+    if (this._statsBtn) {
+      this._statsBtn.classList.toggle('active', this._viewMode === 'stats');
+      this._statsBtn.title = this._viewMode === 'stats' ? 'Back to habits' : 'View stats';
+    }
+
+    const statsMode = this._viewMode === 'stats' && !this._manageMode;
+    if (this._root) this._root.classList.toggle('is-stats-mode', statsMode);
+    if (this._root) this._root.classList.toggle('is-manage-mode', !!this._manageMode);
+    if (this._listWrapEl) this._listWrapEl.classList.toggle('is-hidden', statsMode);
+    if (this._progressWrapEl) this._progressWrapEl.classList.toggle('is-hidden', statsMode || !!this._manageMode);
+    if (this._ribbonEl) {
+      const hideRibbon = statsMode || !!this._manageMode;
+      this._ribbonEl.classList.toggle('ht-hidden', hideRibbon);
+      if (hideRibbon) this._ribbonEl.hidden = true;
+    }
+    if (this._notesWrapEl) {
+      this._notesWrapEl.classList.toggle('is-hidden', statsMode);
+      this._notesWrapEl.style.display =
+        this._config.showDayNotes === false || this._manageMode ? 'none' : '';
+    }
+    if (this._statsViewEl) this._statsViewEl.classList.toggle('is-hidden', !statsMode);
+    if (this._listEl) this._listEl.style.display = this._manageMode ? '' : 'none';
+
+    if (this._notesInputEl && key) {
+      const note = this._notesByDay[key] || '';
+      if (this._notesInputEl.value !== note) this._notesInputEl.value = note;
+    }
+
+    if (statsMode) {
+      this._paintStatsView(key);
+      return;
+    }
+
+    if (this._manageMode) {
+      this._clearBoardSections();
+      this._paintManage(this._listEl);
+      return;
+    }
+
+    if (!key) {
+      this._clearBoardSections();
+      this._tip('Pick a journal day.');
+      return;
+    }
+    if (!habitsAll.length) {
+      this._clearBoardSections();
+      this._tip(
+        cfgHabits.length
+          ? 'No habits scheduled for this day.'
+          : 'No habits yet — gear / Edit habits to add some.'
+      );
+      return;
+    }
+
+    this._paintBoardSections(cats, habitsAll, key);
+    this._paintCollapsedRibbon(cats, habitsAll, key);
+  }
+
+  _clearBoardSections() {
+    if (!this._listWrapEl) return;
+    for (const el of [...this._listWrapEl.children]) {
+      if (el === this._listEl) continue;
+      try {
+        el.remove();
+      } catch (_) {}
+    }
+  }
+
+  _paintBoardSections(cats, habitsAll, dayKey) {
+    if (!this._listWrapEl) return;
+    this._clearBoardSections();
+    if (this._listEl) {
+      this._listEl.innerHTML = '';
+      this._listEl.style.display = 'none';
+    }
+    const key = dayKey || this._dayKey;
+    for (const cat of cats) {
+      const habits = habitsAll
+        .filter((h) => this._habitCategoryId(h.name) === cat.id)
+        .sort((a, b) => (a.order || 0) - (b.order || 0));
+      if (!habits.length && !this._manageMode) continue;
+      if (this._isCatCollapsed(cat.id)) continue;
+
+      const sec = document.createElement('div');
+      sec.className = 'ht-category';
+      sec.dataset.catId = cat.id;
+
+      const header = document.createElement('div');
+      header.className = 'ht-category-header';
+      header.setAttribute('role', 'button');
+      header.tabIndex = 0;
+      const caret = document.createElement('span');
+      caret.className = 'ht-category-caret open';
+      caret.innerHTML = '<i class="ti ti-chevron-right" aria-hidden="true"></i>';
+      const cluster = document.createElement('span');
+      cluster.className = 'ht-ch-cluster';
+      const glyph = document.createElement('span');
+      glyph.className = 'ht-ch-glyph';
+      glyph.setAttribute('aria-hidden', 'true');
+      const icon = String(cat.icon || '').trim();
+      if (icon && /^[a-z0-9-]+$/i.test(icon)) {
+        glyph.innerHTML = `<i class="ti ti-${icon}" aria-hidden="true"></i>`;
+      } else {
+        glyph.textContent = '🔥';
+      }
+      const lead = document.createElement('span');
+      lead.className = 'ht-cat-lead';
+      const doneN = habits.filter((h) => h.done && !this._habitMark(key, h.name)).length;
+      if (habits.length && doneN >= habits.length) {
+        lead.innerHTML =
+          '<span class="ht-cat-inline-check ht-cat-inline-check--all-done" title="All habits done today" aria-hidden="true"><i class="ti ti-checks"></i></span>';
+      } else if (doneN > 0) {
+        lead.innerHTML =
+          '<span class="ht-cat-inline-check" aria-hidden="true"><i class="ti ti-check"></i></span>';
+      }
+      const name = document.createElement('span');
+      name.className = 'ht-category-name';
+      name.textContent = String(cat.name || 'Habits').toUpperCase();
+      const streakEl = document.createElement('span');
+      streakEl.className = 'ht-category-streak';
+      const catStreak = this._categoryEffectiveStreak(cat.id, key);
+      if (catStreak > 0) {
+        const c = this._streakTierSolid(Math.min(catStreak, 364));
+        streakEl.innerHTML =
+          '<span style="color:' +
+          c +
+          '"><i class="ti ti-flame" aria-hidden="true"></i><span class="ht-streak-day-count">' +
+          catStreak +
+          'd</span></span>';
+      } else if (habits.length) {
+        streakEl.textContent = doneN + '/' + habits.length;
+      }
+      cluster.append(glyph, lead, name, streakEl);
+      header.append(caret, cluster);
+      const toggle = () => {
+        this._setCatCollapsed(cat.id, !this._isCatCollapsed(cat.id));
+        this._paint();
+      };
+      header.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        toggle();
+      });
+      header.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+
+      const list = document.createElement('div');
+      list.className = 'dawn-habits-list ht-category-habits';
+      for (const h of habits) list.appendChild(this._makeHabitRow(h));
+
+      sec.append(header, list);
+      this._listWrapEl.insertBefore(sec, this._listEl);
+    }
+  }
+
+  _paintCollapsedRibbon(cats, habitsAll, dayKey) {
+    if (!this._ribbonEl) return;
+    this._ribbonEl.replaceChildren();
+    const ribbonCats = (cats || []).filter((c) => {
+      if (this._manageMode) return true;
+      return habitsAll.some((h) => this._habitCategoryId(h.name) === c.id);
+    });
+    const anyCollapsed = ribbonCats.some((c) => this._isCatCollapsed(c.id));
+    if (!ribbonCats.length || !anyCollapsed) {
+      this._ribbonEl.hidden = true;
+      this._ribbonEl.classList.add('ht-hidden');
+      return;
+    }
+    this._ribbonEl.hidden = false;
+    this._ribbonEl.classList.remove('ht-hidden');
+
+    for (const cat of ribbonCats) {
+      const isOpen = !this._isCatCollapsed(cat.id);
+      if (isOpen) {
+        const ph = document.createElement('div');
+        ph.className = 'ht-ribbon-slot ht-ribbon-slot--expanded';
+        ph.dataset.catId = cat.id;
+        ph.setAttribute('role', 'button');
+        ph.tabIndex = 0;
+        ph.setAttribute('aria-label', 'Collapse ' + (cat.name || 'category'));
+        ph.title = 'Collapse “' + (cat.name || 'category') + '”';
+        const collapseThis = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._setCatCollapsed(cat.id, true);
+          this._paint();
+        };
+        ph.addEventListener('click', collapseThis);
+        ph.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter' || ev.key === ' ') collapseThis(ev);
+        });
+        this._ribbonEl.appendChild(ph);
+        continue;
+      }
+
+      const habits = habitsAll.filter((h) => this._habitCategoryId(h.name) === cat.id);
+      const status = this._categoryDayAggStatus(habits, dayKey);
+      const marked = this._categoryAllMarked(habits, dayKey);
+      const chipStreak = this._categoryEffectiveStreak(cat.id, dayKey);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ht-ribbon-sec';
+      btn.dataset.catId = cat.id;
+      btn.innerHTML =
+        '<span class="ht-ribbon-sec-inner">' +
+        this._ribbonLeadCellHtml(status, marked) +
+        '<span class="ht-ribbon-sec-glyph">' +
+        this._categoryGlyphHtml(cat) +
+        '</span>' +
+        '<span class="ht-ribbon-sec-tail">' +
+        (chipStreak > 0 ? this._ribbonStreakHtml(chipStreak) : '') +
+        '</span></span>';
+      const dayHint =
+        status === 'all_done'
+          ? ' · all done today'
+          : status === 'partial'
+            ? ' · in progress'
+            : status === 'na'
+              ? ' · N/A today'
+              : status === 'fail'
+                ? ' · missed today'
+                : '';
+      btn.title =
+        (cat.name || 'category') +
+        dayHint +
+        (chipStreak > 0 ? ' · ' + chipStreak + 'd streak' : '') +
+        ' — tap to expand';
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._setCatCollapsed(cat.id, false);
+        this._paint();
+      });
+      this._ribbonEl.appendChild(btn);
+    }
+  }
+
+  _categoryDayAggStatus(habits, dayKey) {
+    const list = habits || [];
+    if (!list.length) return 'na';
+    const rows = list.map((h) => {
+      const mark = this._habitMark(dayKey, h.name);
+      return {
+        done: !!(h.done && !mark),
+        na: mark === 'na',
+        fail: mark === 'fail',
+      };
+    });
+    if (rows.every((r) => r.na)) return 'na';
+    if (rows.every((r) => r.done)) return 'all_done';
+    if (rows.some((r) => r.done)) return 'partial';
+    const nonNa = rows.filter((r) => !r.na);
+    if (nonNa.length && nonNa.every((r) => r.fail)) return 'fail';
+    return 'none';
+  }
+
+  _categoryAllMarked(habits, dayKey) {
+    const list = habits || [];
+    if (!list.length) return true;
+    return list.every((h) => !!(h.done || this._habitMark(dayKey, h.name)));
+  }
+
+  _ribbonLeadCellHtml(status, marked) {
+    let inner = '';
+    if (status === 'all_done') {
+      inner =
+        '<span class="ht-cat-inline-check ht-cat-inline-check--all-done" title="All habits in this category done today" aria-hidden="true"><i class="ti ti-checks"></i></span>';
+    } else if (status === 'partial') {
+      inner =
+        '<span class="ht-cat-inline-check" aria-hidden="true"><i class="ti ti-check"></i></span>';
+    } else if (status === 'na') {
+      inner = '<span class="ht-cat-inline-na ht-cat-na-bar" aria-hidden="true"></span>';
+    } else if (status === 'fail') {
+      inner =
+        '<span class="ht-cat-inline-fail ht-habit-mark ht-habit-mark-fail" aria-hidden="true">×</span>';
+    }
+    const dot = marked
+      ? '<span class="ht-ribbon-marked-dot" aria-hidden="true"><span class="ht-cat-marked-dot"></span></span>'
+      : '';
+    return '<span class="ht-ribbon-sec-lead">' + inner + dot + '</span>';
+  }
+
+  _ribbonStreakHtml(streakDays) {
+    const d = Math.max(0, Math.floor(Number(streakDays) || 0));
+    if (d <= 0) return '';
+    const c = this._streakTierSolid(Math.min(d, 364));
+    return (
+      '<span class="ht-ribbon-sec-streak" style="color:' +
+      c +
+      '"><i class="ti ti-flame" aria-hidden="true"></i><span class="ht-streak-day-count">' +
+      d +
+      'd</span></span>'
+    );
+  }
+
+  _categoryGlyphHtml(cat) {
+    const raw = String(cat?.icon || cat?.emoji || '').trim();
+    if (raw && /^[a-z][a-z0-9-]*$/i.test(raw) && raw.length < 48) {
+      return '<i class="ti ti-' + raw + '" aria-hidden="true"></i>';
+    }
+    if (raw) {
+      const esc = raw
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return '<span class="ht-emoji-inline">' + esc + '</span>';
+    }
+    return '<i class="ti ti-folder" aria-hidden="true"></i>';
+  }
+
+  _paintStatsView(dayKey) {
+    if (!this._statsViewEl) return;
+    const range = this._statsRange === 30 ? 30 : 7;
+    this._scheduleHydrateRange(dayKey, range);
+    this._statsViewEl.innerHTML = '';
+
+    const rangeRow = document.createElement('div');
+    rangeRow.className = 'ht-stats-range';
+    for (const [label, days] of [
+      ['7d', 7],
+      ['30d', 30],
+    ]) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ht-range-btn' + (range === days ? ' active' : '');
+      btn.textContent = label;
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._statsRange = days;
+        this._saveUiPrefs();
+        this._paintStatsView(this._dayKey);
+      });
+      rangeRow.appendChild(btn);
+    }
+    this._statsViewEl.appendChild(rangeRow);
+
+    const habitNames = this._collectHabitNames(dayKey, Math.max(range, 30));
+    let selected = this._statsSelected || 'overall';
+    if (selected.startsWith('habit:')) {
+      const want = selected.slice(6).toLowerCase();
+      const hit = habitNames.find((n) => n.toLowerCase() === want);
+      if (!hit) selected = 'overall';
+      else selected = 'habit:' + hit;
+    }
+    this._statsSelected = selected;
+
+    const sel = document.createElement('select');
+    sel.className = 'ht-stats-select';
+    const optOverall = document.createElement('option');
+    optOverall.value = 'overall';
+    optOverall.textContent = 'Overall';
+    sel.appendChild(optOverall);
+    for (const n of habitNames) {
+      const o = document.createElement('option');
+      o.value = 'habit:' + n;
+      o.textContent = n;
+      sel.appendChild(o);
+    }
+    sel.value = selected;
+    sel.addEventListener('change', () => {
+      this._statsSelected = sel.value || 'overall';
+      this._saveUiPrefs();
+      this._paintStatsView(this._dayKey);
+    });
+    this._statsViewEl.appendChild(sel);
+
+    const cards = document.createElement('div');
+    cards.className = 'ht-stat-cards';
+    const mk = (label, value, unit, klass) => {
+      const card = document.createElement('div');
+      card.className = 'ht-stat-card' + (klass ? ' ' + klass : '');
+      card.innerHTML =
+        '<div class="ht-stat-label"></div><div class="ht-stat-value"></div><div class="ht-stat-unit"></div>';
+      card.querySelector('.ht-stat-label').textContent = label;
+      card.querySelector('.ht-stat-value').textContent = String(value);
+      card.querySelector('.ht-stat-unit').textContent = unit || '';
+      return card;
+    };
+
+    const isHabit = selected.startsWith('habit:');
+    const habitName = isHabit ? selected.slice(6) : '';
+    if (isHabit) {
+      const hs = this._habitRangeStats(habitName, dayKey, range);
+      cards.appendChild(mk('Streak', hs.streak, 'days', hs.streak ? 'fire' : ''));
+      cards.appendChild(mk('Best', hs.best, 'days'));
+      cards.appendChild(mk('Rate', hs.rate + '%', hs.daysDone + '/' + hs.daysWith, 'accent'));
+    } else {
+      const stats = this._overallStats(dayKey, range);
+      cards.appendChild(mk('Done', stats.checks, 'checks'));
+      cards.appendChild(mk('Rate', stats.rate + '%', 'of logged', 'accent'));
+      cards.appendChild(mk('Days', stats.daysWithLog, 'with logs'));
+    }
+    this._statsViewEl.appendChild(cards);
+
+    const calSection = document.createElement('div');
+    calSection.className = 'ht-stats-section';
+    calSection.innerHTML = '<div class="ht-stats-section-title">Completion Calendar</div>';
+    if (range === 7) {
+      calSection.appendChild(this._buildCalStrip(dayKey, habitName || null));
+    } else {
+      calSection.appendChild(this._buildCalMonth(dayKey, habitName || null));
+    }
+    this._statsViewEl.appendChild(calSection);
+
+    const chartSection = this._buildDailyProgressChart(dayKey, range, habitName || null);
+    if (chartSection) this._statsViewEl.appendChild(chartSection);
+
+    const hint = document.createElement('div');
+    hint.className = 'ht-stats-hint';
+    hint.textContent =
+      'From idle Habit Logs index + expand hydrate (' +
+      range +
+      'd). Click calendar cells to toggle. Fail/NA + multi-cat need habit-tracker config.';
+    this._statsViewEl.appendChild(hint);
+  }
+
+  _buildDailyProgressChart(dayKey, rangeDays, habitName) {
+    const section = document.createElement('div');
+    section.className = 'ht-stats-section';
+    section.innerHTML = '<div class="ht-stats-section-title">Daily Progress</div>';
+
+    const dates = [];
+    for (let i = rangeDays - 1; i >= 0; i--) {
+      const d = this._shiftDay(dayKey, -i);
+      if (d) dates.push(d);
+    }
+    if (!dates.length) return null;
+
+    const vals = dates.map((d) => {
+      if (habitName) {
+        const st = this._habitDayState(habitName, d);
+        return { val: st.done ? 1 : 0, done: st.done, seen: st.seen };
+      }
+      let slots = 0;
+      let done = 0;
+      for (const e of this._dayEntries(d)) {
+        for (const h of e?.habits || []) {
+          slots += 1;
+          if (h.done) done += 1;
+        }
+      }
+      return {
+        val: done,
+        done: slots > 0 && done >= slots,
+        seen: slots > 0,
+      };
+    });
+
+    const maxVal = Math.max(1, ...vals.map((v) => v.val || 0));
+    let target = 1;
+    if (!habitName) {
+      // Target = max habit slots seen in window (or current day).
+      let maxSlots = 0;
+      for (const d of dates) {
+        let slots = 0;
+        for (const e of this._dayEntries(d)) slots += (e?.habits || []).length;
+        if (slots > maxSlots) maxSlots = slots;
+      }
+      target = Math.max(1, maxSlots);
+    }
+
+    const chartEl = document.createElement('div');
+    chartEl.className = 'ht-barchart';
+    if (target > 0 && maxVal > 0) {
+      const targetPct = Math.min(100, (target / Math.max(maxVal, target)) * 100);
+      const line = document.createElement('div');
+      line.className = 'ht-target-line';
+      line.style.bottom = targetPct + '%';
+      const tLabel = document.createElement('div');
+      tLabel.className = 'ht-target-label';
+      tLabel.style.bottom = targetPct + '%';
+      tLabel.textContent = String(target);
+      chartEl.append(line, tLabel);
+    }
+
+    const labelsEl = document.createElement('div');
+    labelsEl.className = 'ht-barchart-labels';
+    const labelInterval = Math.max(1, Math.ceil(dates.length / 6));
+    dates.forEach((d, i) => {
+      const v = vals[i];
+      const wrap = document.createElement('div');
+      wrap.className = 'ht-bar-wrap';
+      const bar = document.createElement('div');
+      bar.className = 'ht-bar' + (v?.done ? ' done' : '');
+      const heightPct = v?.val
+        ? Math.max(2, Math.round((v.val / Math.max(maxVal, target)) * 100))
+        : 0;
+      bar.style.height = heightPct + '%';
+      wrap.appendChild(bar);
+      if (v?.val > 0) {
+        const tip = document.createElement('div');
+        tip.className = 'ht-bar-tooltip';
+        tip.textContent = String(v.val);
+        wrap.appendChild(tip);
+      }
+      chartEl.appendChild(wrap);
+      const lblWrap = document.createElement('div');
+      lblWrap.className = 'ht-bar-label-wrap';
+      if (i % labelInterval === 0) {
+        const lbl = document.createElement('div');
+        lbl.className = 'ht-bar-label';
+        lbl.textContent = String(new Date(d + 'T12:00:00').getDate());
+        lblWrap.appendChild(lbl);
+      }
+      labelsEl.appendChild(lblWrap);
+    });
+
+    const wrap = document.createElement('div');
+    wrap.className = 'ht-barchart-wrap';
+    wrap.append(chartEl, labelsEl);
+    section.appendChild(wrap);
+    return section;
+  }
+
+  _findHabitOnDay(habitName, dayKey) {
+    const name = String(habitName || '').trim().toLowerCase();
+    if (!name || !dayKey) return null;
+    for (const e of this._dayEntries(dayKey)) {
+      for (const h of e?.habits || []) {
+        if (String(h.name || '').trim().toLowerCase() !== name) continue;
+        return {
+          name: h.name,
+          done: !!h.done,
+          itemGuid: h.itemGuid || '',
+          logGuid: e.guid || h.logGuid || '',
+        };
+      }
+    }
+    return null;
+  }
+
+  async _toggleStatsDay(dateStr, habitName) {
+    if (!dateStr || dateStr > this._todayKey()) return;
+    await this._hydrateDay(dateStr);
+    if (habitName) {
+      const h = this._findHabitOnDay(habitName, dateStr);
+      if (!h?.logGuid) return;
+      await this._toggleHabit(h, dateStr);
+      return;
+    }
+    // Overall: if any incomplete → mark all done; else mark all undone.
+    const habits = [];
+    for (const e of this._dayEntries(dateStr)) {
+      for (const h of e?.habits || []) {
+        habits.push({
+          name: h.name,
+          done: !!h.done,
+          itemGuid: h.itemGuid || '',
+          logGuid: e.guid || h.logGuid || '',
+        });
+      }
+    }
+    if (!habits.length) return;
+    const allDone = habits.every((h) => h.done);
+    for (const h of habits) {
+      if (allDone ? h.done : !h.done) {
+        await this._toggleHabit(h, dateStr);
       }
     }
   }
 
-  // Long-press: show inline number input
-  async _showNumericInput(habitEl, habit, catId, log, dateStr, state) {
-    // Don't stack inputs
-    if (habitEl.querySelector('.ht-num-input')) return;
-    const nameEl = habitEl.querySelector('.ht-habit-name');
+  _todayKey() {
+    const t = new Date();
+    return (
+      t.getFullYear() +
+      '-' +
+      String(t.getMonth() + 1).padStart(2, '0') +
+      '-' +
+      String(t.getDate()).padStart(2, '0')
+    );
+  }
+
+  _buildCalStrip(dayKey, habitName) {
+    const strip = document.createElement('div');
+    strip.className = 'ht-cal-strip';
+    const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const today = this._todayKey();
+    for (let i = 6; i >= 0; i--) {
+      const d = this._shiftDay(dayKey, -i);
+      if (!d) continue;
+      const dt = new Date(d + 'T12:00:00');
+      const isToday = d === today;
+      const col = document.createElement('div');
+      col.className = 'ht-cal-strip-col' + (isToday ? ' today' : '');
+      const dayName = document.createElement('div');
+      dayName.className = 'ht-cal-strip-dow';
+      dayName.textContent = DOW[dt.getDay()];
+      const circle = document.createElement('div');
+      let cls = 'ht-cal-strip-circle';
+      if (habitName) {
+        const st = this._habitDayState(habitName, d);
+        if (st.done) cls += ' done';
+        else if (st.seen) cls += ' partial';
+      } else {
+        const ov = this._overallDayDone(d);
+        if (ov.done) cls += ' done';
+        else if (ov.partial) cls += ' partial';
+      }
+      circle.className = cls;
+      circle.title = d + ' — click to toggle';
+      circle.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        void this._toggleStatsDay(d, habitName || null);
+      });
+      const dateNum = document.createElement('div');
+      dateNum.className = 'ht-cal-strip-date';
+      dateNum.textContent = String(dt.getDate());
+      col.append(dayName, circle, dateNum);
+      strip.appendChild(col);
+    }
+    return strip;
+  }
+
+  _buildCalMonth(dayKey, habitName) {
+    const wrap = document.createElement('div');
+    wrap.className = 'ht-cal-month-view';
+    const anchor = new Date((dayKey || this._todayKey()) + 'T12:00:00');
+    if (!this._statsCalMonth) {
+      this._statsCalMonth = { y: anchor.getFullYear(), m: anchor.getMonth() };
+    }
+    let { y: year, m: month } = this._statsCalMonth;
+    const today = this._todayKey();
+
+    const nav = document.createElement('div');
+    nav.className = 'ht-cal-month-nav';
+    const prevMo = document.createElement('button');
+    prevMo.type = 'button';
+    prevMo.className = 'ht-cal-nav-btn';
+    prevMo.innerHTML = '<i class="ti ti-chevron-left" aria-hidden="true"></i>';
+    const monthTitle = document.createElement('span');
+    monthTitle.className = 'ht-cal-month-title';
+    monthTitle.textContent = new Date(year, month, 1).toLocaleDateString('en-US', {
+      month: 'long',
+      year: 'numeric',
+    });
+    const nextMo = document.createElement('button');
+    nextMo.type = 'button';
+    nextMo.className = 'ht-cal-nav-btn';
+    nextMo.innerHTML = '<i class="ti ti-chevron-right" aria-hidden="true"></i>';
+    prevMo.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      month -= 1;
+      if (month < 0) {
+        month = 11;
+        year -= 1;
+      }
+      this._statsCalMonth = { y: year, m: month };
+      this._paintStatsView(this._dayKey);
+    });
+    nextMo.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      month += 1;
+      if (month > 11) {
+        month = 0;
+        year += 1;
+      }
+      this._statsCalMonth = { y: year, m: month };
+      this._paintStatsView(this._dayKey);
+    });
+    nav.append(prevMo, monthTitle, nextMo);
+    wrap.appendChild(nav);
+
+    const dowRow = document.createElement('div');
+    dowRow.className = 'ht-cal-dow-row';
+    for (const d of ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']) {
+      const h = document.createElement('div');
+      h.className = 'ht-cal-dow-header';
+      h.textContent = d;
+      dowRow.appendChild(h);
+    }
+    wrap.appendChild(dowRow);
+
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const startDow = firstDay.getDay();
+    const grid = document.createElement('div');
+    grid.className = 'ht-cal-grid';
+    for (let p = 0; p < startDow; p++) {
+      const empty = document.createElement('div');
+      empty.className = 'ht-cal-day empty';
+      grid.appendChild(empty);
+    }
+    for (let day = 1; day <= lastDay.getDate(); day++) {
+      const dateStr =
+        year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+      const cell = document.createElement('div');
+      let cls = 'ht-cal-day';
+      if (dateStr === today) cls += ' today';
+      if (dateStr > today) cls += ' out-of-range';
+      if (habitName) {
+        const st = this._habitDayState(habitName, dateStr);
+        if (st.done) cls += ' done';
+        else if (st.seen) cls += ' partial';
+      } else {
+        const ov = this._overallDayDone(dateStr);
+        if (ov.done) cls += ' done';
+        else if (ov.partial) cls += ' partial';
+      }
+      cell.className = cls;
+      cell.title = dateStr + (dateStr <= today ? ' — click to toggle' : '');
+      if (dateStr <= today) {
+        cell.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          void this._toggleStatsDay(dateStr, habitName || null);
+        });
+      }
+      const num = document.createElement('div');
+      num.className = 'ht-cal-day-num';
+      num.textContent = String(day);
+      const dot = document.createElement('div');
+      dot.className = 'ht-cal-day-dot';
+      cell.append(num, dot);
+      grid.appendChild(cell);
+    }
+    wrap.appendChild(grid);
+    // Hydrate visible month days that have index entries (onDemand, not nav).
+    const monthKeys = [];
+    for (let day = 1; day <= lastDay.getDate(); day++) {
+      const dateStr =
+        year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+      if (this._needsHydrate(dateStr)) monthKeys.push(dateStr);
+    }
+    if (monthKeys.length) {
+      const boot = globalThis.BootKernel || globalThis.__dawnBoot;
+      const run = async () => {
+        for (const k of monthKeys.slice(0, 40)) {
+          await this._hydrateDay(k);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      };
+      if (boot?.enqueue) {
+        boot.enqueue(() => run(), {
+          id: 'habits:hydrate-month-' + year + '-' + month,
+          tier: 'onDemand',
+        });
+      } else void run();
+    }
+    return wrap;
+  }
+
+  _tip(text) {
+    this._clearBoardSections();
+    if (!this._listEl) return;
+    this._listEl.style.display = '';
+    this._listEl.innerHTML = '';
+    const tip = document.createElement('div');
+    tip.className = 'dawn-habits-empty';
+    tip.textContent = text;
+    this._listEl.appendChild(tip);
+  }
+
+  _makeOpenLogRow(logGuid) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'ht-habit';
+    row.innerHTML =
+      '<div class="ht-habit-top"><span class="ht-habit-name">Open habit log</span></div>';
+    row.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+    });
+    row.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._openLog(logGuid);
+    });
+    return row;
+  }
+
+  _makeHabitRow(h) {
+    // Prod-like orbit + minimal ti-check; meta 30d·7d from idle index; chevron → per-habit stats.
+    // Boolean: empty → done → fail → N/A → clear. Numeric: tap +1 to target, then reset; long-press edits count.
+    const cfg = this._habitCfg(h.name);
+    const numeric = cfg.type === 'number';
+    const target = numeric ? Math.max(1, Number(cfg.target) || 8) : 0;
+    const val = numeric ? this._habitValue(this._dayKey, h.name) : 0;
+    const mark = this._habitMark(this._dayKey, h.name);
+    const numDone = numeric && !mark && val >= target;
+    const row = document.createElement('div');
+    row.className =
+      'ht-habit' +
+      (mark === 'fail' ? ' ht-fail' : mark === 'na' ? ' ht-na' : h.done || numDone ? ' ht-done' : '');
+    row.title = numeric
+      ? mark
+        ? 'Click to clear mark'
+        : 'Tap to count · long-press to enter a number'
+      : mark === 'fail'
+        ? 'Failed — click for N/A'
+        : mark === 'na'
+          ? 'N/A — click to clear'
+          : h.done
+            ? 'Done — click to mark fail'
+            : 'Click to mark done';
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+
+    const top = document.createElement('div');
+    top.className = 'ht-habit-top';
+
+    const orbit = document.createElement('div');
+    orbit.className = 'ht-habit-orbit';
+    const check = document.createElement('span');
+    check.className = 'ht-habit-check-minimal';
+    const glyph = document.createElement('span');
+    if (numeric && !mark) {
+      glyph.className = 'ht-habit-num';
+      glyph.innerHTML =
+        String(val) + '<span class="ht-num-tgt">/' + target + '</span>';
+    } else {
+      const showSolid = !!mark || !!h.done;
+      glyph.className = 'ht-check-glyph' + (showSolid ? '' : ' ht-check-faint');
+      const icon =
+        mark === 'fail' ? 'ti-x' : mark === 'na' ? 'ti-minus' : 'ti-check';
+      glyph.innerHTML = '<i class="ti ' + icon + '" aria-hidden="true"></i>';
+    }
+    check.appendChild(glyph);
+    orbit.appendChild(check);
+
+    const nameCol = document.createElement('div');
+    nameCol.className = 'ht-habit-name-col';
+    const name = document.createElement('div');
+    name.className = 'ht-habit-line-name ht-habit-name';
+    name.textContent = h.name;
+    nameCol.appendChild(name);
+
+    const meta = document.createElement('div');
+    meta.className = 'ht-habit-line-meta';
+    const cluster = document.createElement('div');
+    cluster.className = 'ht-habit-streak-cluster';
+    const streakDays = this._habitConsecutiveStreak(h.name, this._dayKey);
+    if (streakDays > 0) {
+      const core = document.createElement('span');
+      core.innerHTML = this._streakCoreHtml(streakDays);
+      if (core.firstChild) cluster.appendChild(core.firstChild);
+    }
+    const rolls = this._habitRollCounts(h.name, this._dayKey);
+    const counts = document.createElement('span');
+    counts.className = 'ht-habit-stat-counts';
+    counts.innerHTML =
+      '<span class="ht-roll-num">' +
+      rolls.d30 +
+      '</span><span class="ht-roll-suffix">30d</span>' +
+      '<span class="ht-roll-sep">·</span>' +
+      '<span class="ht-roll-num">' +
+      rolls.d7 +
+      '</span><span class="ht-roll-suffix">7d</span>';
+    cluster.appendChild(counts);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'ht-habit-stats-link';
+    open.title = 'View habit stats (Shift-click: open log)';
+    open.setAttribute('aria-label', 'View habit stats');
+    open.innerHTML = '<i class="ti ti-chevron-right" aria-hidden="true"></i>';
+    open.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ev.shiftKey) {
+        void this._openLog(h.logGuid, h.itemGuid);
+        return;
+      }
+      this._enterHabitStats(h.name);
+    });
+    meta.appendChild(cluster);
+    meta.appendChild(open);
+    nameCol.appendChild(meta);
+
+    top.appendChild(orbit);
+    top.appendChild(nameCol);
+    row.appendChild(top);
+
+    const onToggle = (ev) => {
+      if (ev.target?.closest?.('.ht-habit-stats-link')) return;
+      if (row.querySelector?.('.ht-num-input')) return;
+      if (row._dawnLongPress) {
+        row._dawnLongPress = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (numeric) void this._tapNumericHabit(h, target);
+      else void this._toggleHabit(h);
+    };
+    let pressTimer = null;
+    let pressX = 0;
+    let pressY = 0;
+    const clearPress = () => {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    };
+    row.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return;
+      if (ev.target?.closest?.('.ht-habit-stats-link, .ht-num-input, .ht-num-btn')) return;
+      row._dawnLongPress = false;
+      pressX = ev.clientX;
+      pressY = ev.clientY;
+      clearPress();
+      if (!numeric) return;
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        row._dawnLongPress = true;
+        this._showNumericInput(row, h, target);
+      }, HABITS_LONG_PRESS_MS);
+    });
+    row.addEventListener('pointermove', (ev) => {
+      if (!pressTimer) return;
+      const thresh = ev.pointerType === 'touch' ? 12 : 8;
+      if (Math.abs(ev.clientX - pressX) > thresh || Math.abs(ev.clientY - pressY) > thresh) {
+        clearPress();
+      }
+    });
+    row.addEventListener('pointerup', clearPress);
+    row.addEventListener('pointercancel', clearPress);
+    row.addEventListener('click', onToggle);
+    row.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        if (numeric) void this._tapNumericHabit(h, target);
+        else void this._toggleHabit(h);
+      }
+    });
+    return row;
+  }
+
+  _workspaceGuid() {
+    try {
+      if (typeof this.getWorkspaceGuid === 'function') return this.getWorkspaceGuid();
+    } catch (_) {}
+    try {
+      return this.workspace?.guid || this.workspace?.getGuid?.() || null;
+    } catch (_) {}
+    return null;
+  }
+
+  async _openLog(logGuid, itemGuid) {
+    if (!logGuid) {
+      console.warn('[Dawn/Habits] openLog: no guid');
+      return;
+    }
+    const ws = this._workspaceGuid();
+    try {
+      // Do NOT createPanel() — that opens an empty "Custom Panel" in Thymer.
+      const panel = this.ui.getActivePanel?.();
+      if (!panel?.navigateTo) {
+        console.warn('[Dawn/Habits] openLog: panel.navigateTo missing');
+        return;
+      }
+
+      // Open the habit log document in this panel (back arrow returns to journal).
+      panel.navigateTo({
+        type: 'edit_panel',
+        rootId: logGuid,
+        subId: itemGuid || logGuid,
+        workspaceGuid: ws,
+      });
+    } catch (e) {
+      console.warn('[Dawn/Habits] openLog', e);
+    }
+  }
+
+  _writeHabitDone(h, done, dayKey) {
+    h.done = !!done;
+    const key = dayKey || this._dayKey;
+    // Persist into index entry (paint uses shallow copies).
+    const entries = this._dayEntries(key);
+    let found = false;
+    for (const e of entries) {
+      if (!Array.isArray(e.habits)) continue;
+      for (const x of e.habits) {
+        const same =
+          (h.id && x.id && String(h.id) === String(x.id)) ||
+          (h.itemGuid && x.itemGuid === h.itemGuid) ||
+          (!h.itemGuid && x.name === h.name);
+        if (same) {
+          x.done = !!done;
+          found = true;
+        }
+      }
+    }
+    if (!found && entries[0]) {
+      if (!Array.isArray(entries[0].habits)) entries[0].habits = [];
+      entries[0].habits.push({
+        id: h.id || this._habitIdOf(h),
+        name: h.name,
+        done: !!done,
+        itemGuid: h.itemGuid || '',
+      });
+    }
+    this._saveIndexToStorage();
+  }
+
+  async _setTaskDoneSdk(h, nextDone) {
+    if (h) h.done = !!nextDone;
+    const jsonOk = await this._persistLogHabit(h, this._dayKey);
+    if (jsonOk) return true;
+    if (!h?.logGuid) return false;
+    try {
+      const rec = await this.data.getRecord?.(h.logGuid);
+      if (!rec) {
+        console.warn('[Dawn/Habits] toggle: record missing', h.logGuid);
+        return false;
+      }
+      let items = [];
+      try {
+        items = (await rec.getLineItems?.(true)) || (await rec.getLineItems?.()) || [];
+      } catch (e) {
+        console.warn('[Dawn/Habits] toggle getLineItems', e);
+      }
+      let li = null;
+      for (const it of items) {
+        const g = it.guid || it.getGuid?.();
+        if (h.itemGuid && g === h.itemGuid) {
+          li = it;
+          break;
+        }
+      }
+      if (!li && h.name) {
+        for (const it of items) {
+          if (this._linePlain(it) === h.name) {
+            li = it;
+            break;
+          }
+        }
+      }
+      if (!li?.setTaskStatus) {
+        console.warn('[Dawn/Habits] toggle: line item not found', h);
+        return false;
+      }
+      await li.setTaskStatus(nextDone ? 'done' : 'none');
+      if (!h.itemGuid) {
+        try {
+          h.itemGuid = li.guid || li.getGuid?.() || h.itemGuid;
+        } catch (_) {}
+      }
+      return true;
+    } catch (e) {
+      console.warn('[Dawn/Habits] toggle fail', e);
+      return false;
+    }
+  }
+
+  async _applyNumericDone(h, nextDone, dayKey) {
+    const key = dayKey || this._dayKey;
+    this._setHabitMark(key, h.name, null);
+    this._writeHabitDone(h, nextDone, key);
+    this._paint();
+    await this._setTaskDoneSdk(h, nextDone);
+    if (nextDone) this._afterDaySave(key);
+  }
+
+  async _tapNumericHabit(h, target) {
+    const key = this._dayKey;
+    const mark = this._habitMark(key, h.name);
+    if (mark) {
+      this._setHabitMark(key, h.name, null);
+      this._paint();
+      await this._persistLogHabit(h, key);
+      return;
+    }
+    const tgt = Math.max(1, Number(target) || 8);
+    let v = this._habitValue(key, h.name);
+    if (v >= tgt) v = 0;
+    else v += 1;
+    this._setHabitValue(key, h.name, v);
+    await this._applyNumericDone(h, v >= tgt, key);
+  }
+
+  _htResolveNumericInput(raw, baseVal, max = 9999) {
+    const s = String(raw ?? '').trim().replace(/\s+/g, '');
+    const clamp = (n) => {
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(max, Math.round(n)));
+    };
+    const base = clamp(Number(baseVal));
+    if (!s) return 0;
+    const rel = s.match(/^([+\-*\/])(\d+(?:\.\d+)?)$/);
+    if (rel) {
+      const n = parseFloat(rel[2]);
+      if (!Number.isFinite(n)) return base;
+      let out = base;
+      if (rel[1] === '+') out = base + n;
+      else if (rel[1] === '-') out = base - n;
+      else if (rel[1] === '*') out = base * n;
+      else out = n === 0 ? base : base / n;
+      return clamp(out);
+    }
+    return clamp(parseFloat(s));
+  }
+
+  _showNumericInput(habitEl, h, target) {
+    if (!habitEl || habitEl.querySelector?.('.ht-num-input')) return;
+    const nameEl = habitEl.querySelector('.ht-habit-name, .htq-habit-name');
     if (!nameEl) return;
-
-    // Reload fresh log
-    const freshLog = await this._loadLog(dateStr);
-    log = freshLog;
-
-    const currentVal = typeof log.completions[habit.id] === 'number'
-      ? log.completions[habit.id] : 0;
-
+    const key = this._dayKey;
+    const tgt = Math.max(1, Number(target) || 8);
+    const cur = this._habitValue(key, h.name);
     const wrap = document.createElement('span');
     wrap.style.cssText = 'display:inline-flex;align-items:center;gap:3px;margin-left:6px;';
-
-    const input = document.createElement('input');
-    input.type = 'number';
-    input.className = 'ht-num-input';
-    input.value = currentVal;
-    input.min = 0;
-    input.max = 9999;
-
-    const okBtn = document.createElement('button');
-    okBtn.className = 'ht-num-btn';
-    okBtn.innerHTML = htIcon('check');
-    okBtn.style.background = 'rgba(76,175,80,0.2)';
-    okBtn.style.borderColor = '#4caf50';
-    okBtn.style.color = '#4caf50';
-
-    const commit = async () => {
-      wrap.remove();
-      const newVal = Math.max(0, parseInt(input.value) || 0);
-      if (newVal === 0) delete log.completions[habit.id];
-      else log.completions[habit.id] = newVal;
-
-      const wasDone = newVal >= habit.target;
-      if (wasDone) this._celebrate(habitEl);
-
-      this._htRecomputeCategoryDone(log, this._config, dateStr);
-
-      await this._saveLog(dateStr, log);
-      await this._patchHabitEl(habitEl, habit, log, dateStr, catId, state);
+    let outside = null;
+    const close = () => {
+      try { wrap.remove(); } catch (_) {}
+      if (outside) {
+        try { document.removeEventListener('pointerdown', outside, true); } catch (_) {}
+        outside = null;
+      }
     };
 
-    const commitSpecial = async (sym) => {
-      wrap.remove();
-      const fresh = await this._loadLog(dateStr);
-      fresh.completions[habit.id] = sym;
-      this._htRecomputeCategoryDone(fresh, this._config, dateStr);
-      await this._saveLog(dateStr, fresh);
-      await this._patchHabitEl(habitEl, habit, fresh, dateStr, catId, state);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.inputMode = 'decimal';
+    input.className = 'ht-num-input';
+    input.value = String(cur);
+    input.title = 'Enter a number, or +6 / *2 from the current count';
+
+    const okBtn = document.createElement('button');
+    okBtn.type = 'button';
+    okBtn.className = 'ht-num-btn';
+    okBtn.innerHTML = '<i class="ti ti-check" aria-hidden="true"></i>';
+    okBtn.style.cssText = 'background:rgba(76,175,80,0.2);border-color:#4caf50;color:#4caf50;';
+
+    const commit = () => {
+      close();
+      const v = this._htResolveNumericInput(input.value, cur);
+      this._setHabitMark(key, h.name, null);
+      this._setHabitValue(key, h.name, v);
+      void this._applyNumericDone(h, v >= tgt, key);
+    };
+    const commitSpecial = (mark) => {
+      close();
+      this._setHabitValue(key, h.name, 0);
+      this._writeHabitDone?.(h, false, key);
+      h.done = false;
+      this._setHabitMark(key, h.name, mark);
+      this._paint();
+      void this._persistLogHabit(h, key);
     };
 
     const failBtn = document.createElement('button');
@@ -9802,1933 +5007,1078 @@ class Plugin extends AppPlugin {
     naBtn.setAttribute('aria-label', 'Not applicable');
     naBtn.innerHTML = '<span class="ht-cat-na-bar"></span>';
 
-    okBtn.addEventListener('click', (e) => { e.stopPropagation(); commit(); });
-    failBtn.addEventListener('click', (e) => { e.stopPropagation(); commitSpecial(HT_COMP_FAIL); });
-    naBtn.addEventListener('click', (e) => { e.stopPropagation(); commitSpecial(HT_COMP_NA); });
+    okBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); commit(); });
+    failBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); commitSpecial('fail'); });
+    naBtn.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); commitSpecial('na'); });
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') commit();
-      if (e.key === 'Escape') wrap.remove();
       e.stopPropagation();
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { e.preventDefault(); close(); }
     });
     input.addEventListener('click', (e) => e.stopPropagation());
+    input.addEventListener('pointerdown', (e) => e.stopPropagation());
+    wrap.addEventListener('pointerdown', (e) => e.stopPropagation());
+    wrap.addEventListener('click', (e) => e.stopPropagation());
 
     wrap.appendChild(input);
     wrap.appendChild(okBtn);
     wrap.appendChild(failBtn);
     wrap.appendChild(naBtn);
     nameEl.appendChild(wrap);
-    input.focus();
-    input.select();
+    setTimeout(() => { try { input.focus(); input.select(); } catch (_) {} }, 10);
+    outside = (e) => {
+      if (!wrap.contains(e.target)) close();
+    };
+    setTimeout(() => document.addEventListener('pointerdown', outside, true), 50);
   }
 
-  // Celebration burst animation on the habit element
-  _celebrate(el) {
-    if (!el) return;
-    el.classList.remove('ht-celebrating');
-    void el.offsetWidth; // reflow to restart animation
-    el.classList.add('ht-celebrating');
-
-    // Spawn particle dots
-    const colors = ['#4caf50','#8bc34a','#c6ff00','#ffeb3b','#ff9800'];
-    const rect = el.getBoundingClientRect();
-    const parentRect = el.offsetParent?.getBoundingClientRect() || rect;
-
-    for (let i = 0; i < 7; i++) {
-      const p = document.createElement('div');
-      p.className = 'ht-particle';
-      const angle = (i / 7) * 2 * Math.PI;
-      const dist = 18 + Math.random() * 12;
-      p.style.setProperty('--tx', `${Math.cos(angle) * dist}px`);
-      p.style.setProperty('--ty', `${Math.sin(angle) * dist}px`);
-      p.style.background = colors[i % colors.length];
-      p.style.left = `${rect.left - parentRect.left + rect.width / 2 - 2.5}px`;
-      p.style.top = `${rect.top - parentRect.top + rect.height / 2 - 2.5}px`;
-      el.offsetParent?.appendChild(p);
-      setTimeout(() => p.remove(), 520);
+  async _toggleHabit(h, dayKey) {
+    const key = dayKey || this._dayKey;
+    const mark = this._habitMark(key, h.name);
+    if (!h?.logGuid) {
+      const guid = await this._ensureDayLog(key);
+      if (guid) h.logGuid = guid;
     }
-
-    setTimeout(() => el.classList.remove('ht-celebrating'), 400);
-  }
-
-  // ── Stats View ─────────────────────────────────────────────────────────
-
-  async _renderStats(state, body) {
-    body.dataset.mode = 'stats'; // set mode FIRST before any async
-    body.innerHTML = '';
-    const wrap = document.createElement('div');
-    wrap.className = 'ht-stats-view';
-    body.appendChild(wrap);
-
-    state._htStatsDragBatch = null;
-    state._htStatsDragSeen = null;
-    state._htStatsDragArmed = false;
-    state._htStatsDragMode = null;
-    state._htStatsDragDidPaint = false;
-
-    const config = this._config || { categories: [], habits: [] };
-    let rangeDays = this._getStatsRangeDays(state);
-    const storedRangeOk = (() => {
-      const s = this._persistState ? parseInt(localStorage.getItem('ht_stats_range'), 10) : NaN;
-      return s === 7 || s === 30;
-    })();
-    if (!storedRangeOk) this._persistStatsRangeDays(state, rangeDays);
-    let selectedId = state.statsSelected || '__overall__';
-    if (selectedId.startsWith('habit:')) {
-      const hid = selectedId.slice(6);
-      const hOk = config.habits.some((x) => x.id === hid && !x.archived);
-      if (!hOk) {
-        selectedId = '__overall__';
-        state.statsSelected = '__overall__';
-      }
-    }
-
-    const buildSelect = () => {
-      const sel = document.createElement('select');
-      sel.className = 'ht-stats-select';
-      const opt0 = document.createElement('option');
-      opt0.value = '__overall__'; opt0.textContent = 'Overall';
-      sel.appendChild(opt0);
-      for (const cat of config.categories) {
-        const o = document.createElement('option');
-        o.value = 'cat:' + cat.id;
-        o.textContent = `${cat.name} (category)`;
-        sel.appendChild(o);
-        for (const h of config.habits.filter(h2 => h2.categoryId === cat.id && !h2.archived)) {
-          const oh = document.createElement('option');
-          oh.value = 'habit:' + h.id;
-          oh.textContent = `  · ${h.name}`;
-          sel.appendChild(oh);
-        }
-      }
-      sel.value = selectedId;
-      sel.addEventListener('change', () => {
-        selectedId = sel.value;
-        state.statsSelected = selectedId;
-        renderContent.call(this);
-      });
-      return sel;
-    };
-
-    // Range buttons
-    const rangeRow = document.createElement('div');
-    rangeRow.className = 'ht-stats-range';
-    for (const [label, days] of [['7d', 7], ['30d', 30]]) {
-      const btn = document.createElement('button');
-      btn.className = 'ht-range-btn' + (rangeDays === days ? ' active' : '');
-      btn.textContent = label;
-      btn.addEventListener('click', () => {
-        rangeDays = days;
-        this._persistStatsRangeDays(state, days);
-        rangeRow.querySelectorAll('.ht-range-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        renderContent.call(this);
-      });
-      rangeRow.appendChild(btn);
-    }
-    wrap.appendChild(rangeRow);
-    wrap.appendChild(buildSelect());
-
-    const contentEl = document.createElement('div');
-    contentEl.className = 'ht-stats-content';
-    wrap.appendChild(contentEl);
-
-    // ── Stats cell interaction helpers ─────────────────────────────────────
-
-    // Patch a calendar cell's visual state in-place (no full re-render)
-    const patchCell = (el, isDone, isPartial, label, isNaDay = false, isFail = false) => {
-      el.classList.toggle('done', isDone);
-      el.classList.toggle('partial', isPartial && !isDone);
-      el.classList.toggle('ht-cal-na', !!isNaDay);
-      el.classList.toggle('ht-cal-fail', !!isFail);
-
-      const stripCirc = el.classList.contains('ht-cal-strip-circle');
-      if (stripCirc) {
-        if (isFail) el.textContent = '×';
-        else if (isNaDay) el.textContent = '–';
-        else if (label != null && label > 0) el.textContent = String(label);
-        else if (isDone) el.textContent = '';
-        else el.textContent = '';
-      }
-
-      // Monthly grid cell — update value label
-      const valEl = el.querySelector('.ht-cal-day-val');
-      if (valEl) {
-        // Update existing val element
-        if (label != null && label > 0) {
-          valEl.textContent = label;
-          valEl.style.display = '';
-        } else {
-          valEl.textContent = '';
-          valEl.style.display = 'none';
-        }
-      } else if (label != null && label > 0 && el.querySelector('.ht-cal-day-num')) {
-        // Monthly cell with no val element yet — create one
-        const newVal = document.createElement('div');
-        newVal.className = 'ht-cal-day-val';
-        newVal.textContent = label;
-        el.appendChild(newVal);
-      }
-
-      // 7d strip circle — update text directly (no sub-elements)
-      if (!el.querySelector('.ht-cal-day-num') && !el.querySelector('.ht-cal-strip-date')) {
-        // pure circle element — label is shown as text in center
-        // don't overwrite; strip uses separate date label below
-      }
-    };
-
-    // Recompute and persist log changes, patch cell in-place
-    const applyLogChange = async (dateStr, log, el, hId, cId) => {
-      const h = hId ? config.habits.find(x => x.id === hId) : null;
-      if (hId && h) {
-        this._htRecomputeCategoryDone(log, config, dateStr);
+    const done = !!(h.done || this._lsDone(key, h.name));
+    if (!h?.logGuid) {
+      if (!mark && !done) {
+        this._setLsDone(key, h.name, true);
+        h.done = true;
+      } else if (!mark && done) {
+        this._setLsDone(key, h.name, false);
+        h.done = false;
+        this._setHabitMark(key, h.name, 'fail');
+      } else if (mark === 'fail') {
+        this._setHabitMark(key, h.name, 'na');
       } else {
-        const affectedCatIds = cId ? [cId] : config.categories.map((c) => c.id);
-        for (const catId of affectedCatIds) {
-          const habitsInCat = config.habits.filter((x) => x.categoryId === catId && !x.archived);
-          const anyDone = habitsInCat.some((x) => {
-            const v2 = log.completions[x.id];
-            if (!v2) return false;
-            if ((x.target || 0) > 0) return typeof v2 === 'number' ? v2 >= x.target : false;
-            return true;
-          });
-          if (anyDone) log.categoryDone[catId] = true;
-          else delete log.categoryDone[catId];
-        }
+        this._setHabitMark(key, h.name, null);
+        this._setLsDone(key, h.name, false);
+        h.done = false;
       }
-      await this._saveLog(dateStr, log);
-
-      const isHabitSel = !!hId && !!h;
-      const isCatSel = !!cId;
-
-      let isDone = false;
-      let isPartial = false;
-      let valLabel = null;
-      let na = false;
-      let fail = false;
-      if (isHabitSel) {
-        const surf = htHabitDaySurface(log, h, dateStr);
-        const nm = htCompletionNorm(log.completions[hId], h);
-        const num = typeof log.completions[hId] === 'number' ? log.completions[hId] : log.completions[hId] === true ? 1 : 0;
-        isDone = nm.done;
-        isPartial = nm.kind === 'partial';
-        valLabel = (h.target || 0) > 0 && num > 0 ? num : null;
-        na = nm.kind === 'na' || (surf.displayNa && nm.kind === 'empty');
-        fail = nm.kind === 'fail';
-      } else if (isCatSel) {
-        isDone = !!log.categoryDone[cId];
-      } else {
-        const allActive = config.habits.filter((x) => !x.archived);
-        const doneCount = allActive.filter((x) => {
-          const v = log.completions[x.id];
-          if (!v) return false;
-          return (x.target || 0) > 0 ? typeof v === 'number' && v >= x.target : true;
-        }).length;
-        isDone = doneCount === allActive.length;
-        isPartial = !isDone && doneCount > 0;
-      }
-      patchCell(el, isDone, isPartial, valLabel, na, fail);
-      if (isDone) this._celebrate(el);
-    };
-
-    // Show inline numeric input on long-press (for stats circles)
-    const showStatsNumericInput = (el, dateStr, h) => {
-      if (el.querySelector('.ht-num-input')) return;
-      const hId = h.id;
-
-      const wrap = document.createElement('div');
-      wrap.style.cssText = 'position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);' +
-        'display:flex;gap:4px;align-items:center;background:rgba(28,26,34,0.95);' +
-        'border:1px solid rgba(255,255,255,0.15);border-radius:8px;padding:4px 6px;z-index:100;white-space:nowrap;';
-
-      const input = document.createElement('input');
-      input.type = 'number'; input.className = 'ht-num-input';
-      input.style.cssText = 'width:44px;';
-      input.min = 0; input.max = 9999;
-
-      const okBtn = document.createElement('button');
-      okBtn.className = 'ht-num-btn'; okBtn.innerHTML = htIcon('check');
-      okBtn.style.cssText = 'background:rgba(76,175,80,0.2);border-color:#4caf50;color:#4caf50;';
-
-      const commit = async () => {
-        wrap.remove();
-        const newVal = Math.max(0, parseInt(input.value) || 0);
-        const log = await this._loadLog(dateStr);
-        if (newVal === 0) delete log.completions[hId];
-        else log.completions[hId] = newVal;
-        await applyLogChange(dateStr, log, el, hId, null);
-      };
-
-      const commitSpecial = async (sym) => {
-        wrap.remove();
-        const log = await this._loadLog(dateStr);
-        log.completions[hId] = sym;
-        await applyLogChange(dateStr, log, el, hId, null);
-      };
-
-      const failBtn = document.createElement('button');
-      failBtn.type = 'button';
-      failBtn.className = 'ht-num-btn ht-num-fail-btn';
-      failBtn.setAttribute('aria-label', 'Missed (×)');
-      failBtn.textContent = '×';
-
-      const naBtn = document.createElement('button');
-      naBtn.type = 'button';
-      naBtn.className = 'ht-num-btn ht-num-na-btn';
-      naBtn.setAttribute('aria-label', 'Not applicable');
-      naBtn.innerHTML = '<span class="ht-cat-na-bar"></span>';
-
-      okBtn.addEventListener('click', (e) => { e.stopPropagation(); commit(); });
-      failBtn.addEventListener('click', (e) => { e.stopPropagation(); commitSpecial(HT_COMP_FAIL); });
-      naBtn.addEventListener('click', (e) => { e.stopPropagation(); commitSpecial(HT_COMP_NA); });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') commit();
-        if (e.key === 'Escape') wrap.remove();
-        e.stopPropagation();
-      });
-      input.addEventListener('click', (e) => e.stopPropagation());
-      wrap.appendChild(input); wrap.appendChild(okBtn);
-      wrap.appendChild(failBtn); wrap.appendChild(naBtn);
-      el.style.position = 'relative';
-      el.style.overflow = 'visible';
-      el.appendChild(wrap);
-      setTimeout(() => { input.focus(); input.select(); }, 10);
-
-      // Close on outside click
-      const outside = (e) => { if (!wrap.contains(e.target)) { wrap.remove(); document.removeEventListener('click', outside); } };
-      setTimeout(() => document.addEventListener('click', outside), 50);
-    };
-
-    const armStatsHabitDragFlush = () => {
-      if (state._htStatsDragArmed) return;
-      state._htStatsDragArmed = true;
-      const finish = async () => {
-        window.removeEventListener('pointerup', finish, true);
-        window.removeEventListener('pointercancel', finish, true);
-        state._htStatsDragArmed = false;
-        state._htStatsDragMode = null;
-        const batch = state._htStatsDragBatch;
-        state._htStatsDragBatch = null;
-        state._htStatsDragSeen = null;
-        if (!batch || batch.size === 0) return;
-        for (const [ds, lg] of batch.entries()) {
-          await this._saveLog(ds, lg);
-        }
-        await this._getAllLogRows(true);
-        await renderContent.call(this);
-      };
-      window.addEventListener('pointerup', finish, { once: true, capture: true });
-      window.addEventListener('pointercancel', finish, { once: true, capture: true });
-    };
-
-    const mergeStatsDragLog = (dateStr, logsByDate) => {
-      if (!state._htStatsDragBatch) state._htStatsDragBatch = new Map();
-      if (!state._htStatsDragBatch.has(dateStr)) {
-        const base = logsByDate.get(dateStr);
-        const copy = JSON.parse(JSON.stringify(base || { completions: {}, categoryDone: {}, notes: '' }));
-        copy.date = dateStr;
-        state._htStatsDragBatch.set(dateStr, copy);
-      }
-      return state._htStatsDragBatch.get(dateStr);
-    };
-
-    const paintStatsHabitDragCell = (dateStr, el, logsByDate, hId, habit) => {
-      const mode = state._htStatsDragMode;
-      if (!mode) return;
-      if (!state._htStatsDragSeen) state._htStatsDragSeen = new Set();
-      const key = `${dateStr}:${hId}`;
-      if (state._htStatsDragSeen.has(key)) return;
-      state._htStatsDragSeen.add(key);
-      state._htStatsDragDidPaint = true;
-      const log = mergeStatsDragLog(dateStr, logsByDate);
-      this._htApplyDragCompletion(log, habit, hId, mode);
-      this._htRecomputeCategoryDone(log, config, dateStr);
-      const surf = htHabitDaySurface(log, habit, dateStr);
-      const nm = htCompletionNorm(log.completions[hId], habit);
-      const num = typeof log.completions[hId] === 'number' ? log.completions[hId] : 0;
-      const valLabel = (habit.target || 0) > 0 && num > 0 ? num : null;
-      const na = nm.kind === 'na' || (surf.displayNa && nm.kind === 'empty');
-      const fail = nm.kind === 'fail';
-      patchCell(el, nm.done, nm.kind === 'partial', valLabel, na, fail);
-    };
-
-    // Wire up tap + long-press on a calendar circle element
-    const wireCircle = (el, dateStr, currentV, logsByDate) => {
-      const isCatSel = selectedId.startsWith('cat:');
-      const isHabitSel = selectedId.startsWith('habit:');
-      const hId = isHabitSel ? selectedId.slice(6) : null;
-      const cId = isCatSel ? selectedId.slice(4) : null;
-      const h = hId ? config.habits.find(x => x.id === hId) : null;
-      const isNumeric = h && (h.target||0) > 0;
-
-      let longTimer = null;
-      let didLong = false;
-      let statsDragStarted = false;
-      let pressClickCount = 1;
-      let pressStartX = 0;
-      let pressStartY = 0;
-
-      const cancelStatsPress = () => {
-        clearTimeout(longTimer);
-        longTimer = null;
-      };
-
-      const armStatsDrag = () => {
-        if (!isHabitSel || !h || statsDragStarted) return;
-        statsDragStarted = true;
-        cancelStatsPress();
-        this._htCancelPendingHabitTap(state);
-        armStatsHabitDragFlush();
-        const log = mergeStatsDragLog(dateStr, logsByDate);
-        state._htStatsDragMode = this._htDragModeForPressSeq(
-          state,
-          h,
-          log,
-          hId,
-          dateStr,
-          pressClickCount
-        );
-        paintStatsHabitDragCell(dateStr, el, logsByDate, hId, h);
-      };
-
-      if (isHabitSel && h) {
-        const statsDayLog = () => {
-          const base = logsByDate.get(dateStr);
-          return base
-            ? {
-                date: dateStr,
-                completions: { ...base.completions },
-                categoryDone: { ...base.categoryDone },
-                notes: base.notes || '',
-              }
-            : { date: dateStr, completions: {}, categoryDone: {}, notes: '' };
-        };
-
-        el.addEventListener('pointerdown', (e) => {
-          if (e.button !== 0) return;
-          didLong = false;
-          statsDragStarted = false;
-          const prevSeq = state._htSidebarDragClickSeq || 0;
-          pressClickCount = this._htSidebarPressSeqBump(
-            state,
-            h,
-            statsDayLog(),
-            hId,
-            dateStr
-          );
-          if (pressClickCount > 1 && prevSeq >= 1) this._htCancelPendingHabitTap(state);
-          pressStartX = e.clientX;
-          pressStartY = e.clientY;
-          if (isNumeric) {
-            longTimer = setTimeout(() => {
-              if (statsDragStarted) return;
-              didLong = true;
-              cancelStatsPress();
-              showStatsNumericInput(el, dateStr, h);
-            }, HT_LONG_PRESS_MS);
-          }
-        });
-        el.addEventListener('pointermove', (e) => {
-          if (!(e.buttons & 1)) return;
-          const threshold = e.pointerType === 'touch' ? 12 : HT_DRAG_MOVE_PX;
-          if (
-            Math.abs(e.clientX - pressStartX) > threshold ||
-            Math.abs(e.clientY - pressStartY) > threshold
-          ) {
-            armStatsDrag();
-          }
-        });
-        el.addEventListener('pointerenter', (e) => {
-          if (!(e.buttons & 1)) return;
-          if (!statsDragStarted) return;
-          paintStatsHabitDragCell(dateStr, el, logsByDate, hId, h);
-        });
-        el.addEventListener('pointerup', () => {
-          state._htSidebarDragLastUp = Date.now();
-          cancelStatsPress();
-        });
-        el.addEventListener('pointercancel', cancelStatsPress);
-      }
-
-      el.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (isHabitSel && h && state._htStatsDragDidPaint) {
-          state._htStatsDragDidPaint = false;
-          return;
-        }
-        if (didLong) {
-          didLong = false;
-          return;
-        }
-        if (el.querySelector('.ht-num-input')) return;
-
-        if (isHabitSel && h) {
-          const runCycle = async () => {
-            const log = await this._loadLog(dateStr);
-            const seq = state._htSidebarDragClickSeq || 1;
-            if (state._htDragSeqSourceEmpty && seq >= 2) {
-              const mode = this._htSidebarDragModeFromClickCount(seq);
-              this._htApplyDragCompletion(log, h, hId, mode);
-            } else {
-              this._htCycleHabitCompletion(log, h, hId);
-            }
-            await applyLogChange(dateStr, log, el, hId, null);
-          };
-          if (state._htDragSeqSourceEmpty && (state._htSidebarDragClickSeq || 0) === 1) {
-            this._htCancelPendingHabitTap(state);
-            state._htPendingHabitTap = () => {
-              void runCycle();
-            };
-            state._htPendingHabitTapTimer = setTimeout(() => {
-              state._htPendingHabitTapTimer = null;
-              const fn = state._htPendingHabitTap;
-              state._htPendingHabitTap = null;
-              fn?.();
-            }, HT_SIDEBAR_DRAG_CLICK_GAP_MS);
-            return;
-          }
-          this._htCancelPendingHabitTap(state);
-          await runCycle();
-          return;
-        }
-
-        const log = await this._loadLog(dateStr);
-
-        if (isCatSel && cId) {
-          if (log.categoryDone[cId]) delete log.categoryDone[cId];
-          else log.categoryDone[cId] = true;
-          await this._saveLog(dateStr, log);
-          patchCell(el, !!log.categoryDone[cId], false, null);
-          if (log.categoryDone[cId]) this._celebrate(el);
-        } else {
-          // Overall — toggle all
-          const allActive = config.habits.filter(x => !x.archived);
-          const allDone = allActive.every(x => log.completions[x.id]);
-          if (allDone) {
-            allActive.forEach(x => delete log.completions[x.id]);
-            config.categories.forEach(c => delete log.categoryDone[c.id]);
-          } else {
-            allActive.forEach(x => { log.completions[x.id] = (x.target||0) > 0 ? x.target : true; });
-            config.categories.forEach(c => { log.categoryDone[c.id] = true; });
-          }
-          await this._saveLog(dateStr, log);
-          patchCell(el, !allDone, false, null);
-          if (!allDone) this._celebrate(el);
-        }
-      });
-    };
-
-    async function renderContent() {
-      if (!contentEl.isConnected) return;
-
-      const logRowsStats = await this._getAllLogRows();
-      const logsByDate = this._buildLogsByDateMapFromRows(logRowsStats);
-
-      // Build date range for stats cards (rolling window)
-      const today = htToday();
-      const dates = [];
-      for (let i = rangeDays - 1; i >= 0; i--) dates.push(htDaysBefore(today, i));
-
-      // All dates with log data (for calendar rendering beyond the rolling window)
-      const allLogDates = new Set(logsByDate.keys());
-
-      // Parse selection
-      const isCat = selectedId.startsWith('cat:');
-      const isHabit = selectedId.startsWith('habit:');
-      const isOverall = selectedId === '__overall__';
-      const catId = isCat ? selectedId.slice(4) : null;
-      const habitId = isHabit ? selectedId.slice(6) : null;
-      const habit = habitId ? config.habits.find(h => h.id === habitId) : null;
-      const cat = catId ? config.categories.find(c => c.id === catId) : null;
-      const activeHabits = config.habits.filter(h => !h.archived);
-
-      const habitDaySnapshot = (dateStr, log) => {
-        if (!habit) return null;
-        const L = log || { completions: {}, categoryDone: {} };
-        const raw = L.completions?.[habit.id];
-        const nm = htCompletionNorm(raw, habit);
-        const surf = htHabitDaySurface(L, habit, dateStr);
-        const displayNa = nm.kind === 'na' || (surf.displayNa && nm.kind === 'empty');
-        const fail = nm.kind === 'fail';
-        const num =
-          typeof raw === 'number'
-            ? raw
-            : raw === true
-              ? 1
-              : nm.num || 0;
-        const target = habit.target || 0;
-        return {
-          val: num,
-          max: target || 1,
-          done: nm.done,
-          partial: nm.kind === 'partial',
-          na: displayNa,
-          fail,
-        };
-      };
-
-      // Compute per-day values for rolling window
-      const getVal = (dateStr) => {
-        const log = logsByDate.get(dateStr);
-        if (isOverall) {
-          if (!log) return null;
-          const done = activeHabits.filter(h => {
-            if (!htHabitAppliesOnDate(h, dateStr)) return false;
-            const cv = log.completions?.[h.id];
-            if (!cv) return false;
-            return (h.target||0) > 0 ? (typeof cv === 'number' ? cv >= h.target : false) : true;
-          }).length;
-          const denom = activeHabits.filter(h => htHabitAppliesOnDate(h, dateStr)).length;
-          return { val: done, max: Math.max(1, denom), done: denom > 0 && done === denom };
-        }
-        if (isCat) {
-          if (!log) return null;
-          return { val: log.categoryDone?.[catId] ? 1 : 0, max: 1, done: !!log.categoryDone?.[catId] };
-        }
-        if (isHabit && habit) {
-          return habitDaySnapshot(dateStr, log);
-        }
-        return null;
-      };
-
-      const dayVals = dates.map(d => getVal(d));
-
-      // All log dates sorted
-      const allDates = [...allLogDates].sort();
-
-      let completionRate = 0;
-      let rateLabel = '';
-      if (isHabit && habit) {
-        let denom = 0;
-        let doneCt = 0;
-        for (const d of dates) {
-          if (!htHabitAppliesOnDate(habit, d)) continue;
-          const snap = habitDaySnapshot(d, logsByDate.get(d));
-          if (!snap || snap.na) continue;
-          denom++;
-          if (snap.done) doneCt++;
-        }
-        completionRate = denom > 0 ? Math.round((doneCt / denom) * 100) : 0;
-        rateLabel = `${doneCt}/${denom} days`;
-      } else {
-        const allDoneDays = allDates.filter(d => getVal(d)?.done).length;
-        completionRate = allDates.length > 0 ? Math.round((allDoneDays / allDates.length) * 100) : 0;
-        rateLabel = `${allDoneDays}/${allDates.length} days`;
-      }
-
-      // Total value (numeric habits) across all history
-      let totalVal = 0;
-      allDates.forEach(d => {
-        const log = logsByDate.get(d);
-        if (log && isHabit && habit) {
-          const hv = log.completions?.[habit.id];
-          totalVal += typeof hv === 'number' ? hv : (hv === true ? 1 : 0);
-        }
-      });
-
-      let bestStreak = 0;
-      let cur = 0;
-      if (isHabit && habit) {
-        const startStr =
-          habit.seedDate && habit.seedDate <= today
-            ? habit.seedDate
-            : (allDates[0] || today);
-        for (let d = startStr; d <= today; d = htDaysAfter(d, 1)) {
-          if (!htHabitAppliesOnDate(habit, d)) continue;
-          const log = logsByDate.get(d);
-          const raw = log?.completions?.[habit.id];
-          const nm = htCompletionNorm(raw, habit);
-          if (nm.kind === 'na') continue;
-          if (nm.done) {
-            cur++;
-            bestStreak = Math.max(bestStreak, cur);
-          } else if (habit.seedDate && d >= habit.seedDate && !log) {
-            cur++;
-            bestStreak = Math.max(bestStreak, cur);
-          } else {
-            cur = 0;
-          }
-        }
-      } else {
-        for (let i = 0; i < allDates.length; i++) {
-          const v = getVal(allDates[i]);
-          if (v?.done) {
-            if (i > 0) {
-              const prev = new Date(allDates[i - 1] + 'T12:00:00');
-              const curr = new Date(allDates[i] + 'T12:00:00');
-              const diff = Math.round((curr - prev) / 86400000);
-              if (diff === 1) cur++;
-              else cur = 1;
-            } else {
-              cur = 1;
-            }
-            if (cur > bestStreak) bestStreak = cur;
-          } else {
-            cur = 0;
-          }
-        }
-      }
-
-      let streak = 0;
-      if (isHabit && habit) {
-        streak = this._habitStreakFromMap(habit.id, htDaysAfter(today, 1), logsByDate, habit);
-      } else {
-        let checkDate = htDaysBefore(today, 1);
-        const todayVal = getVal(today);
-        if (todayVal?.done) {
-          streak = 1;
-          checkDate = htDaysBefore(today, 1);
-        }
-        for (let i = 0; i < 3650; i++) {
-          const v = getVal(checkDate);
-          if (v?.done) {
-            streak++;
-            checkDate = htDaysBefore(checkDate, 1);
-          } else break;
-        }
-      }
-
-      contentEl.innerHTML = '';
-
-      // ── Stat cards ──
-      const cards = document.createElement('div');
-      cards.className = 'ht-stat-cards';
-
-      const makeCard = (label, value, unit, cls) => {
-        const c = document.createElement('div');
-        c.className = 'ht-stat-card' + (cls ? ' ' + cls : '');
-        c.innerHTML = `<div class="ht-stat-label">${label}</div><div class="ht-stat-value">${value}</div><div class="ht-stat-unit">${unit}</div>`;
-        return c;
-      };
-
-      cards.appendChild(makeCard('Streak', streak, 'days', streak > 0 ? 'fire' : ''));
-      cards.appendChild(makeCard('Best', bestStreak, 'days', bestStreak > 0 ? 'accent' : ''));
-      cards.appendChild(makeCard('Rate', completionRate + '%', rateLabel, ''));
-
-      if (isHabit && habit?.target > 0) {
-        cards.appendChild(makeCard('Total', totalVal, habit.unit || 'total', 'accent'));
-      }
-      contentEl.appendChild(cards);
-
-      // ── Category completion rates (overall) — high-signal; above calendar & daily bars ──
-      if (isOverall) {
-        const rateSection = document.createElement('div');
-        rateSection.className = 'ht-stats-section';
-        rateSection.innerHTML = '<div class="ht-stats-section-title">Category Completion Rate</div>';
-
-        for (const c of config.categories) {
-          const habitsInCat = activeHabits.filter(h => h.categoryId === c.id);
-          if (habitsInCat.length === 0) continue;
-          const catDoneDays = dates.filter(d => {
-            const log = logsByDate.get(d);
-            return log?.categoryDone?.[c.id];
-          }).length;
-          const rate = dates.length > 0 ? Math.round((catDoneDays / dates.length) * 100) : 0;
-          const row = document.createElement('div');
-          row.className = 'ht-cat-rate-row';
-          row.innerHTML = `
-            <span class="ht-cat-rate-name"><span class="ht-cat-glyph-inline">${htCategoryGlyphHtml(c.emoji)}</span>${htEsc(c.name)}</span>
-            <div class="ht-cat-rate-bar-wrap"><div class="ht-cat-rate-bar" style="width:${rate}%"></div></div>
-            <span class="ht-cat-rate-pct">${rate}%</span>
-          `;
-          rateSection.appendChild(row);
-        }
-        contentEl.appendChild(rateSection);
-      }
-
-      // ── Calendar view (7d = weekly strip, 30d = monthly grid) ──
-      const calSection = document.createElement('div');
-      calSection.className = 'ht-stats-section';
-      calSection.innerHTML = '<div class="ht-stats-section-title">Completion Calendar</div>';
-
-      if (rangeDays === 7) {
-        // ── 7-day strip: day columns with date number + circle ──
-        const strip = document.createElement('div');
-        strip.className = 'ht-cal-strip';
-        const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-        dates.forEach((d, i) => {
-          const v = dayVals[i];
-          const dt = new Date(d + 'T12:00:00');
-          const isToday = d === today;
-          const col = document.createElement('div');
-          col.className = 'ht-cal-strip-col' + (isToday ? ' today' : '');
-          const dayName = document.createElement('div');
-          dayName.className = 'ht-cal-strip-dow';
-          dayName.textContent = DOW[dt.getDay()];
-          const circle = document.createElement('div');
-          circle.className =
-            'ht-cal-strip-circle' +
-            (v?.fail ? ' ht-cal-fail' : '') +
-            (v?.na ? ' ht-cal-na' : '') +
-            (v?.done ? ' done' : v && !v?.na && !v?.fail && v.val > 0 ? ' partial' : '');
-          const dateNum = document.createElement('div');
-          dateNum.className = 'ht-cal-strip-date';
-          dateNum.textContent = dt.getDate();
-          // Show value inside circle for numeric habits
-          if (isHabit && habit?.target > 0 && v?.val > 0 && !v?.na && !v?.fail) {
-            circle.textContent = v.val;
-            circle.classList.add('has-val');
-          }
-          if (v?.fail) circle.textContent = '×';
-          else if (v?.na) circle.textContent = '–';
-          circle.title = d + (v?.val != null ? ': ' + v.val : '');
-          wireCircle(circle, d, v, logsByDate);
-          col.appendChild(dayName);
-          col.appendChild(circle);
-          col.appendChild(dateNum);
-          strip.appendChild(col);
-        });
-        calSection.appendChild(strip);
-
-      } else {
-        // ── 30-day monthly calendar grid ──
-        // Persist viewed month on panel state so habit-calendar drag refresh doesn't jump back to journal month.
-        const refAnchor = new Date((state.dateStr || htToday()) + 'T12:00:00');
-        if (!state._htStatsCal) {
-          state._htStatsCal = { y: refAnchor.getFullYear(), m: refAnchor.getMonth() };
-        }
-        let calYear = state._htStatsCal.y;
-        let calMonth = state._htStatsCal.m;
-
-        const renderMonth = (year, month) => {
-          state._htStatsCal = { y: year, m: month };
-          calYear = year;
-          calMonth = month;
-          calSection.querySelector('.ht-cal-month-view')?.remove();
-          const mv = document.createElement('div');
-          mv.className = 'ht-cal-month-view';
-
-          // Month nav header
-          const nav = document.createElement('div');
-          nav.className = 'ht-cal-month-nav';
-          const prevMo = document.createElement('button');
-          prevMo.className = 'ht-cal-nav-btn'; prevMo.innerHTML = htIcon('chevron-left');
-          const monthTitle = document.createElement('span');
-          monthTitle.className = 'ht-cal-month-title';
-          monthTitle.textContent = new Date(year, month, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-          const nextMo = document.createElement('button');
-          nextMo.className = 'ht-cal-nav-btn'; nextMo.innerHTML = htIcon('chevron-right');
-          prevMo.addEventListener('click', () => {
-            calMonth--; if (calMonth < 0) { calMonth = 11; calYear--; }
-            renderMonth(calYear, calMonth);
-          });
-          nextMo.addEventListener('click', () => {
-            calMonth++; if (calMonth > 11) { calMonth = 0; calYear++; }
-            renderMonth(calYear, calMonth);
-          });
-          nav.appendChild(prevMo); nav.appendChild(monthTitle); nav.appendChild(nextMo);
-          mv.appendChild(nav);
-
-          // Day-of-week headers
-          const dowRow = document.createElement('div');
-          dowRow.className = 'ht-cal-dow-row';
-          for (const d of ['Sun','Mon','Tue','Wed','Thu','Fri','Sat']) {
-            const h = document.createElement('div');
-            h.className = 'ht-cal-dow-header'; h.textContent = d;
-            dowRow.appendChild(h);
-          }
-          mv.appendChild(dowRow);
-
-          // Build day grid
-          const firstDay = new Date(year, month, 1);
-          const lastDay = new Date(year, month + 1, 0);
-          const startDow = firstDay.getDay();
-          const grid = document.createElement('div');
-          grid.className = 'ht-cal-grid';
-
-          // Pad start
-          for (let p = 0; p < startDow; p++) {
-            const empty = document.createElement('div');
-            empty.className = 'ht-cal-day empty';
-            grid.appendChild(empty);
-          }
-
-          for (let day = 1; day <= lastDay.getDate(); day++) {
-            const dateStr = `${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
-            const idx = dates.indexOf(dateStr);
-            const v = idx >= 0 ? dayVals[idx] : null;
-            const isToday = dateStr === today;
-            // Allow selecting any past date in the visible month.
-            // Keep future dates dim/non-interactive.
-            const inRange = dateStr <= today;
-
-            // Compute value from log directly for dates outside the rolling window
-            let cellV = v;
-            if (!cellV && allLogDates.has(dateStr)) {
-              const log = logsByDate.get(dateStr);
-              if (log) {
-                if (isOverall) {
-                  const done = activeHabits.filter(h => {
-                    const cv = log.completions?.[h.id];
-                    if (!cv) return false;
-                    if ((h.target||0) > 0) return typeof cv === 'number' ? cv >= h.target : false;
-                    return true;
-                  }).length;
-                  cellV = { val: done, max: activeHabits.length, done: done === activeHabits.length };
-                } else if (isCat) {
-                  cellV = { val: log.categoryDone?.[catId] ? 1 : 0, max: 1, done: !!log.categoryDone?.[catId] };
-                } else if (isHabit && habit) {
-                  cellV = habitDaySnapshot(dateStr, log);
-                }
-              }
-            }
-
-            const cell = document.createElement('div');
-            cell.className = 'ht-cal-day' +
-              (isToday ? ' today' : '') +
-              (!inRange ? ' out-of-range' : '') +
-              (cellV?.fail ? ' ht-cal-fail' : '') +
-              (cellV?.na ? ' ht-cal-na' : '') +
-              (cellV?.done ? ' done' : (cellV && !cellV.na && !cellV.fail && cellV.val > 0 ? ' partial' : ''));
-
-            const num = document.createElement('div');
-            num.className = 'ht-cal-day-num'; num.textContent = day;
-            const dot = document.createElement('div');
-            dot.className = 'ht-cal-day-dot';
-            cell.appendChild(num);
-            cell.appendChild(dot);
-            // For numeric habits, show value as small text
-            if (isHabit && habit?.target > 0 && cellV?.val > 0 && !cellV?.na && !cellV?.fail) {
-              const valEl = document.createElement('div');
-              valEl.className = 'ht-cal-day-val';
-              valEl.textContent = cellV.val;
-              cell.appendChild(valEl);
-            }
-            cell.title = dateStr + (cellV?.val != null ? ': ' + cellV.val : '');
-            if (inRange) wireCircle(cell, dateStr, cellV, logsByDate);
-            grid.appendChild(cell);
-          }
-          mv.appendChild(grid);
-          calSection.appendChild(mv);
-        };
-
-        renderMonth(calYear, calMonth);
-      }
-
-      contentEl.appendChild(calSection);
-
-      // ── Bar chart ──
-      const chartSection = document.createElement('div');
-      chartSection.className = 'ht-stats-section';
-      chartSection.innerHTML = '<div class="ht-stats-section-title">Daily Progress</div>';
-
-      const chartEl = document.createElement('div');
-      chartEl.className = 'ht-barchart';
-
-      // Only show last 30 days max in bar chart (too cramped otherwise)
-      const chartDates = dates.slice(-Math.min(30, dates.length));
-      const chartVals = dayVals.slice(-chartDates.length);
-      const maxVal = Math.max(1, ...chartVals.map(v => v?.val || 0));
-      const target = (isHabit && habit?.target > 0) ? habit.target : (isOverall ? activeHabits.length : 1);
-
-      if (target > 0 && maxVal > 0) {
-        const targetPct = Math.min(100, (target / Math.max(maxVal, target)) * 100);
-        const line = document.createElement('div');
-        line.className = 'ht-target-line';
-        line.style.bottom = targetPct + '%';
-        const tLabel = document.createElement('div');
-        tLabel.className = 'ht-target-label';
-        tLabel.style.bottom = targetPct + '%';
-        tLabel.textContent = target;
-        chartEl.appendChild(line);
-        chartEl.appendChild(tLabel);
-      }
-
-      const labelsEl = document.createElement('div');
-      labelsEl.className = 'ht-barchart-labels';
-      const labelInterval = Math.ceil(chartDates.length / 6);
-
-      chartDates.forEach((d, i) => {
-        const v = chartVals[i];
-        // Bar
-        const wrap = document.createElement('div');
-        wrap.className = 'ht-bar-wrap';
-        const bar = document.createElement('div');
-        bar.className = 'ht-bar' + (v?.done ? ' done' : '');
-        const heightPct = v ? Math.max(2, Math.round((v.val / Math.max(maxVal, target)) * 100)) : 0;
-        bar.style.height = heightPct + '%';
-        wrap.appendChild(bar);
-        // Hover tooltip showing value
-        if (v?.val > 0) {
-          const tooltip = document.createElement('div');
-          tooltip.className = 'ht-bar-tooltip';
-          tooltip.textContent = v.val + (habit?.unit ? ' ' + habit.unit : '');
-          wrap.appendChild(tooltip);
-        }
-        chartEl.appendChild(wrap);
-
-        // Label in separate row — always add a slot, only fill text on interval
-        const lblWrap = document.createElement('div');
-        lblWrap.className = 'ht-bar-label-wrap';
-        if (i % labelInterval === 0) {
-          const lbl = document.createElement('div');
-          lbl.className = 'ht-bar-label';
-          lbl.textContent = new Date(d + 'T12:00:00').getDate();
-          lblWrap.appendChild(lbl);
-        }
-        labelsEl.appendChild(lblWrap);
-      });
-
-      const barchartWrap = document.createElement('div');
-      barchartWrap.className = 'ht-barchart-wrap';
-      // Target line/label stay in chartEl — positioned relative to bar area height
-      barchartWrap.appendChild(chartEl);
-      barchartWrap.appendChild(labelsEl);
-      chartSection.appendChild(barchartWrap);
-      contentEl.appendChild(chartSection);
-
-    }
-
-    await renderContent.call(this);
-  }
-
-  /**
-   * Re-render every mounted panel (habits or stats) after config/logs change.
-   * @param {{ skipManageModeHabitSidebar?: boolean }} [opts] When true, habit list panels
-   *   in inline quick-edit (`htManageMode`) are skipped so debounced saves do not tear down
-   *   inputs and reset scroll; use `_htRefreshManageModeHabitSidebars` after structural edits.
-   */
-  async refreshAllPanels(opts = {}) {
-    const skipManage = !!opts.skipManageModeHabitSidebar;
-    for (const [, state] of (this._panelStates || new Map())) {
-      if (!state.bodyEl) continue;
-      if (skipManage && state.htManageMode && state.bodyEl.dataset?.mode !== 'stats') continue;
-      try {
-        if (state.bodyEl.dataset?.mode === 'stats') {
-          await this._renderStats(state, state.bodyEl);
-        } else {
-          await this._renderSidebar(state);
-        }
-      } catch (e) {
-        console.error('[HabitTracker] refreshAllPanels:', e);
-      }
-    }
-  }
-
-  // ── Settings UI ──────────────────────────────────────────────────────────
-
-  /**
-   * HTML5 drag needs `preventDefault` on dragover for ancestors; Thymer’s panel/modal shell can
-   * intercept first — bridge from capture phase while a habit row drag is active.
-   */
-  _htAttachSettingsDragBridge(hostEl) {
-    if (!hostEl || typeof hostEl.addEventListener !== 'function') return () => {};
-    const attr = 'data-ht-settings-drag-habit';
-    const onChain = (e) => {
-      try {
-        if (document.body.getAttribute(attr)) {
-          e.preventDefault();
-          try {
-            e.dataTransfer.dropEffect = 'move';
-          } catch (_) {}
-        }
-      } catch (_) {}
-    };
-    hostEl.addEventListener('dragenter', onChain, true);
-    hostEl.addEventListener('dragover', onChain, true);
-    return () => {
-      try {
-        hostEl.removeEventListener('dragenter', onChain, true);
-        hostEl.removeEventListener('dragover', onChain, true);
-      } catch (_) {}
-    };
-  }
-
-  /** Command palette / legacy entry: toggle inline manage on a journal habits panel (no modal). */
-  openSettings() {
-    void this._openJournalHabitInlineManage(null);
-  }
-
-  /**
-   * Toggle inline habit manage mode for a journal panel (suite shell or standalone sidebar).
-   * Second invocation closes the inline settings chrome (same as “Done editing”).
-   * @param {string | null} preferredPanelId suite `_states` key when invoked from suite gear
-   */
-  _openJournalHabitInlineManage(preferredPanelId) {
-    document.querySelector('.ht-modal-overlay')?.remove();
-    let chosen = preferredPanelId ? this._panelStates.get(preferredPanelId) : null;
-    if (!chosen?.bodyEl?.isConnected) {
-      chosen = null;
-      for (const [, st] of this._panelStates || new Map()) {
-        if (!st.bodyEl?.isConnected || st.bodyEl.dataset?.mode === 'stats') continue;
-        if (st.isJournalPanel) {
-          chosen = st;
-          break;
-        }
-      }
-    }
-    if (!chosen) {
-      this.ui.addToaster?.({
-        title: 'Journal Header Suite',
-        message: 'Open a journal page with habits visible, then try again.',
-        dismissible: true,
-        autoDestroyTime: 4200,
-      });
+      this._paint();
+      this._afterDaySave?.(key);
       return;
     }
-
-    if (chosen.htManageMode) {
-      chosen.htManageMode = false;
-      const btnOff = chosen._htHabitShell?.manageBtn;
-      if (btnOff) {
-        btnOff.classList.remove('active');
-        btnOff.title = 'Edit habits & layout (inline)';
+    // Cycle: empty → done → fail → na → empty
+    if (!mark && !h.done) {
+      this._setHabitMark(key, h.name, null);
+      this._writeHabitDone(h, true, key);
+      this._paint();
+      const ok = await this._setTaskDoneSdk(h, true);
+      if (!ok) {
+        this._writeHabitDone(h, false, key);
+        this._paint();
+      } else {
+        this._afterDaySave(key);
       }
-      void this._renderSidebar(chosen);
       return;
     }
-
-    chosen.htManageMode = true;
-    const btn = chosen._htHabitShell?.manageBtn;
-    if (btn) {
-      btn.classList.add('active');
-      btn.title = 'Done editing habits';
+    if (!mark && h.done) {
+      this._writeHabitDone(h, false, key);
+      this._setHabitMark(key, h.name, 'fail');
+      this._paint();
+      await this._setTaskDoneSdk(h, false);
+      return;
     }
-    void this._renderSidebar(chosen);
+    if (mark === 'fail') {
+      this._setHabitMark(key, h.name, 'na');
+      this._writeHabitDone(h, false, key);
+      this._paint();
+      await this._persistLogHabit(h, key);
+      return;
+    }
+    if (mark === 'na') {
+      this._setHabitMark(key, h.name, null);
+      this._writeHabitDone(h, false, key);
+      this._paint();
+      await this._persistLogHabit(h, key);
+    }
   }
 
-  _renderSettings(container, draft, options = {}) {
-    const panelState = options.panelState || null;
-    const layoutAsIcons = !!options.layoutAsIcons;
-    const showSuiteTabs = options.showSuiteTabs !== false;
-
-    if (panelState) {
-      container.innerHTML = '';
-      
-
-      if (!(draft.categories || []).length) {
-        const hintEmpty = document.createElement('div');
-        hintEmpty.style.cssText =
-          'font-size:12px;color:#8a7e6a;margin:0 0 10px;line-height:1.45;';
-        hintEmpty.textContent =
-          'Add a category to get started, or open a journal day and use Edit habits & layout in the habit panel.';
-        container.appendChild(hintEmpty);
-      }
-
-      const topRow = document.createElement('div');
-      topRow.className = 'ht-add-row';
-      topRow.style.marginBottom = '10px';
-      const newCatIconPicker = this._htBuildCategoryIconPicker('folder', () => {});
-      const newCatName = document.createElement('input');
-      newCatName.className = 'ht-input';
-      newCatName.placeholder = 'New category name';
-      const addCatBtn = document.createElement('button');
-      addCatBtn.className = 'ht-btn ht-btn-primary ht-btn-sm';
-      addCatBtn.textContent = 'Add category';
-      topRow.appendChild(newCatIconPicker.el);
-      topRow.appendChild(newCatName);
-      topRow.appendChild(addCatBtn);
-      container.appendChild(topRow);
-      const onAddCat = () => {
-        const name = newCatName.value.trim();
-        if (!name) return;
-        const icon = newCatIconPicker.normalizeIconSlug(newCatIconPicker.getSlug());
-        draft.categories.push({
-          id: htGenId(),
-          name,
-          emoji: icon,
-          order: draft.categories.length,
-        });
-        newCatName.value = '';
-        newCatIconPicker.setValue('folder');
-        htNormalizeHabitConfig(draft);
-        this._htSchedulePersistHabitConfig();
-        void this._htRefreshManageModeHabitSidebars();
-      };
-      addCatBtn.addEventListener('click', onAddCat);
-      newCatName.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') onAddCat();
-      });
-
-      const offDayRow = document.createElement('label');
-      offDayRow.style.cssText =
-        'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-      const offDayCb = document.createElement('input');
-      offDayCb.type = 'checkbox';
-      offDayCb.checked = !!draft.hideOffDayHabits;
-      offDayCb.addEventListener('change', () => {
-        draft.hideOffDayHabits = offDayCb.checked;
-        htNormalizeHabitConfig(draft);
-        this._htSchedulePersistHabitConfig();
-        void this._htRefreshManageModeHabitSidebars();
-      });
-      offDayRow.appendChild(offDayCb);
-      const offDayTxt = document.createElement('span');
-      offDayTxt.textContent = 'Hide habits on off-days (weekdays not scheduled)';
-      offDayRow.appendChild(offDayTxt);
-      container.appendChild(offDayRow);
-
-      const notesRow = document.createElement('label');
-      notesRow.style.cssText =
-        'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-      const notesCb = document.createElement('input');
-      notesCb.type = 'checkbox';
-      notesCb.checked = draft.showDayNotes !== false;
-      notesCb.addEventListener('change', () => {
-        draft.showDayNotes = notesCb.checked;
-        htNormalizeHabitConfig(draft);
-        this._htSchedulePersistHabitConfig();
-        void this._htRefreshManageModeHabitSidebars();
-        void this.refreshAllPanels({ skipManageModeHabitSidebar: true });
-      });
-      notesRow.appendChild(notesCb);
-      const notesTxt = document.createElement('span');
-      notesTxt.textContent = 'Show day notes field under habits';
-      notesRow.appendChild(notesTxt);
-      container.appendChild(notesRow);
-
-      const finishInlineLayout = () => {
-        htNormalizeHabitConfig(draft);
-        this._htSchedulePersistHabitConfig();
-        void this._htRefreshManageModeHabitSidebars();
-        void this.refreshAllPanels({ skipManageModeHabitSidebar: true });
-      };
-
-      if (layoutAsIcons) {
-        const layoutWrap = document.createElement('div');
-        layoutWrap.style.cssText =
-          'display:flex;flex-direction:column;gap:6px;margin-bottom:10px;';
-        const lab = document.createElement('div');
-        lab.style.cssText =
-          'font-size:11px;color:var(--text-muted,#8a7e6a);text-transform:uppercase;letter-spacing:0.06em;';
-        lab.textContent = 'Habit layout';
-        const btnRow = document.createElement('div');
-        btnRow.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;';
-        const b1 = document.createElement('button');
-        b1.type = 'button';
-        b1.className = 'ht-btn ht-btn-sm';
-        b1.title = 'Single column — journal list and editor cards';
-        b1.innerHTML = htIcon('layout-list');
-        const b2 = document.createElement('button');
-        b2.type = 'button';
-        b2.className = 'ht-btn ht-btn-sm';
-        b2.title = 'Multi column — editor cards';
-        b2.innerHTML = htIcon('layout-columns');
-        const paintLayout = () => {
-          const single = this._htReadHabitLayoutSingleColumn();
-          b1.classList.toggle('ht-btn-primary', single);
-          b1.classList.toggle('ht-btn-secondary', !single);
-          b2.classList.toggle('ht-btn-primary', !single);
-          b2.classList.toggle('ht-btn-secondary', single);
-        };
-        const applyLayout = (single) => {
-          this._htWriteHabitLayoutSingleColumn(single);
-          paintLayout();
-          finishInlineLayout();
-        };
-        b1.addEventListener('click', (e) => {
-          e.preventDefault();
-          applyLayout(true);
-        });
-        b2.addEventListener('click', (e) => {
-          e.preventDefault();
-          applyLayout(false);
-        });
-        paintLayout();
-        btnRow.append(b1, b2);
-        layoutWrap.append(lab, btnRow);
-        container.appendChild(layoutWrap);
-      } else {
-        const boardColRow = document.createElement('label');
-        boardColRow.style.cssText =
-          'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-        const boardColCb = document.createElement('input');
-        boardColCb.type = 'checkbox';
-        boardColCb.checked = this._htReadHabitLayoutSingleColumn();
-        boardColCb.addEventListener('change', () => {
-          this._htWriteHabitLayoutSingleColumn(boardColCb.checked);
-          finishInlineLayout();
-        });
-        boardColRow.appendChild(boardColCb);
-        const boardColLbl = document.createElement('span');
-        boardColLbl.textContent =
-          'Single column for habits in the journal and for the cards below';
-        boardColRow.appendChild(boardColLbl);
-        container.appendChild(boardColRow);
-      }
-
-      return;
-    }
-
-    container.innerHTML = '';
-    
-    const heading = document.createElement('div');
-    heading.className = 'ht-section-title';
-    heading.textContent = 'Habits & categories';
-    container.appendChild(heading);
-
-    const hint = document.createElement('div');
-    hint.style.cssText = 'font-size:12px;color:#8a7e6a;margin:0 0 10px;line-height:1.45;';
-    hint.textContent =
-      'Turn suite tabs on or off above. Habits list below by category in the journal; filter by tag with the sunrise icon. Reorder categories with ↑↓; drag ⋮ to move habits between categories.';
-    container.appendChild(hint);
-
-    const offDayRow = document.createElement('label');
-    offDayRow.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-    const offDayCb = document.createElement('input');
-    offDayCb.type = 'checkbox';
-    offDayCb.checked = !!draft.hideOffDayHabits;
-    offDayCb.addEventListener('change', () => { draft.hideOffDayHabits = offDayCb.checked; });
-    offDayRow.appendChild(offDayCb);
-    const offDayTxt = document.createElement('span');
-    offDayTxt.textContent = 'Hide habits on off-days (weekdays not scheduled)';
-    offDayRow.appendChild(offDayTxt);
-    container.appendChild(offDayRow);
-
-    const notesRowModal = document.createElement('label');
-    notesRowModal.style.cssText =
-      'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-    const notesCbModal = document.createElement('input');
-    notesCbModal.type = 'checkbox';
-    notesCbModal.checked = draft.showDayNotes !== false;
-    notesCbModal.addEventListener('change', () => {
-      draft.showDayNotes = notesCbModal.checked;
-    });
-    notesRowModal.appendChild(notesCbModal);
-    const notesTxtModal = document.createElement('span');
-    notesTxtModal.textContent = 'Show day notes field under habits';
-    notesRowModal.appendChild(notesTxtModal);
-    container.appendChild(notesRowModal);
-
-    const catIconPicker = this._htBuildCategoryIconPicker('folder', () => {});
-
-    const topRow = document.createElement('div');
-    topRow.className = 'ht-add-row';
-    topRow.style.marginBottom = '10px';
-    const newCatName = document.createElement('input');
-    newCatName.className = 'ht-input';
-    newCatName.placeholder = 'New category name';
-    const addCatBtn = document.createElement('button');
-    addCatBtn.className = 'ht-btn ht-btn-primary ht-btn-sm';
-    addCatBtn.textContent = 'Add category';
-    topRow.appendChild(catIconPicker.el);
-    topRow.appendChild(newCatName);
-    topRow.appendChild(addCatBtn);
-    container.appendChild(topRow);
-
-    const board = document.createElement('div');
-    container.appendChild(board);
-
-    const syncBoardGridCss = () => {
-      const single = this._htReadHabitLayoutSingleColumn();
-      board.style.cssText = [
-        'display:grid',
-        `grid-template-columns:${single ? 'minmax(0,1fr)' : 'repeat(auto-fit,minmax(240px,1fr))'}`,
-        'gap:10px',
-        'align-items:start',
-      ].join(';');
-    };
-
-    let renderUnified = () => {};
-    const finishMutation = () => {
-      if (panelState) {
-        htNormalizeHabitConfig(draft);
-        draft.habitGroupMode = 'category';
-        this._htSchedulePersistHabitConfig();
-        void this._htRefreshManageModeHabitSidebars();
-      } else {
-        renderUnified();
-      }
-    };
-
-    if (layoutAsIcons) {
-      const layoutWrap = document.createElement('div');
-      layoutWrap.style.cssText =
-        'display:flex;flex-direction:column;gap:6px;margin-bottom:10px;';
-      const lab = document.createElement('div');
-      lab.style.cssText =
-        'font-size:11px;color:var(--text-muted,#8a7e6a);text-transform:uppercase;letter-spacing:0.06em;';
-      lab.textContent = 'Habit layout';
-      const btnRow = document.createElement('div');
-      btnRow.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;';
-      const b1 = document.createElement('button');
-      b1.type = 'button';
-      b1.className = 'ht-btn ht-btn-sm';
-      b1.title = 'Single column — journal list and editor cards';
-      b1.innerHTML = htIcon('layout-list');
-      const b2 = document.createElement('button');
-      b2.type = 'button';
-      b2.className = 'ht-btn ht-btn-sm';
-      b2.title = 'Multi column — editor cards';
-      b2.innerHTML = htIcon('layout-columns');
-      const paintLayout = () => {
-        const single = this._htReadHabitLayoutSingleColumn();
-        b1.classList.toggle('ht-btn-primary', single);
-        b1.classList.toggle('ht-btn-secondary', !single);
-        b2.classList.toggle('ht-btn-primary', !single);
-        b2.classList.toggle('ht-btn-secondary', single);
-      };
-      const applyLayout = (single) => {
-        this._htWriteHabitLayoutSingleColumn(single);
-        paintLayout();
-        syncBoardGridCss();
-        finishMutation();
-        void this.refreshAllPanels({ skipManageModeHabitSidebar: !!panelState });
-      };
-      b1.addEventListener('click', (e) => {
-        e.preventDefault();
-        applyLayout(true);
-      });
-      b2.addEventListener('click', (e) => {
-        e.preventDefault();
-        applyLayout(false);
-      });
-      paintLayout();
-      btnRow.append(b1, b2);
-      layoutWrap.append(lab, btnRow);
-      container.insertBefore(layoutWrap, board);
-    } else {
-      const boardColRow = document.createElement('label');
-      boardColRow.style.cssText =
-        'display:flex;align-items:center;gap:8px;font-size:12px;color:#d4cfc6;margin-bottom:10px;cursor:pointer;';
-      const boardColCb = document.createElement('input');
-      boardColCb.type = 'checkbox';
-      boardColCb.checked = this._htReadHabitLayoutSingleColumn();
-      boardColCb.addEventListener('change', () => {
-        this._htWriteHabitLayoutSingleColumn(boardColCb.checked);
-        finishMutation();
-        void this.refreshAllPanels({ skipManageModeHabitSidebar: !!panelState });
-      });
-      boardColRow.appendChild(boardColCb);
-      const boardColLbl = document.createElement('span');
-      boardColLbl.textContent = 'Single column for habits in the journal and for the cards below';
-      boardColRow.appendChild(boardColLbl);
-      container.insertBefore(boardColRow, board);
-    }
-
-    let dragHabitId = null;
-    const HT_SETTINGS_DRAG_ATTR = 'data-ht-settings-drag-habit';
-    const normalizeOrders = () => {
-      const byCat = new Map();
-      for (const c of draft.categories) byCat.set(c.id, []);
-      for (const h of draft.habits.filter((x) => !x.archived)) {
-        if (!byCat.has(h.categoryId)) byCat.set(h.categoryId, []);
-        byCat.get(h.categoryId).push(h);
-      }
-      for (const [, arr] of byCat) {
-        arr.sort((a, b) => (a.order || 0) - (b.order || 0));
-        arr.forEach((h, i) => { h.order = i; });
-      }
-    };
-    const moveCategoryOrder = (catId, delta) => {
-      const sorted = [...draft.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
-      const i = sorted.findIndex((c) => c.id === catId);
-      const j = i + delta;
-      if (i < 0 || j < 0 || j >= sorted.length) return;
-      const t = sorted[i];
-      sorted[i] = sorted[j];
-      sorted[j] = t;
-      sorted.forEach((c, k) => {
-        c.order = k;
-      });
-    };
-    const moveHabit = (habitId, toCatId, toIndex) => {
-      const moving = draft.habits.find((h) => h.id === habitId && !h.archived);
-      if (!moving || !toCatId) return;
-      moving.categoryId = toCatId;
-      normalizeOrders();
-      const list = draft.habits
-        .filter((h) => !h.archived && h.categoryId === toCatId)
-        .sort((a, b) => (a.order || 0) - (b.order || 0));
-      const from = list.findIndex((h) => h.id === moving.id);
-      if (from >= 0) list.splice(from, 1);
-      const idx = Math.max(0, Math.min(toIndex, list.length));
-      list.splice(idx, 0, moving);
-      list.forEach((h, i) => { h.order = i; });
-    };
-
-    const clearDropVisuals = () => {
-      for (const el of board.querySelectorAll('.ht-settings-habit-row')) {
-        el.classList.remove('ht-settings-drop-before', 'ht-settings-drop-after');
-      }
-      for (const el of board.querySelectorAll('.ht-settings-habit-list')) {
-        el.classList.remove('ht-settings-list-hover', 'ht-settings-list-drop-empty');
-      }
-    };
-    const insertBeforeFromClientY = (listEl, clientY) => {
-      const rows = [...listEl.querySelectorAll('.ht-settings-habit-row')];
-      for (let i = 0; i < rows.length; i++) {
-        const box = rows[i].getBoundingClientRect();
-        const mid = box.top + box.height / 2;
-        if (clientY < mid) return i;
-      }
-      return rows.length;
-    };
-    const paintDropIndicator = (listEl, clientY) => {
-      clearDropVisuals();
-      const beforeIdx = insertBeforeFromClientY(listEl, clientY);
-      const rows = [...listEl.querySelectorAll('.ht-settings-habit-row')];
-      listEl.classList.add('ht-settings-list-hover');
-      if (rows.length === 0) {
-        listEl.classList.add('ht-settings-list-drop-empty');
-        return beforeIdx;
-      }
-      if (beforeIdx < rows.length) rows[beforeIdx].classList.add('ht-settings-drop-before');
-      else rows[rows.length - 1].classList.add('ht-settings-drop-after');
-      return beforeIdx;
-    };
-
-    const openHabitEditor = (habit) => {
-      if (!habit) return;
-      document.querySelector('.ht-edit-overlay')?.remove();
-      const overlay = document.createElement('div');
-      overlay.className = 'ht-edit-overlay';
-      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:10020;';
-      overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) overlay.remove();
-      });
-      const modal = document.createElement('div');
-      modal.style.cssText = 'width:min(520px,92vw);background:rgba(24,22,30,0.98);border:1px solid rgba(255,255,255,0.16);border-radius:12px;padding:12px;';
-      modal.innerHTML = `
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-          <div style="flex:1;font-weight:600;">Edit Habit</div>
-          <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="close-edit">${htIcon('x')}</button>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;">
-            Name
-            <input class="ht-input" data-edit="name" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;">
-            Category
-            <select class="ht-select" data-edit="category"></select>
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;">
-            Daily target count
-            <input class="ht-input" type="number" min="0" data-edit="target" placeholder="0 = checkbox mode" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;">
-            Unit
-            <input class="ht-input" data-edit="unit" placeholder="mins, reps, pages..." />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;grid-column:1 / -1;">
-            Tags (comma-separated — free grouping alongside category)
-            <input class="ht-input" data-edit="tags" placeholder="morning, health…" />
-          </label>
-          <div style="grid-column:1 / -1;">
-            <div style="font-size:11px;color:#8a7e6a;margin-bottom:4px;">Active weekdays (Sun–Sat; none selected = every day)</div>
-            <div style="display:flex;gap:4px;flex-wrap:wrap;" data-edit="weekdays-row"></div>
-          </div>
-          <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8a7e6a;grid-column:1 / -1;">
-            Streak seed date (optional)
-            <input class="ht-input" type="date" data-edit="seed" />
-          </label>
-        </div>
-        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:12px;">
-          <button class="ht-btn ht-btn-secondary ht-btn-sm" data-action="cancel-edit">Cancel</button>
-          <button class="ht-btn ht-btn-primary ht-btn-sm" data-action="save-edit">Save</button>
-        </div>
-      `;
-      overlay.appendChild(modal);
-      document.body.appendChild(overlay);
-
-      const nameInput = modal.querySelector('[data-edit="name"]');
-      const categorySel = modal.querySelector('[data-edit="category"]');
-      const targetInput = modal.querySelector('[data-edit="target"]');
-      const unitInput = modal.querySelector('[data-edit="unit"]');
-      const tagsInput = modal.querySelector('[data-edit="tags"]');
-      const seedInput = modal.querySelector('[data-edit="seed"]');
-      const wdRowEl = modal.querySelector('[data-edit="weekdays-row"]');
-      nameInput.value = habit.name || '';
-      targetInput.value = habit.target > 0 ? String(habit.target) : '';
-      unitInput.value = habit.unit || '';
-      tagsInput.value = (Array.isArray(habit.tags) ? habit.tags : []).join(', ');
-      seedInput.value = habit.seedDate || '';
-      const wdLabels = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
-      const wdSel = new Set(Array.isArray(habit.weekdays) ? habit.weekdays : []);
-      wdRowEl.innerHTML = '';
-      const wdBtns = [];
-      for (let i = 0; i < 7; i++) {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-        b.dataset.wd = String(i);
-        b.textContent = wdLabels[i];
-        b.style.minWidth = '34px';
-        const paintWd = (on) => {
-          b.classList.toggle('ht-wd-on', on);
-          if (on) {
-            b.style.borderColor = 'rgba(102,153,255,0.85)';
-            b.style.background = 'rgba(102,153,255,0.18)';
-            b.style.color = '#dbe7ff';
-          } else {
-            b.style.borderColor = '';
-            b.style.background = '';
-            b.style.color = '';
-          }
-        };
-        paintWd(wdSel.has(i));
-        b.addEventListener('click', () => paintWd(!b.classList.contains('ht-wd-on')));
-        wdRowEl.appendChild(b);
-        wdBtns.push(b);
-      }
-      for (const c of draft.categories) {
-        const o = document.createElement('option');
-        o.value = c.id;
-        o.textContent = c.name || '';
-        if (c.id === habit.categoryId) o.selected = true;
-        categorySel.appendChild(o);
-      }
-      const close = () => overlay.remove();
-      modal.querySelector('[data-action="close-edit"]')?.addEventListener('click', close);
-      modal.querySelector('[data-action="cancel-edit"]')?.addEventListener('click', close);
-      modal.querySelector('[data-action="save-edit"]')?.addEventListener('click', () => {
-        const nm = String(nameInput.value || '').trim();
-        if (!nm) return;
-        const prevSeed = habit.seedDate || null;
-        habit.name = nm;
-        habit.categoryId = categorySel.value || habit.categoryId;
-        const tRaw = String(targetInput.value || '').trim();
-        const tVal = tRaw === '' ? 0 : parseInt(tRaw, 10);
-        habit.target = Number.isInteger(tVal) && tVal > 0 ? tVal : 0;
-        habit.unit = String(unitInput.value || '').trim() || null;
-        habit.tags = String(tagsInput.value || '')
-          .split(',')
-          .map((t) => t.trim())
-          .filter(Boolean);
-        habit.weekdays = wdBtns
-          .filter((b) => b.classList.contains('ht-wd-on'))
-          .map((b) => parseInt(b.dataset.wd, 10))
-          .sort((a, b) => a - b);
-        habit.seedDate = String(seedInput.value || '').trim() || null;
-        normalizeOrders();
-        close();
-        finishMutation();
-        this._htOnHabitSeedDateMaybeBackfill(habit, prevSeed);
-      });
-      nameInput.focus();
-      nameInput.select();
-    };
-
-    renderUnified = () => {
-      const scrollHost =
-        container.closest('.ht-modal-body') ||
-        container.closest('[data-jhs-settings-scroll]') ||
-        container.closest('.ht-sidebar-body') ||
-        container;
-      const prevScroll = scrollHost.scrollTop;
-      try {
-        board.innerHTML = '';
-        syncBoardGridCss();
-        clearDropVisuals();
-
-        const appendHabitRow = (listEl, habit) => {
-        const row = document.createElement('div');
-        row.draggable = false;
-        row.dataset.unifiedHabitId = habit.id;
-        row.className = 'ht-settings-habit-row';
-        row.style.cssText =
-          'display:flex;align-items:center;gap:6px;padding:6px;border-radius:7px;border:1px solid rgba(255,255,255,0.12);background:rgba(20,20,24,0.4);user-select:none;';
-        const targetHint = habit.target > 0 ? ` · ${habit.target}${habit.unit ? ' ' + habit.unit : ''}` : '';
-        row.innerHTML = `
-            <span class="ht-settings-habit-drag-grip" draggable="true" title="Drag to reorder or move between lists" style="opacity:.7;cursor:grab;touch-action:none;">${htIcon('grip-vertical')}</span>
-            <span draggable="false" style="flex:1;font-size:12px;line-height:1.25;">${htEsc(habit.name)}<span style="opacity:.65;">${targetHint}</span></span>
-            <button type="button" draggable="false" class="ht-btn ht-btn-secondary ht-btn-sm" data-action="edit-habit" title="Edit">${htIcon('pencil')}</button>
-            <button type="button" draggable="false" class="ht-btn ht-btn-secondary ht-btn-sm" data-action="archive-habit" title="Archive">${htIcon('package')}</button>
-            <button type="button" draggable="false" class="ht-btn ht-btn-danger ht-btn-sm" data-action="del-habit" title="Delete">${htIcon('trash')}</button>
-          `;
-        const grip = row.querySelector('.ht-settings-habit-drag-grip');
-        const onGripDragStart = (ev) => {
-          try {
-            ev.stopPropagation();
-            ev.dataTransfer.effectAllowed = 'move';
-            const hid = String(habit.id);
-            ev.dataTransfer.setData('text/plain', hid);
-            try {
-              ev.dataTransfer.setData('application/x-thymer-habit-id', hid);
-            } catch (_) {}
-            try {
-              const ox = Math.min(48, Math.max(8, ev.offsetX + 6));
-              const oy = Math.min(22, Math.max(6, ev.offsetY + 8));
-              ev.dataTransfer.setDragImage(row, ox, oy);
-            } catch (_) {}
-          } catch (_) {}
-          dragHabitId = habit.id;
-          try {
-            document.body.setAttribute(HT_SETTINGS_DRAG_ATTR, String(habit.id));
-          } catch (_) {}
-          row.style.opacity = '0.45';
-        };
-        const onGripDragEnd = () => {
-          row.style.opacity = '';
-          clearDropVisuals();
-          try {
-            document.body.removeAttribute(HT_SETTINGS_DRAG_ATTR);
-          } catch (_) {}
-          requestAnimationFrame(() => {
-            dragHabitId = null;
-          });
-        };
-        grip?.addEventListener('dragstart', onGripDragStart);
-        grip?.addEventListener('dragend', onGripDragEnd);
-        row.querySelector('[data-action="archive-habit"]')?.addEventListener('click', () => {
-          habit.archived = true;
-          finishMutation();
-        });
-        row.querySelector('[data-action="edit-habit"]')?.addEventListener('click', () => {
-          openHabitEditor(habit);
-        });
-        row.querySelector('[data-action="del-habit"]')?.addEventListener('click', () => {
-          const idx = draft.habits.findIndex((h) => h.id === habit.id);
-          if (idx >= 0) draft.habits.splice(idx, 1);
-          finishMutation();
-        });
-        listEl.appendChild(row);
-      };
-
-      /**
-       * Drop zone = whole card (header + dashed list + add row) so dragover still fires over
-       * padding/inputs; listEl is used for insert index math.
-       */
-      const wireHabitListDnD = (listEl, onDrop, zoneEl = null) => {
-        const zone = zoneEl || listEl;
-        listEl.classList.add('ht-settings-habit-list');
-        let paintRaf = null;
-        let pendingY = null;
-
-        const dragActive = (e) => {
-          const dtTypes = e.dataTransfer?.types ? Array.from(e.dataTransfer.types) : [];
-          let bodyId = '';
-          try {
-            bodyId = String(document.body.getAttribute(HT_SETTINGS_DRAG_ATTR) || '').trim();
-          } catch (_) {}
-          return !!(
-            dragHabitId ||
-            dtTypes.includes('text/plain') ||
-            dtTypes.includes('application/x-thymer-habit-id') ||
-            bodyId
-          );
-        };
-
-        const flushPaint = () => {
-          paintRaf = null;
-          if (pendingY == null) return;
-          const y0 = pendingY;
-          pendingY = null;
-          const rows = [...listEl.querySelectorAll('.ht-settings-habit-row')];
-          const rect = listEl.getBoundingClientRect();
-          const y =
-            rows.length === 0
-              ? y0
-              : Math.min(Math.max(y0, rect.top + 2), rect.bottom - 2);
-          listEl._htPendingDropIdx = paintDropIndicator(listEl, y);
-        };
-
-        const onDragOver = (e) => {
-          e.preventDefault();
-          try {
-            e.dataTransfer.dropEffect = 'move';
-          } catch (_) {}
-          if (!dragActive(e)) return;
-          pendingY = e.clientY;
-          if (paintRaf == null) {
-            paintRaf = requestAnimationFrame(flushPaint);
-          }
-        };
-
-        zone.addEventListener(
-          'dragenter',
-          (e) => {
-            if (!dragActive(e)) return;
-            e.preventDefault();
-          },
-          false
-        );
-        zone.addEventListener('dragover', onDragOver, false);
-        zone.addEventListener('dragleave', (e) => {
-          if (zone.contains(e.relatedTarget)) return;
-          if (paintRaf != null) {
-            cancelAnimationFrame(paintRaf);
-            paintRaf = null;
-          }
-          pendingY = null;
-          clearDropVisuals();
-        });
-        zone.addEventListener('drop', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (paintRaf != null) {
-            cancelAnimationFrame(paintRaf);
-            paintRaf = null;
-          }
-          pendingY = null;
-          const rect = listEl.getBoundingClientRect();
-          const rows = [...listEl.querySelectorAll('.ht-settings-habit-row')];
-          const y =
-            rows.length === 0
-              ? e.clientY
-              : Math.min(Math.max(e.clientY, rect.top + 2), rect.bottom - 2);
-          const beforeIdx =
-            typeof listEl._htPendingDropIdx === 'number'
-              ? listEl._htPendingDropIdx
-              : insertBeforeFromClientY(listEl, y);
-          listEl._htPendingDropIdx = undefined;
-          clearDropVisuals();
-          let habitId = String(e.dataTransfer?.getData?.('text/plain') || '').trim();
-          if (!habitId) {
-            try {
-              habitId = String(e.dataTransfer?.getData?.('application/x-thymer-habit-id') || '').trim();
-            } catch (_) {}
-          }
-          if (!habitId) habitId = String(dragHabitId || '').trim();
-          if (!habitId) {
-            try {
-              habitId = String(document.body.getAttribute(HT_SETTINGS_DRAG_ATTR) || '').trim();
-            } catch (_) {}
-          }
-          try {
-            document.body.removeAttribute(HT_SETTINGS_DRAG_ATTR);
-          } catch (_) {}
-          if (!habitId) return;
-          onDrop(habitId, beforeIdx);
-          dragHabitId = null;
-          finishMutation();
-        });
-      };
-
-      const cats = [...draft.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
-      if (cats.length === 0) {
-        const empty = document.createElement('div');
-        empty.style.cssText = 'font-size:12px;color:#8a7e6a;padding:8px 2px;';
-        empty.textContent = 'Add your first category to begin.';
-        board.appendChild(empty);
+  async _runIdleIndex(boot, isMobile) {
+    if (this._building) return;
+    this._building = true;
+    const t0 = performance.now();
+    const byDay = Object.create(null);
+    let count = 0;
+    try {
+      const coll = await this._getLogsCollection(boot);
+      if (!coll?.getAllRecords) {
+        console.warn('[Dawn/Habits] Habit Logs missing');
         return;
       }
-      for (let ci = 0; ci < cats.length; ci++) {
-        const cat = cats[ci];
-        const card = document.createElement('div');
-        card.style.cssText = 'border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);border-radius:10px;padding:10px;min-height:150px;';
-
-        const head = document.createElement('div');
-        head.style.cssText = 'display:flex;align-items:center;gap:6px;margin-bottom:8px;';
-        const upCat = document.createElement('button');
-        upCat.type = 'button';
-        upCat.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-        upCat.title = 'Move category up';
-        upCat.style.cssText = 'padding:2px 5px;min-width:0;';
-        upCat.innerHTML = htIcon('chevron-up');
-        upCat.disabled = ci <= 0;
-        upCat.addEventListener('click', () => {
-          moveCategoryOrder(cat.id, -1);
-          finishMutation();
-        });
-        const downCat = document.createElement('button');
-        downCat.type = 'button';
-        downCat.className = 'ht-btn ht-btn-secondary ht-btn-sm';
-        downCat.title = 'Move category down';
-        downCat.style.cssText = 'padding:2px 5px;min-width:0;';
-        downCat.innerHTML = htIcon('chevron-down');
-        downCat.disabled = ci >= cats.length - 1;
-        downCat.addEventListener('click', () => {
-          moveCategoryOrder(cat.id, 1);
-          finishMutation();
-        });
-        const iconPicker = this._htBuildCategoryIconPicker(cat.emoji || 'folder', (slug) => {
-          cat.emoji = slug;
-          finishMutation();
-        });
-        const nameInput = document.createElement('input');
-        nameInput.className = 'ht-input';
-        nameInput.value = cat.name || '';
-        nameInput.style.cssText = 'flex:1;min-width:0;height:28px;padding:4px 8px;';
-        nameInput.addEventListener('change', () => {
-          const nm = nameInput.value.trim();
-          if (nm) cat.name = nm;
-          else nameInput.value = cat.name || '';
-          if (panelState) this._htSchedulePersistHabitConfig();
-        });
-        const delCatBtn = document.createElement('button');
-        delCatBtn.className = 'ht-btn ht-btn-danger ht-btn-sm';
-        delCatBtn.title = 'Delete category';
-        delCatBtn.innerHTML = htIcon('trash');
-        delCatBtn.addEventListener('click', () => {
-          if (!confirm(`Delete category "${cat.name}" and all habits in it?`)) return;
-          draft.categories = draft.categories.filter((c) => c.id !== cat.id);
-          draft.habits = draft.habits.filter((h) => h.categoryId !== cat.id);
-          finishMutation();
-        });
-        head.appendChild(upCat);
-        head.appendChild(downCat);
-        head.appendChild(iconPicker.el);
-        head.appendChild(nameInput);
-        head.appendChild(delCatBtn);
-        card.appendChild(head);
-
-        const list = document.createElement('div');
-        list.style.cssText = 'display:flex;flex-direction:column;gap:6px;min-height:70px;padding:6px;border-radius:8px;border:1px dashed rgba(255,255,255,0.08);';
-        const habits = draft.habits
-          .filter((h) => !h.archived && h.categoryId === cat.id)
-          .sort((a, b) => (a.order || 0) - (b.order || 0));
-        if (habits.length === 0) {
-          const empty = document.createElement('div');
-          empty.style.cssText = 'font-size:11px;color:#8a7e6a;padding:8px 3px;';
-          empty.textContent = 'Drop habits here';
-          list.appendChild(empty);
+      await this._loadVaultConfig();
+      const prevHabits = Object.create(null);
+      for (const list of Object.values(this._index.byDay || {})) {
+        for (const e of list || []) {
+          if (e?.guid && e.hydrated === true && Array.isArray(e.habits)) {
+            prevHabits[e.guid] = { habits: e.habits, hydrated: true };
+          }
         }
-        for (const habit of habits) appendHabitRow(list, habit);
-
-        const addRow = document.createElement('div');
-        addRow.style.cssText = 'display:flex;gap:6px;margin-top:8px;';
-        const addInput = document.createElement('input');
-        addInput.className = 'ht-input';
-        addInput.placeholder = `Add habit to ${cat.name}`;
-        addInput.style.cssText = 'flex:1;min-width:0;';
-        const addBtn = document.createElement('button');
-        addBtn.className = 'ht-btn ht-btn-primary ht-btn-sm';
-        addBtn.textContent = 'Add';
-        const addHabit = () => {
-          const nm = addInput.value.trim();
-          if (!nm) return;
-          const order = draft.habits.filter((h) => !h.archived && h.categoryId === cat.id).length;
-          draft.habits.push({
-            id: htGenId(),
-            name: nm,
-            categoryId: cat.id,
-            order,
-            tags: [],
-            weekdays: [],
-          });
-          addInput.value = '';
-          finishMutation();
-        };
-        addBtn.addEventListener('click', addHabit);
-        addInput.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter') addHabit();
-        });
-        addRow.appendChild(addInput);
-        addRow.appendChild(addBtn);
-        card.appendChild(list);
-        card.appendChild(addRow);
-        wireHabitListDnD(
-          list,
-          (habitId, beforeIdx) => {
-            moveHabit(habitId, cat.id, beforeIdx);
-          },
-          card
-        );
-
-        board.appendChild(card);
       }
-      } finally {
-        requestAnimationFrame(() => {
-          scrollHost.scrollTop = prevScroll;
-        });
+
+      const arr = (await coll.getAllRecords()) || [];
+      this._index.byDay = byDay;
+      this._index.full = false;
+      for (let i = 0; i < arr.length; i++) {
+        count += 1;
+        let title = '';
+        let guid = '';
+        try {
+          title = arr[i]?.getName?.() || arr[i]?.name || '';
+          guid = arr[i]?.guid || arr[i]?.id || '';
+        } catch (_) {}
+        const key = this._dayKeyFromLabel(title);
+        if (!key) {
+          if (this._applyVaultConfigRecord(arr[i], title)) this._paint();
+        } else if (guid) {
+          if (!byDay[key]) byDay[key] = [];
+          const entry = { guid, title: String(title).slice(0, 80) };
+          if (prevHabits[guid]?.habits?.length) {
+            entry.habits = prevHabits[guid].habits;
+            entry.hydrated = true;
+          } else {
+            const parsedHabits = await this._habitsFromRecord(arr[i], key, {
+              persistLs: false,
+              jsonOnly: true,
+            });
+            if (parsedHabits.length) {
+              entry.habits = parsedHabits;
+              entry.hydrated = true;
+            }
+          }
+          byDay[key].push(entry);
+          if (key === this._dayKey && entry.hydrated) this._paint();
+        }
+        if (i % (isMobile ? 8 : 20) === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+          if (boot?.shouldYield?.()) await boot.yieldToMain?.();
+        }
       }
-    };
-
-    addCatBtn.addEventListener('click', () => {
-      const name = newCatName.value.trim();
-      if (!name) return;
-      const icon = catIconPicker.normalizeIconSlug(catIconPicker.getSlug());
-      draft.categories.push({ id: htGenId(), name, emoji: icon, order: draft.categories.length });
-      newCatName.value = '';
-      catIconPicker.setValue('folder');
-      finishMutation();
-    });
-    newCatName.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') addCatBtn.click();
-    });
-
-    renderUnified();
-
+      this._index = {
+        byDay,
+        count,
+        builtAt: Date.now(),
+        ms: Math.round(performance.now() - t0),
+        full: true,
+      };
+      if (this._logMiss) {
+        for (const k of Object.keys(byDay)) delete this._logMiss[k];
+      }
+      this._saveIndexToStorage();
+      console.info('[Dawn/Habits] index', count, 'days', Object.keys(byDay).length, 'ms', this._index.ms);
+      this._paint();
+      if (this._isHabitsTabExpanded() && this._dayKey) {
+        void this._hydrateDay(this._dayKey);
+      }
+    } catch (e) {
+      console.warn('[Dawn/Habits] index fail', e);
+    } finally {
+      this._building = false;
+    }
   }
 }
+/**
+ * Inline habit manage — prod Behavioral `_renderSettings` chrome, LS-backed.
+ * Mixed onto DawnHabitsEngine after habits-engine.js.
+ */
+
+function dawnMixInHabitManage(Cls) {
+  if (!Cls || Cls.prototype._toggleManage) return;
+
+  Cls.prototype._toggleManage = function _toggleManage() {
+    this._manageMode = !this._manageMode;
+    if (this._manageMode) this._viewMode = 'list';
+    this._paint();
+  };
+
+  Cls.prototype._newHabitId = function _newHabitId() {
+    return 'h-' + Math.random().toString(36).slice(2, 10);
+  };
+
+  Cls.prototype._paintManage = function _paintManage(container) {
+    if (!container) return;
+    container.innerHTML = '';
+    container.classList.add('dawn-ht-manage');
+    const cfg = this._config;
+    if (!Array.isArray(cfg.categories)) cfg.categories = [{ id: 'default', name: 'Habits', order: 0 }];
+    if (!Array.isArray(cfg.habits)) cfg.habits = [];
+    if (!Array.isArray(cfg.tagOrder)) cfg.tagOrder = [];
+    if (cfg.showDayNotes == null) cfg.showDayNotes = true;
+
+    const persist = () => {
+      this._saveConfig();
+      this._paint();
+    };
+
+    const shell = globalThis.__dawnJhsShell;
+    if (shell?.tabTogglesBlock) {
+      try {
+        container.appendChild(shell.tabTogglesBlock());
+      } catch (_) {}
+    }
+
+    const addRow = document.createElement('div');
+    addRow.style.cssText = 'display:flex;gap:8px;align-items:center;margin:0 0 10px;flex-wrap:wrap;';
+    const catName = document.createElement('input');
+    catName.type = 'text';
+    catName.placeholder = 'New category name';
+    catName.style.cssText =
+      'flex:1;min-width:140px;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;';
+    const addCat = document.createElement('button');
+    addCat.type = 'button';
+    addCat.textContent = 'Add category';
+    addCat.style.cssText =
+      'padding:6px 10px;border-radius:6px;border:1px solid rgba(160,120,220,0.45);background:rgba(140,90,210,0.35);color:inherit;cursor:pointer;';
+    addCat.addEventListener('click', () => {
+      const name = catName.value.trim();
+      if (!name) return;
+      cfg.categories.push({
+        id: 'c-' + Math.random().toString(36).slice(2, 8),
+        name,
+        icon: '',
+        order: cfg.categories.length,
+      });
+      catName.value = '';
+      persist();
+    });
+    addRow.append(catName, addCat);
+    container.appendChild(addRow);
+
+    const mkCheck = (label, checked, onChange) => {
+      const lab = document.createElement('label');
+      lab.style.cssText =
+        'display:flex;align-items:center;gap:8px;font-size:12px;margin:0 0 8px;cursor:pointer;';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !!checked;
+      cb.addEventListener('change', () => onChange(cb.checked));
+      lab.append(cb, document.createTextNode(label));
+      return lab;
+    };
+    container.appendChild(
+      mkCheck('Hide habits on off-days (weekdays not scheduled)', cfg.hideOffDayHabits, (v) => {
+        cfg.hideOffDayHabits = v;
+        persist();
+      })
+    );
+    container.appendChild(
+      mkCheck('Show day notes field under habits', cfg.showDayNotes !== false, (v) => {
+        cfg.showDayNotes = v;
+        persist();
+      })
+    );
+
+    const layoutWrap = document.createElement('div');
+    layoutWrap.style.cssText = 'margin:0 0 12px;';
+    const layoutLab = document.createElement('div');
+    layoutLab.style.cssText =
+      'font-size:11px;color:#8a7e6a;text-transform:uppercase;letter-spacing:0.06em;margin:0 0 6px;';
+    layoutLab.textContent = 'Habit layout';
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:6px;';
+    const b1 = document.createElement('button');
+    b1.type = 'button';
+    b1.title = 'Single column';
+    b1.innerHTML = '<i class="ti ti-layout-list"></i>';
+    const b2 = document.createElement('button');
+    b2.type = 'button';
+    b2.title = 'Two columns';
+    b2.innerHTML = '<i class="ti ti-columns"></i>';
+    const paintLay = () => {
+      b1.style.cssText = this._singleCol
+        ? 'padding:4px 8px;border-radius:6px;border:1px solid rgba(160,120,220,0.5);background:rgba(140,90,210,0.35);color:inherit;'
+        : 'padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:inherit;';
+      b2.style.cssText = !this._singleCol
+        ? 'padding:4px 8px;border-radius:6px;border:1px solid rgba(160,120,220,0.5);background:rgba(140,90,210,0.35);color:inherit;'
+        : 'padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:inherit;';
+    };
+    b1.addEventListener('click', () => {
+      this._singleCol = true;
+      this._saveUiPrefs();
+      persist();
+    });
+    b2.addEventListener('click', () => {
+      this._singleCol = false;
+      this._saveUiPrefs();
+      persist();
+    });
+    paintLay();
+    btnRow.append(b1, b2);
+    layoutWrap.append(layoutLab, btnRow);
+    container.appendChild(layoutWrap);
+
+    const archived = cfg.habits.filter((h) => h.archived);
+    const archDet = document.createElement('details');
+    const archSum = document.createElement('summary');
+    archSum.textContent = `Archived habits (${archived.length})`;
+    archSum.style.cssText = 'cursor:pointer;font-size:13px;margin:0 0 8px;';
+    archDet.appendChild(archSum);
+    for (const h of archived) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;align-items:center;margin:0 0 4px;font-size:13px;';
+      row.appendChild(document.createTextNode(h.name || '(untitled)'));
+      const un = document.createElement('button');
+      un.type = 'button';
+      un.textContent = 'Restore';
+      un.addEventListener('click', () => {
+        h.archived = false;
+        persist();
+      });
+      row.appendChild(un);
+      archDet.appendChild(row);
+    }
+    container.appendChild(archDet);
+
+    const catHead = document.createElement('div');
+    catHead.style.cssText =
+      'font-size:13px;font-weight:600;margin:16px 0 6px;';
+    catHead.textContent = 'Categories';
+    const catHint = document.createElement('div');
+    catHint.style.cssText = 'font-size:11px;color:#8a7e6a;margin:0 0 8px;';
+    catHint.textContent = 'Categories ↑ ↓ changes order everywhere (journal sections and the collapsed ribbon).';
+    container.append(catHead, catHint);
+
+    const cats = [...cfg.categories].sort((a, b) => (a.order || 0) - (b.order || 0));
+    cats.forEach((c, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;align-items:center;margin:0 0 6px;';
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.textContent = '↑';
+      up.disabled = i === 0;
+      up.addEventListener('click', () => {
+        const o = cats[i - 1];
+        const t = c.order;
+        c.order = o.order;
+        o.order = t;
+        persist();
+      });
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.textContent = '↓';
+      down.disabled = i === cats.length - 1;
+      down.addEventListener('click', () => {
+        const o = cats[i + 1];
+        const t = c.order;
+        c.order = o.order;
+        o.order = t;
+        persist();
+      });
+      const inp = document.createElement('input');
+      inp.type = 'text';
+      inp.value = c.name;
+      inp.style.cssText =
+        'flex:1;padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;';
+      inp.addEventListener('change', () => {
+        c.name = inp.value.trim() || c.name;
+        persist();
+      });
+      row.append(up, down, inp);
+      if (c.id !== 'default') {
+        const rm = document.createElement('button');
+        rm.type = 'button';
+        rm.textContent = '×';
+        rm.addEventListener('click', () => {
+          cfg.categories = cfg.categories.filter((x) => x.id !== c.id);
+          for (const h of cfg.habits) {
+            if (h.categoryId === c.id) h.categoryId = 'default';
+          }
+          persist();
+        });
+        row.appendChild(rm);
+      }
+      container.appendChild(row);
+    });
+
+    const tagHead = document.createElement('div');
+    tagHead.style.cssText = 'font-size:13px;font-weight:600;margin:16px 0 4px;';
+    tagHead.textContent = 'Tags';
+    const tagHint = document.createElement('div');
+    tagHint.style.cssText = 'font-size:11px;color:#8a7e6a;margin:0 0 8px;';
+    tagHint.textContent = 'Reorder affects tag filter / picker order. × removes tag from every habit.';
+    container.append(tagHead, tagHint);
+    cfg.tagOrder.forEach((t, i) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:6px;align-items:center;margin:0 0 4px;';
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.textContent = '↑';
+      up.disabled = i === 0;
+      up.addEventListener('click', () => {
+        const arr = cfg.tagOrder;
+        [arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+        persist();
+      });
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.textContent = '↓';
+      down.disabled = i === cfg.tagOrder.length - 1;
+      down.addEventListener('click', () => {
+        const arr = cfg.tagOrder;
+        [arr[i + 1], arr[i]] = [arr[i], arr[i + 1]];
+        persist();
+      });
+      const lab = document.createElement('span');
+      lab.textContent = t;
+      lab.style.flex = '1';
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = '×';
+      rm.addEventListener('click', () => {
+        cfg.tagOrder = cfg.tagOrder.filter((x) => x !== t);
+        for (const h of cfg.habits) h.tags = (h.tags || []).filter((x) => x !== t);
+        persist();
+      });
+      row.append(up, down, lab, rm);
+      container.appendChild(row);
+    });
+
+    const addHabit = document.createElement('button');
+    addHabit.type = 'button';
+    addHabit.textContent = '+ Add habit';
+    addHabit.style.cssText =
+      'margin:14px 0 10px;padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.04);color:inherit;cursor:pointer;';
+    addHabit.addEventListener('click', () => {
+      cfg.habits.push(
+        this._normalizeHabitRow({
+          id: this._newHabitId(),
+          name: 'New habit',
+          categoryId: cats[0]?.id || 'default',
+          order: cfg.habits.length,
+        })
+      );
+      persist();
+    });
+    container.appendChild(addHabit);
+
+    const live = cfg.habits.filter((h) => !h.archived).sort((a, b) => (a.order || 0) - (b.order || 0));
+    for (const h of live) {
+      container.appendChild(this._manageHabitCard(h, cfg, persist));
+    }
+
+    const done = document.createElement('button');
+    done.type = 'button';
+    done.textContent = 'Done editing';
+    done.style.cssText =
+      'margin:16px 0 8px;padding:7px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.16);background:rgba(255,255,255,0.06);color:inherit;cursor:pointer;';
+    done.addEventListener('click', () => this._toggleManage());
+    container.appendChild(done);
+  };
+
+  Cls.prototype._manageHabitCard = function _manageHabitCard(h, cfg, persist) {
+    const card = document.createElement('div');
+    card.style.cssText =
+      'border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:10px;margin:0 0 10px;background:rgba(0,0,0,0.18);';
+    const top = document.createElement('div');
+    top.style.cssText = 'display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 8px;';
+    const nameIn = document.createElement('input');
+    nameIn.type = 'text';
+    nameIn.value = h.name;
+    nameIn.style.cssText =
+      'flex:1;min-width:120px;padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;';
+    nameIn.addEventListener('change', () => {
+      h.name = nameIn.value.trim() || h.name;
+      persist();
+    });
+    const catSel = document.createElement('select');
+    catSel.style.cssText =
+      'padding:5px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;';
+    for (const c of cfg.categories) {
+      const o = document.createElement('option');
+      o.value = c.id;
+      o.textContent = c.name;
+      if (c.id === h.categoryId) o.selected = true;
+      catSel.appendChild(o);
+    }
+    catSel.addEventListener('change', () => {
+      h.categoryId = catSel.value;
+      persist();
+    });
+    const arch = document.createElement('button');
+    arch.type = 'button';
+    arch.textContent = 'Archive';
+    arch.addEventListener('click', () => {
+      h.archived = true;
+      persist();
+    });
+    top.append(nameIn, catSel, arch);
+    card.appendChild(top);
+
+    const tagsDet = document.createElement('details');
+    tagsDet.open = true;
+    const tagsSum = document.createElement('summary');
+    tagsSum.textContent = 'Tags';
+    tagsSum.style.cursor = 'pointer';
+    tagsDet.appendChild(tagsSum);
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:10px;color:#8a7e6a;margin:4px 0;';
+    hint.textContent = 'Ctrl/Cmd-click for multiple.';
+    const sel = document.createElement('select');
+    sel.multiple = true;
+    sel.size = Math.min(4, Math.max(2, cfg.tagOrder.length || 2));
+    sel.style.cssText = 'width:100%;background:rgba(0,0,0,0.25);color:inherit;border:1px solid rgba(255,255,255,0.12);';
+    const paintTags = () => {
+      sel.innerHTML = '';
+      for (const t of cfg.tagOrder) {
+        const o = document.createElement('option');
+        o.value = t;
+        o.textContent = t;
+        if ((h.tags || []).includes(t)) o.selected = true;
+        sel.appendChild(o);
+      }
+    };
+    paintTags();
+    sel.addEventListener('change', () => {
+      h.tags = Array.from(sel.selectedOptions).map((o) => o.value);
+      persist();
+    });
+    const addWrap = document.createElement('div');
+    addWrap.style.cssText = 'display:flex;gap:6px;margin:6px 0 0;';
+    const newTag = document.createElement('input');
+    newTag.placeholder = 'New tag…';
+    newTag.style.cssText =
+      'flex:1;padding:4px 6px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.25);color:inherit;';
+    const addT = document.createElement('button');
+    addT.type = 'button';
+    addT.textContent = 'Add';
+    addT.addEventListener('click', () => {
+      const raw = newTag.value.trim();
+      if (!raw) return;
+      if (!cfg.tagOrder.includes(raw)) cfg.tagOrder.push(raw);
+      if (!(h.tags || []).includes(raw)) (h.tags || (h.tags = [])).push(raw);
+      newTag.value = '';
+      persist();
+    });
+    addWrap.append(newTag, addT);
+    tagsDet.append(hint, sel, addWrap);
+    card.appendChild(tagsDet);
+
+    const adv = document.createElement('details');
+    adv.open = true;
+    const advSum = document.createElement('summary');
+    advSum.textContent = 'Schedule, target & streak seed';
+    advSum.style.cursor = 'pointer';
+    adv.appendChild(advSum);
+    const grid = document.createElement('div');
+    grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:10px;margin-top:8px;';
+
+    const mkField = (label, el) => {
+      const lab = document.createElement('label');
+      lab.style.cssText = 'display:flex;flex-direction:column;gap:2px;font-size:10px;color:#8a7e6a;';
+      lab.appendChild(document.createTextNode(label));
+      lab.appendChild(el);
+      return lab;
+    };
+    const targetIn = document.createElement('input');
+    targetIn.type = 'number';
+    targetIn.min = '0';
+    targetIn.value = h.target > 0 ? String(h.target) : '';
+    targetIn.style.width = '72px';
+    targetIn.addEventListener('change', () => {
+      const n = parseInt(targetIn.value, 10);
+      h.target = Number.isInteger(n) && n > 0 ? n : 0;
+      h.type = h.target > 0 ? 'number' : 'bool';
+      persist();
+    });
+    const unitIn = document.createElement('input');
+    unitIn.placeholder = 'mins, reps…';
+    unitIn.value = h.unit || '';
+    unitIn.addEventListener('change', () => {
+      h.unit = unitIn.value.trim();
+      persist();
+    });
+    const startIn = document.createElement('input');
+    startIn.type = 'date';
+    startIn.value = h.startDate || '';
+    startIn.addEventListener('change', () => {
+      h.startDate = startIn.value || '';
+      persist();
+    });
+    const seedIn = document.createElement('input');
+    seedIn.type = 'date';
+    seedIn.value = h.streakSeed || '';
+    seedIn.addEventListener('change', () => {
+      h.streakSeed = seedIn.value || '';
+      persist();
+    });
+    grid.append(
+      mkField('Daily target (0 = checkbox)', targetIn),
+      mkField('Unit', unitIn),
+      mkField('Start date', startIn),
+      mkField('Streak seed date', seedIn)
+    );
+
+    const wdWrap = document.createElement('div');
+    wdWrap.style.cssText = 'flex:1 1 100%;';
+    const wdLbl = document.createElement('div');
+    wdLbl.style.cssText = 'font-size:10px;color:#8a7e6a;margin:0 0 4px;';
+    wdLbl.textContent = 'Weekdays (none = every day)';
+    const wdRow = document.createElement('div');
+    wdRow.style.cssText = 'display:flex;gap:3px;flex-wrap:wrap;';
+    const labels = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+    const wdSel = new Set(h.weekdays || []);
+    for (let i = 0; i < 7; i++) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = labels[i];
+      const on = wdSel.has(i);
+      b.style.cssText = on
+        ? 'padding:2px 6px;border-radius:4px;border:1px solid rgba(61,143,88,0.5);background:rgba(61,143,88,0.2);color:inherit;'
+        : 'padding:2px 6px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:inherit;';
+      b.addEventListener('click', () => {
+        if (wdSel.has(i)) wdSel.delete(i);
+        else wdSel.add(i);
+        h.weekdays = [...wdSel].sort((a, b) => a - b);
+        persist();
+      });
+      wdRow.appendChild(b);
+    }
+    wdWrap.append(wdLbl, wdRow);
+    grid.appendChild(wdWrap);
+
+    const pin = document.createElement('label');
+    pin.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;flex:1 1 100%;';
+    const pinCb = document.createElement('input');
+    pinCb.type = 'checkbox';
+    pinCb.checked = !!h.quickAccess;
+    pinCb.addEventListener('change', () => {
+      h.quickAccess = pinCb.checked;
+      persist();
+    });
+    pin.append(pinCb, document.createTextNode('Pin to quick access (status bar)'));
+    grid.appendChild(pin);
+    adv.appendChild(grid);
+    card.appendChild(adv);
+    return card;
+  };
+}
+
+if (typeof DawnHabitsEngine === 'function') dawnMixInHabitManage(DawnHabitsEngine);
+/**
+ * Quick-access habits — status-bar flame + frosted popover (prod htq-* chrome).
+ * Config-only / LS paint; toggles reuse DawnHabitsEngine mark/done paths. No nav I/O.
+ */
+
+function dawnMixInHabitQuickAccess(Cls) {
+  if (!Cls || Cls.prototype._refreshQuickAccess) return;
+
+  const CSS = `
+  .htq-anchor { display:inline-flex;width:18px;height:18px;align-items:center;justify-content:center;line-height:0;vertical-align:middle;cursor:pointer;opacity:.88; }
+  .htq-anchor .ti { font-size:14px;line-height:1; }
+  .htq-shell { position:fixed;z-index:200000;display:flex;max-width:min(320px,calc(100vw - 16px));pointer-events:auto; }
+  .htq-shell--bottom { flex-direction:column;align-items:flex-start; }
+  .htq-card { min-width:200px;max-width:min(320px,calc(100vw - 16px));max-height:min(340px,52vh);overflow-y:auto;padding:8px 10px;border-radius:12px;border:1px solid color-mix(in srgb,CanvasText 14%,transparent);background:color-mix(in srgb,Canvas 42%,transparent);color:CanvasText;-webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);box-shadow:0 0 0 1px color-mix(in srgb,CanvasText 8%,transparent),0 -6px 28px color-mix(in srgb,CanvasText 18%,transparent),0 0 22px color-mix(in srgb,Highlight 24%,transparent); }
+  .htq-head { display:flex;align-items:center;gap:6px;margin-bottom:8px;min-height:22px; }
+  .htq-back { display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:none;border-radius:6px;background:transparent;color:inherit;cursor:pointer;opacity:.75; }
+  .htq-back:hover { opacity:1; }
+  .htq-title { flex:1;font-size:11px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;color:color-mix(in srgb,CanvasText 62%,transparent); }
+  .htq-date { display:inline-flex;align-items:center;gap:0;margin-left:auto;flex-shrink:0; }
+  .htq-date .ht-nav-btn { width:14px;height:14px;padding:0;margin:0 -2px;opacity:.55;font-size:11px;line-height:1; appearance:none;border:none;background:transparent;color:inherit;cursor:pointer; }
+  .htq-date .ht-nav-btn .ti { font-size:12px;line-height:1; }
+  .htq-date .ht-nav-btn:hover { opacity:1; }
+  .htq-date .ht-date-label { font-size:11px;min-width:0;padding:0 2px;text-align:center;color:color-mix(in srgb,CanvasText 72%,transparent);cursor:pointer; }
+  .htq-cats { display:flex;flex-wrap:wrap;gap:6px;justify-content:center; }
+  .htq-cat-btn { display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0;border:none;border-radius:8px;background:transparent;color:inherit;cursor:pointer;opacity:.86; }
+  .htq-cat-btn:hover { opacity:1;background:color-mix(in srgb,CanvasText 8%,transparent); }
+  .htq-cat-btn .ti { font-size:16px;line-height:1; }
+  .htq-habits { display:flex;flex-direction:column;gap:4px; }
+  .htq-habit { display:flex;align-items:center;gap:8px;width:100%;padding:7px 8px;border:none;border-radius:8px;background:transparent;color:inherit;font:inherit;font-size:12px;text-align:left;cursor:pointer; }
+  .htq-habit:hover { background:color-mix(in srgb,CanvasText 8%,transparent); }
+  .htq-habit-mark { flex-shrink:0;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;border-radius:999px;border:1px solid color-mix(in srgb,CanvasText 22%,transparent);font-size:10px;font-weight:600;font-variant-numeric:tabular-nums; }
+  .htq-habit-mark.is-done { border-color:rgba(76,175,80,0.55);background:rgba(76,175,80,0.18);color:#8fd49a; }
+  .htq-habit-mark.is-partial { border-color:rgba(72,150,112,0.45);color:#9fd4b0; }
+  .htq-habit-mark.is-fail { color:#e57373;border-color:rgba(229,115,115,0.45); }
+  .htq-habit-mark.is-na { color:#c8a548;border-color:rgba(200,165,72,0.45); }
+  .htq-habit-name { flex:1;min-width:0;line-height:1.25; }
+  `;
+
+  Cls.prototype._pinnedHabits = function _pinnedHabits() {
+    return (this._config?.habits || []).filter((h) => h && !h.archived && h.quickAccess);
+  };
+
+  Cls.prototype._quickAccessGroups = function _quickAccessGroups() {
+    const pinned = this._pinnedHabits();
+    if (!pinned.length) return [];
+    const cats = [...(this._config?.categories || [])].sort((a, b) => (a.order || 0) - (b.order || 0));
+    const groups = [];
+    for (const cat of cats) {
+      const habits = pinned
+        .filter((h) => this._habitCategoryId(h.name) === cat.id || h.categoryId === cat.id)
+        .sort((a, b) => (a.order || 0) - (b.order || 0));
+      if (habits.length) groups.push({ cat, habits });
+    }
+    const known = new Set(cats.map((c) => c.id));
+    const orphan = pinned.filter((h) => {
+      const id = h.categoryId || this._habitCategoryId(h.name);
+      return !known.has(id);
+    });
+    if (orphan.length) {
+      groups.push({
+        cat: { id: '__orphan__', name: 'Other', icon: 'folder', order: 9999 },
+        habits: orphan.sort((a, b) => (a.order || 0) - (b.order || 0)),
+      });
+    }
+    return groups;
+  };
+
+  Cls.prototype._injectQuickAccessCss = function _injectQuickAccessCss() {
+    if (document.querySelector('style[data-dawn-htq]')) return;
+    const el = document.createElement('style');
+    el.setAttribute('data-dawn-htq', '1');
+    el.textContent = CSS;
+    document.head.appendChild(el);
+  };
+
+  Cls.prototype._closeQuickPopover = function _closeQuickPopover() {
+    try {
+      this._htqDocClose && document.removeEventListener('mousedown', this._htqDocClose, true);
+    } catch (_) {}
+    this._htqDocClose = null;
+    try {
+      this._htqKeyClose && document.removeEventListener('keydown', this._htqKeyClose, true);
+    } catch (_) {}
+    this._htqKeyClose = null;
+    try {
+      this._htQuickPopoverEl?.remove();
+    } catch (_) {}
+    this._htQuickPopoverEl = null;
+    this._htQuickPopoverViewCatId = null;
+  };
+
+  Cls.prototype._clearQuickAccessAnchors = function _clearQuickAccessAnchors() {
+    this._closeQuickPopover();
+    try {
+      this._htQuickStatusItem?.destroy?.();
+    } catch (_) {}
+    try {
+      this._htQuickStatusItem?.remove?.();
+    } catch (_) {}
+    this._htQuickStatusItem = null;
+    try {
+      this._htQuickSidebarItem?.destroy?.();
+    } catch (_) {}
+    try {
+      this._htQuickSidebarItem?.remove?.();
+    } catch (_) {}
+    this._htQuickSidebarItem = null;
+  };
+
+  Cls.prototype._quickAnchorHtml = function _quickAnchorHtml() {
+    return '<span class="htq-anchor" title="Quick habits"><i class="ti ti-flame" aria-hidden="true"></i></span>';
+  };
+
+  Cls.prototype._refreshQuickAccess = function _refreshQuickAccess() {
+    this._injectQuickAccessCss();
+    this._clearQuickAccessAnchors();
+    const pinned = this._pinnedHabits();
+    const ui = this.ui || this._app?.ui;
+    if (!pinned.length || typeof ui?.addStatusBarItem !== 'function') return;
+    try {
+      this._htQuickStatusItem = ui.addStatusBarItem({
+        htmlLabel: this._quickAnchorHtml(),
+        tooltip: 'Quick habits',
+        onClick: () => this._toggleQuickPopover(this._htQuickStatusItem?.getElement?.()),
+      });
+    } catch (e) {
+      console.warn('[Dawn/Habits] quick access status bar failed', e);
+    }
+  };
+
+  Cls.prototype._toggleQuickPopover = function _toggleQuickPopover(anchorEl) {
+    if (this._htQuickPopoverEl) {
+      this._closeQuickPopover();
+      return;
+    }
+    this._openQuickPopover(anchorEl);
+  };
+
+  Cls.prototype._quickDayKey = function _quickDayKey() {
+    if (this._htQuickPopoverDateStr) return this._htQuickPopoverDateStr;
+    if (this._dayKey) return this._dayKey;
+    const t = new Date();
+    return (
+      t.getFullYear() +
+      '-' +
+      String(t.getMonth() + 1).padStart(2, '0') +
+      '-' +
+      String(t.getDate()).padStart(2, '0')
+    );
+  };
+
+  Cls.prototype._habitDoneForQuick = function _habitDoneForQuick(h, dayKey) {
+    const mark = this._habitMark?.(dayKey, h.name);
+    if (mark === 'fail' || mark === 'na') return mark;
+    const cfg = this._habitCfg?.(h.name) || h;
+    const numeric = cfg.type === 'number';
+    const target = numeric ? Math.max(1, Number(cfg.target) || 8) : 0;
+    const val = numeric ? this._habitValue?.(dayKey, h.name) || 0 : 0;
+    if (numeric && !mark && val > 0 && val < target) return { partial: val };
+    const entries = this._dayEntries?.(dayKey) || [];
+    let done = !!(this._lsDone?.(dayKey, h.name));
+    for (const e of entries) {
+      for (const row of e.habits || []) {
+        if (String(row.name || '').trim().toLowerCase() === String(h.name || '').trim().toLowerCase() && row.done) {
+          done = true;
+        }
+      }
+    }
+    if (numeric && !mark && val >= target) done = true;
+    return done;
+  };
+
+  Cls.prototype._quickMarkHtml = function _quickMarkHtml(h, dayKey) {
+    const state = this._habitDoneForQuick(h, dayKey);
+    if (state === 'fail') return '<span class="htq-habit-mark is-fail" aria-hidden="true">×</span>';
+    if (state === 'na') return '<span class="htq-habit-mark is-na" aria-hidden="true">/</span>';
+    if (state && typeof state === 'object' && state.partial != null) {
+      return `<span class="htq-habit-mark is-partial" aria-hidden="true">${state.partial}</span>`;
+    }
+    if (state) {
+      return '<span class="htq-habit-mark is-done" aria-hidden="true"><i class="ti ti-check" aria-hidden="true"></i></span>';
+    }
+    return '<span class="htq-habit-mark" aria-hidden="true"></span>';
+  };
+
+  Cls.prototype._openQuickPopover = function _openQuickPopover(anchorEl) {
+    const groups = this._quickAccessGroups();
+    if (!groups.length) return;
+    this._htQuickPopoverDateStr = this._quickDayKey();
+    if (groups.length === 1) this._htQuickPopoverViewCatId = groups[0].cat.id;
+    else this._htQuickPopoverViewCatId = this._htQuickPopoverViewCatId || null;
+
+    const shell = document.createElement('div');
+    shell.className = 'htq-shell htq-shell--bottom';
+    const card = document.createElement('div');
+    card.className = 'htq-card';
+    shell.appendChild(card);
+    document.body.appendChild(shell);
+    this._htQuickPopoverEl = shell;
+    this._fillQuickCard(card, groups);
+    this._positionQuickPopover(anchorEl || this._htQuickStatusItem?.getElement?.());
+
+    this._htqDocClose = (ev) => {
+      if (!shell.contains(ev.target) && !ev.target?.closest?.('.htq-anchor')) {
+        this._closeQuickPopover();
+      }
+    };
+    this._htqKeyClose = (ev) => {
+      if (ev.key === 'Escape') this._closeQuickPopover();
+    };
+    setTimeout(() => {
+      document.addEventListener('mousedown', this._htqDocClose, true);
+      document.addEventListener('keydown', this._htqKeyClose, true);
+    }, 0);
+  };
+
+  Cls.prototype._fillQuickCard = function _fillQuickCard(card, groups) {
+    card.innerHTML = '';
+    const dayKey = this._quickDayKey();
+    const viewId = this._htQuickPopoverViewCatId;
+    const group = viewId ? groups.find((g) => g.cat.id === viewId) : null;
+
+    if (!group) {
+      const head = document.createElement('div');
+      head.className = 'htq-head';
+      const title = document.createElement('div');
+      title.className = 'htq-title';
+      title.textContent = 'Quick habits';
+      head.appendChild(title);
+      this._appendQuickDateNav(head);
+      card.appendChild(head);
+      const cats = document.createElement('div');
+      cats.className = 'htq-cats';
+      for (const g of groups) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'htq-cat-btn';
+        btn.title = `${g.cat.name || 'Category'} (${g.habits.length})`;
+        const icon = String(g.cat.icon || '').trim();
+        if (icon && /^[a-z0-9-]+$/i.test(icon)) {
+          btn.innerHTML = `<i class="ti ti-${icon}" aria-hidden="true"></i>`;
+        } else {
+          btn.textContent = '🔥';
+        }
+        btn.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._htQuickPopoverViewCatId = g.cat.id;
+          this._fillQuickCard(card, groups);
+          this._positionQuickPopover(this._htQuickStatusItem?.getElement?.());
+        });
+        cats.appendChild(btn);
+      }
+      card.appendChild(cats);
+      return;
+    }
+
+    const head = document.createElement('div');
+    head.className = 'htq-head';
+    if (groups.length > 1) {
+      const back = document.createElement('button');
+      back.type = 'button';
+      back.className = 'htq-back';
+      back.title = 'Back to categories';
+      back.innerHTML = '<i class="ti ti-chevron-left" aria-hidden="true"></i>';
+      back.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._htQuickPopoverViewCatId = null;
+        this._fillQuickCard(card, groups);
+        this._positionQuickPopover(this._htQuickStatusItem?.getElement?.());
+      });
+      head.appendChild(back);
+    }
+    const title = document.createElement('div');
+    title.className = 'htq-title';
+    title.textContent = group.cat.name || 'Habits';
+    head.appendChild(title);
+    this._appendQuickDateNav(head);
+    card.appendChild(head);
+
+    const list = document.createElement('div');
+    list.className = 'htq-habits';
+    for (const h of group.habits) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'htq-habit';
+      btn.title = numeric ? `${h.name} — tap to count · long-press to enter a number` : `${h.name} — tap to toggle`;
+      const paint = () => {
+        btn.innerHTML =
+          this._quickMarkHtml(h, this._quickDayKey()) +
+          `<span class="htq-habit-name">${String(h.name || '').replace(/</g, '&lt;')}</span>`;
+      };
+      paint();
+      let pressTimer = null;
+      let didLong = false;
+      let pressX = 0;
+      let pressY = 0;
+      const cfg = this._habitCfg?.(h.name) || h;
+      const numeric = cfg.type === 'number';
+      const target = Math.max(1, Number(cfg.target) || 8);
+      const clearPress = () => {
+        if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+      };
+      btn.addEventListener('pointerdown', (ev) => {
+        if (ev.button !== 0 || !numeric) return;
+        if (ev.target?.closest?.('.ht-num-input, .ht-num-btn')) return;
+        didLong = false;
+        pressX = ev.clientX;
+        pressY = ev.clientY;
+        clearPress();
+        pressTimer = setTimeout(() => {
+          pressTimer = null;
+          didLong = true;
+          this._showNumericInput?.(btn, h, target);
+        }, 500);
+      });
+      btn.addEventListener('pointermove', (ev) => {
+        if (!pressTimer) return;
+        const thresh = ev.pointerType === 'touch' ? 12 : 8;
+        if (Math.abs(ev.clientX - pressX) > thresh || Math.abs(ev.clientY - pressY) > thresh) clearPress();
+      });
+      btn.addEventListener('pointerup', clearPress);
+      btn.addEventListener('pointercancel', clearPress);
+      btn.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (didLong || btn.querySelector?.('.ht-num-input')) {
+          didLong = false;
+          return;
+        }
+        const key = this._quickDayKey();
+        const prev = this._dayKey;
+        this._dayKey = key;
+        try {
+          if (numeric) await this._tapNumericHabit?.(h, target);
+          else await this._toggleHabit?.(h);
+        } finally {
+          this._dayKey = prev || key;
+        }
+        paint();
+        try { this._paint?.(); } catch (_) {}
+      });
+      list.appendChild(btn);
+    }
+    card.appendChild(list);
+  };
+
+  Cls.prototype._appendQuickDateNav = function _appendQuickDateNav(head) {
+    const nav = document.createElement('div');
+    nav.className = 'htq-date';
+    const prev = document.createElement('button');
+    prev.type = 'button';
+    prev.className = 'ht-nav-btn';
+    prev.innerHTML = '<i class="ti ti-chevron-left" aria-hidden="true"></i>';
+    const label = document.createElement('span');
+    label.className = 'ht-date-label';
+    const next = document.createElement('button');
+    next.type = 'button';
+    next.className = 'ht-nav-btn';
+    next.innerHTML = '<i class="ti ti-chevron-right" aria-hidden="true"></i>';
+    const sync = () => {
+      label.textContent = this._formatDayLabel?.(this._quickDayKey()) || this._quickDayKey();
+    };
+    sync();
+    prev.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._htQuickPopoverDateStr = this._shiftDay(this._quickDayKey(), -1);
+      const card = this._htQuickPopoverEl?.querySelector('.htq-card');
+      if (card) this._fillQuickCard(card, this._quickAccessGroups());
+    });
+    next.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._htQuickPopoverDateStr = this._shiftDay(this._quickDayKey(), 1);
+      const card = this._htQuickPopoverEl?.querySelector('.htq-card');
+      if (card) this._fillQuickCard(card, this._quickAccessGroups());
+    });
+    label.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const t = new Date();
+      this._htQuickPopoverDateStr =
+        t.getFullYear() +
+        '-' +
+        String(t.getMonth() + 1).padStart(2, '0') +
+        '-' +
+        String(t.getDate()).padStart(2, '0');
+      const card = this._htQuickPopoverEl?.querySelector('.htq-card');
+      if (card) this._fillQuickCard(card, this._quickAccessGroups());
+    });
+    nav.append(prev, label, next);
+    head.appendChild(nav);
+  };
+
+  Cls.prototype._positionQuickPopover = function _positionQuickPopover(anchorEl) {
+    const shell = this._htQuickPopoverEl;
+    if (!shell) return;
+    const gap = 4;
+    const margin = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    shell.style.visibility = 'hidden';
+    shell.style.left = '0';
+    shell.style.top = '0';
+    const sw = shell.offsetWidth;
+    const sh = shell.offsetHeight;
+    shell.style.visibility = '';
+    let left = margin;
+    let top = margin;
+    if (anchorEl?.getBoundingClientRect) {
+      const r = anchorEl.getBoundingClientRect();
+      left = Math.max(margin, Math.min(r.left + r.width / 2 - sw / 2, vw - sw - margin));
+      top = r.top - sh - gap;
+      if (top < margin) top = r.bottom + gap;
+      top = Math.max(margin, Math.min(top, vh - sh - margin));
+    } else {
+      left = Math.max(margin, (vw - sw) / 2);
+      top = Math.max(margin, vh - sh - 48);
+    }
+    shell.style.left = `${left}px`;
+    shell.style.top = `${top}px`;
+  };
+}
+
+if (typeof DawnHabitsEngine === 'function') dawnMixInHabitQuickAccess(DawnHabitsEngine);
