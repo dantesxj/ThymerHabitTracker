@@ -305,31 +305,68 @@ class DawnHabitsEngine {
           const key = dayKey || this._dayKey;
           const out = {};
           const names = new Set((this._config.habits || []).map((h) => h.name));
+          const pack = (name, doneHint) => {
+            const cfg = this._habitCfg?.(name) || {};
+            const mark = this._habitMark(key, name);
+            const numeric = cfg.type === 'number' || (Number(cfg.target) || 0) > 0;
+            const target = numeric ? Math.max(1, Number(cfg.target) || 8) : 0;
+            const value = numeric ? Number(this._habitValue?.(key, name) || 0) : 0;
+            const done = !mark && (doneHint || !!this._lsDone?.(key, name) || (numeric && value >= target));
+            return {
+              done,
+              mark: mark || null,
+              numeric,
+              value,
+              target,
+              categoryId: this._habitCategoryId?.(name) || null,
+            };
+          };
           for (const e of this._dayEntries?.(key) || []) {
             for (const h of e.habits || []) {
               if (!h?.name) continue;
               names.add(h.name);
-              const mark = this._habitMark(key, h.name);
-              out[h.name] = {
-                done: !!(h.done && !mark),
-                mark: mark || null,
-                categoryId: this._habitCategoryId?.(h.name) || h.categoryId || null,
-              };
+              out[h.name] = pack(h.name, !!h.done);
             }
           }
           for (const name of names) {
             if (out[name]) continue;
-            const mark = this._habitMark(key, name);
-            const lsDone = !!this._lsDone?.(key, name);
-            out[name] = {
-              done: !mark && lsDone,
-              mark: mark || null,
-              categoryId: this._habitCategoryId?.(name) || null,
-            };
+            out[name] = pack(name, false);
           }
           return out;
         },
+        habitCfg: (name) => this._habitCfg?.(name) || null,
         markDone: (nameOrId, dayKey) => this._markHabitDoneByName(nameOrId, dayKey),
+        tap: async (nameOrId, dayKey) => {
+          const key = dayKey || this._dayKey;
+          const want = String(nameOrId || '').trim().toLowerCase();
+          if (!key || !want) return false;
+          await this._ensureDayLog?.(key);
+          let hit = null;
+          for (const e of this._dayEntries?.(key) || []) {
+            for (const h of e.habits || []) {
+              const n = String(h.name || '').trim().toLowerCase();
+              const id = String(h.id || '').trim().toLowerCase();
+              if (n === want || id === want) {
+                hit = { ...h, logGuid: e.guid };
+                break;
+              }
+            }
+            if (hit) break;
+          }
+          if (!hit) {
+            const cfg = (this._config.habits || []).find((h) => {
+              const n = String(h.name || '').trim().toLowerCase();
+              const id = String(h.id || '').trim().toLowerCase();
+              return n === want || id === want;
+            });
+            if (cfg) hit = { ...cfg, logGuid: this._primaryLogGuid?.(key), done: false };
+          }
+          if (!hit) return false;
+          const hcfg = this._habitCfg?.(hit.name) || {};
+          const target = Math.max(1, Number(hcfg.target) || 8);
+          await this._tapNumericHabit(hit, target, key);
+          return true;
+        },
         toggle: async (nameOrId, dayKey) => {
           const key = dayKey || this._dayKey;
           const want = String(nameOrId || '').trim().toLowerCase();
@@ -356,6 +393,13 @@ class DawnHabitsEngine {
             if (cfg) hit = { ...cfg, logGuid: this._primaryLogGuid(key), done: false };
           }
           if (!hit) return false;
+          const hcfg = this._habitCfg?.(hit.name) || {};
+          const numeric = hcfg.type === 'number' || (Number(hcfg.target) || 0) > 0;
+          if (numeric) {
+            const target = Math.max(1, Number(hcfg.target) || 8);
+            await this._tapNumericHabit(hit, target, key);
+            return true;
+          }
           await this._toggleHabit(hit, key);
           return true;
         },
@@ -3483,10 +3527,10 @@ class DawnHabitsEngine {
     this._dayKey = this._normalizeDayKey((meta && meta.dayKey) || dayLabel);
     // Cancel in-flight hydrate for a previous day — rapid flips must stay paint-only.
     this._hydrating.clear();
+    // Skip DOM work while Habits tab is hidden (Dashboard embeds its own section).
+    if (!this._isHabitsTabExpanded()) return;
     this._paint();
-    if (this._isHabitsTabExpanded() && this._dayKey) {
-      void this._hydrateDay(this._dayKey);
-    }
+    if (this._dayKey) void this._hydrateDay(this._dayKey);
   }
 
   _normalizeDayKey(raw) {
@@ -4908,13 +4952,13 @@ class DawnHabitsEngine {
     if (nextDone) this._afterDaySave(key);
   }
 
-  async _tapNumericHabit(h, target) {
-    const key = this._dayKey;
+  async _tapNumericHabit(h, target, dayKey) {
+    const key = dayKey || this._dayKey;
     const mark = this._habitMark(key, h.name);
     if (mark) {
       this._setHabitMark(key, h.name, null);
       this._paint();
-      await this._persistLogHabit(h, key);
+      await this._persistLogHabit?.(h, key);
       return;
     }
     const tgt = Math.max(1, Number(target) || 8);
