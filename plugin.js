@@ -9,7 +9,7 @@
  * Dawn Habits — standalone JHS tab plugin.
  *
  * Deploy:
- *   cat plugin.js habits-engine.js habit-manage.mixin.js habit-quick-access.mixin.js
+ *   cat plugin.js habits-engine.js habit-manage.mixin.js habit-quick-access.mixin.js habit-recovery.mixin.js
  *
  * CONTRACT:
  * - registerTab('habits') on Journal Header Shell.
@@ -211,6 +211,10 @@ class DawnHabitsEngine {
     } catch (_) {}
 
     try {
+      this._registerRecoveryCommands?.();
+    } catch (_) {}
+
+    try {
       this._cmdRebuild = this.ui.addCommandPaletteCommand({
         label: 'Dawn: Rebuild Habits Index',
         icon: 'ti-checkbox',
@@ -237,6 +241,9 @@ class DawnHabitsEngine {
       this._clearQuickAccessAnchors?.();
     } catch (_) {}
     try {
+      this._closeRecoveryDialog?.();
+    } catch (_) {}
+    try {
       this._unregBoot?.();
     } catch (_) {}
     try {
@@ -244,6 +251,9 @@ class DawnHabitsEngine {
     } catch (_) {}
     try {
       this._cmdCats?.remove?.();
+    } catch (_) {}
+    try {
+      this._cmdRecovery?.remove?.();
     } catch (_) {}
     try {
       this._styleEl?.remove?.();
@@ -284,17 +294,22 @@ class DawnHabitsEngine {
         listCategoryRibbon: (dayKey) => {
           const key = dayKey || this._dayKey;
           const habitsAll = this._config.habits || [];
+          const missedIds = new Set(
+            (this._missedRecoverableCategories?.(key) || []).map((m) => m.cat?.id).filter(Boolean)
+          );
           return (this._config.categories || []).map((c) => {
             const habits = habitsAll.filter((h) => this._habitCategoryId?.(h.name) === c.id);
             const status = this._categoryDayAggStatus?.(habits, key) || '';
             const marked = this._categoryAllMarked?.(habits, key);
             const streak = this._categoryEffectiveStreak?.(c.id, key) || 0;
+            const atRisk = missedIds.has(c.id);
             return {
               id: c.id,
               name: c.name,
               icon: c.icon || null,
               status,
               streak,
+              atRisk,
               glyphHtml: this._categoryGlyphHtml?.(c) || '',
               leadHtml: this._ribbonLeadCellHtml?.(status, marked) || '',
               streakHtml: streak > 0 ? this._ribbonStreakHtml?.(streak) || '' : '',
@@ -406,6 +421,26 @@ class DawnHabitsEngine {
         mount: (el, ctx) => this._mount(el, ctx),
         onDay: (dayLabel, meta) => this._onDay(dayLabel, meta),
         onExpand: (expanded) => this._onExpand(expanded),
+        recoverySnapshot: (dayKey) => this._recoverySnapshot?.(dayKey) || { stockN: 0, missedN: 0 },
+        openRecoveryPrompt: (dayKey) => {
+          const snap = this._recoverySnapshot?.(dayKey);
+          if (!snap?.stock?.length || !snap?.missed?.length) return false;
+          const promptKey = `dawn:recovery_prompt_seen_v1:${snap.today || 'force'}`;
+          this._showRecoveryPrompt?.({
+            stock: snap.stock,
+            missed: snap.missed,
+            promptKey,
+          });
+          return true;
+        },
+        openRecoveryInventory: () => this._openRecoveryInventoryDialog?.(),
+        maybePromptRecoveries: (dayKey) => this._maybePromptRecoveries?.(dayKey),
+        prepareAndMaybePromptRecoveries: async (dayKey) => {
+          const key = dayKey || this._dayKey;
+          const y = this._shiftDay?.(key, -1);
+          if (y) await this._hydrateDay?.(y);
+          this._maybePromptRecoveries?.(key);
+        },
       };
       globalThis.__dawnHabitsHost = api;
       globalThis.__dawnHabitsAddon = api;
@@ -3510,7 +3545,8 @@ class DawnHabitsEngine {
     const promptRecoveries = async () => {
       const y = this._shiftDay(this._dayKey, -1);
       if (y) await this._hydrateDay(y);
-      this._app?._maybePromptRecoveries?.(this._dayKey);
+      // Prompt lives on the engine (habit-recovery.mixin) — not Behavioral.
+      this._maybePromptRecoveries?.(this._dayKey);
     };
     if (boot?.enqueue) {
       boot.enqueue(promptRecoveries, {
@@ -6114,3 +6150,218 @@ function dawnMixInHabitQuickAccess(Cls) {
 }
 
 if (typeof DawnHabitsEngine === 'function') dawnMixInHabitQuickAccess(DawnHabitsEngine);
+/**
+ * Streak recovery prompt + inventory — owned by Dawn Habits (not Behavioral).
+ * Engine already earns recoveries via _afterDaySave; this surfaces spending them.
+ */
+
+function dawnMixInHabitRecovery(Cls) {
+  if (!Cls || Cls.prototype._maybePromptRecoveries) return;
+
+  const CSS = `
+  .dawn-hab-rec-overlay {
+    position: fixed; inset: 0; z-index: 10080;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(8, 8, 14, 0.62);
+    padding: 16px;
+  }
+  .dawn-hab-rec-card {
+    width: min(420px, 96vw);
+    max-height: min(520px, 88vh);
+    overflow: auto;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 140, 160, 0.28);
+    background: rgba(22, 20, 28, 0.97);
+    padding: 18px 18px 14px;
+    color: #eceff4;
+  }
+  .dawn-hab-rec-card h3 {
+    margin: 0 0 6px; font-size: 17px; font-weight: 650;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .dawn-hab-rec-card h3 .ti { color: rgba(255, 140, 160, 0.95); }
+  .dawn-hab-rec-sub { font-size: 13px; opacity: 0.72; line-height: 1.5; margin-bottom: 12px; }
+  .dawn-hab-rec-cat {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-top: 1px solid rgba(255,255,255,0.07);
+    font-size: 13px;
+  }
+  .dawn-hab-rec-actions {
+    display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap;
+  }
+  .dawn-hab-rec-btn {
+    border: 1px solid rgba(255,255,255,0.14);
+    background: rgba(255,255,255,0.06);
+    color: #eceff4;
+    border-radius: 8px; padding: 7px 12px; font-size: 12px; cursor: pointer;
+  }
+  .dawn-hab-rec-btn.primary {
+    border-color: rgba(255, 140, 160, 0.45);
+    background: rgba(255, 140, 160, 0.16);
+  }
+  `;
+
+  function esc(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  Cls.prototype._injectRecoveryCss = function () {
+    if (this._habRecCssInjected) return;
+    try {
+      this.ui.injectCSS(CSS);
+      this._habRecCssInjected = true;
+    } catch (_) {
+      const el = document.createElement('style');
+      el.setAttribute('data-dawn-hab-recovery', '1');
+      el.textContent = CSS;
+      document.documentElement.appendChild(el);
+      this._habRecCssInjected = true;
+    }
+  };
+
+  Cls.prototype._closeRecoveryDialog = function () {
+    try {
+      this._habRecOverlay?.remove();
+    } catch (_) {}
+    this._habRecOverlay = null;
+  };
+
+  Cls.prototype._recoverySnapshot = function (dayKey) {
+    const today = dayKey || this._dayKey;
+    const stock = this._activeRecoveries?.(this._config) || [];
+    const missed = today ? this._missedRecoverableCategories?.(today) || [] : [];
+    return { today, stock, missed, stockN: stock.length, missedN: missed.length };
+  };
+
+  Cls.prototype._maybePromptRecoveries = function (dayKey) {
+    if (this._habRecOverlay) return;
+    const { today, stock, missed } = this._recoverySnapshot(dayKey);
+    if (!stock.length || !missed.length || !today) return;
+    const promptKey = `dawn:recovery_prompt_seen_v1:${today}`;
+    try {
+      if (localStorage.getItem(promptKey) === '1') return;
+    } catch (_) {}
+    this._showRecoveryPrompt({ stock, missed, promptKey });
+  };
+
+  Cls.prototype._showRecoveryPrompt = function ({ stock, missed, promptKey }) {
+    this._injectRecoveryCss();
+    this._closeRecoveryDialog();
+    const overlay = document.createElement('div');
+    overlay.className = 'dawn-hab-rec-overlay';
+    const card = document.createElement('div');
+    card.className = 'dawn-hab-rec-card';
+    card.innerHTML = `
+      <h3><i class="ti ti-first-aid-kit" aria-hidden="true"></i> Streak Recovery</h3>
+      <p class="dawn-hab-rec-sub">Patch category streaks from yesterday. You have <strong>${stock.length}</strong> recovery${stock.length === 1 ? '' : 's'} (oldest expires first). Each selected category uses one.</p>
+      <div class="dawn-hab-rec-list"></div>
+      <div class="dawn-hab-rec-actions">
+        <button type="button" class="dawn-hab-rec-btn" data-act="skip">Not now</button>
+        <button type="button" class="dawn-hab-rec-btn primary" data-act="apply">Patch selected</button>
+      </div>`;
+    const list = card.querySelector('.dawn-hab-rec-list');
+    for (const m of missed) {
+      const row = document.createElement('label');
+      row.className = 'dawn-hab-rec-cat';
+      row.innerHTML = `<input type="checkbox" data-cat-id="${esc(m.cat.id)}" checked /> <span>${esc(m.cat.name || 'Category')}</span>`;
+      list.appendChild(row);
+    }
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    this._habRecOverlay = overlay;
+
+    const close = (markSeen = true) => {
+      if (markSeen) {
+        try {
+          localStorage.setItem(promptKey, '1');
+        } catch (_) {}
+      }
+      this._closeRecoveryDialog();
+    };
+
+    card.querySelector('[data-act="skip"]')?.addEventListener('click', () => close(true));
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) close(true);
+    });
+    card.querySelector('[data-act="apply"]')?.addEventListener('click', () => {
+      const picks = [...card.querySelectorAll('input[type=checkbox]:checked')].map((el) => el.dataset.catId);
+      if (!picks.length) {
+        close(true);
+        return;
+      }
+      const cfg = this._normalizeRecoveryCfg(this._config);
+      let used = 0;
+      for (const catId of picks.slice(0, stock.length)) {
+        const miss = missed.find((x) => x.cat.id === catId);
+        if (!miss) continue;
+        const inv = this._activeRecoveries(cfg);
+        if (!inv.length) break;
+        cfg.recoveryInventory = (cfg.recoveryInventory || []).filter((r) => r.id !== inv[0].id);
+        this._applyCategoryRecovery(miss.dateStr, catId);
+        used += 1;
+      }
+      this._saveConfig?.();
+      if (used) {
+        this._toastRecovery?.(
+          'Streak patched',
+          `Used ${used} streak recover${used === 1 ? 'y' : 'ies'}.`
+        );
+      }
+      close(true);
+      try {
+        globalThis.__dawnDash?.refresh?.();
+      } catch (_) {}
+      this._paint?.();
+    });
+  };
+
+  Cls.prototype._openRecoveryInventoryDialog = function () {
+    this._injectRecoveryCss();
+    this._closeRecoveryDialog();
+    const cfg = this._normalizeRecoveryCfg(this._config);
+    const stock = this._activeRecoveries(cfg);
+    const overlay = document.createElement('div');
+    overlay.className = 'dawn-hab-rec-overlay';
+    const card = document.createElement('div');
+    card.className = 'dawn-hab-rec-card';
+    const rows = stock.length
+      ? stock
+          .map((r) => {
+            const days = Math.max(0, Math.ceil((Number(r.expiresAt) - Date.now()) / 86400000));
+            return `<div class="dawn-hab-rec-cat"><i class="ti ti-first-aid-kit" aria-hidden="true"></i> ${esc(r.label || 'Recovery')} <span style="opacity:0.55;margin-left:auto">expires ~${days}d</span></div>`;
+          })
+          .join('')
+      : '<p class="dawn-hab-rec-sub">No recoveries yet. Earn at 7/30/90/365-day category milestones, Deep Focus (3+ habits in a category), or Full Sweep days.</p>';
+    card.innerHTML = `
+      <h3><i class="ti ti-first-aid-kit" aria-hidden="true"></i> Streak Recoveries</h3>
+      <p class="dawn-hab-rec-sub">${stock.length} available · 90-day expiry · oldest used first</p>
+      <div class="dawn-hab-rec-list">${rows}</div>
+      <div class="dawn-hab-rec-actions">
+        <button type="button" class="dawn-hab-rec-btn" data-act="close">Close</button>
+      </div>`;
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    this._habRecOverlay = overlay;
+    card.querySelector('[data-act="close"]')?.addEventListener('click', () => this._closeRecoveryDialog());
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) this._closeRecoveryDialog();
+    });
+  };
+
+  Cls.prototype._registerRecoveryCommands = function () {
+    if (this._cmdRecovery) return;
+    try {
+      this._cmdRecovery = this.ui.addCommandPaletteCommand({
+        label: 'Dawn: Streak Recoveries…',
+        icon: 'ti-first-aid-kit',
+        onSelected: () => this._openRecoveryInventoryDialog(),
+      });
+    } catch (_) {}
+  };
+}
+
+if (typeof DawnHabitsEngine === 'function') dawnMixInHabitRecovery(DawnHabitsEngine);
